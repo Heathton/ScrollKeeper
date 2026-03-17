@@ -43,9 +43,10 @@ def build_settings(gpu_policy: str = "concurrent", idle_timeout: int = 0) -> Set
         ollama_container="scrollkeeper-ollama",
         ollama_port=11434,
         ollama_model="qwen3.5:9b",
-        ollama_embed_model="embeddinggemma",
+        ollama_embed_model="qwen3-embedding:4b",
         ollama_idle_timeout=idle_timeout,
         gpu_policy=gpu_policy,
+        enable_gpu=True,
     )
 
 

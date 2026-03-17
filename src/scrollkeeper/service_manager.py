@@ -105,42 +105,54 @@ class DockerServiceManager:
             if self._is_container_running(self.whisper.name):
                 self._wait_for_http(f"{self.whisper_base_url}/health", timeout_seconds=120)
                 return
-            self._run_container(
+            command = [
+                "docker",
+                "run",
+                "-d",
+                "--rm",
+                "--name",
+                self.whisper.name,
+                "--network",
+                self.settings.docker_network,
+            ]
+            if self.settings.enable_gpu:
+                command.extend(["--gpus", "all"])
+            command.extend(
                 [
-                    "docker",
-                    "run",
-                    "-d",
-                    "--rm",
-                    "--name",
-                    self.whisper.name,
-                    "--network",
-                    self.settings.docker_network,
                     "-e",
                     f"WHISPER_MODEL={self.settings.whisper_model}",
+                    "-e",
+                    f"WHISPER_DEVICE={'cuda' if self.settings.enable_gpu else 'cpu'}",
                     self.whisper.image,
                 ]
             )
+            self._run_container(command)
             self._wait_for_http(f"{self.whisper_base_url}/health", timeout_seconds=300)
 
     def _ensure_ollama_running_sync(self) -> None:
         with self._ensure_ollama_lock:
             self._ensure_network_sync()
             if not self._is_container_running(self.ollama.name):
-                self._run_container(
+                command = [
+                    "docker",
+                    "run",
+                    "-d",
+                    "--rm",
+                    "--name",
+                    self.ollama.name,
+                    "--network",
+                    self.settings.docker_network,
+                ]
+                if self.settings.enable_gpu:
+                    command.extend(["--gpus", "all"])
+                command.extend(
                     [
-                        "docker",
-                        "run",
-                        "-d",
-                        "--rm",
-                        "--name",
-                        self.ollama.name,
-                        "--network",
-                        self.settings.docker_network,
                         "-v",
                         "scrollkeeper_ollama:/root/.ollama",
                         self.ollama.image,
                     ]
                 )
+                self._run_container(command)
             self._wait_for_http(f"{self.ollama_base_url}/api/version", timeout_seconds=300)
             self._ensure_ollama_model_sync(self.settings.ollama_model)
             self._ensure_ollama_model_sync(self.settings.ollama_embed_model)

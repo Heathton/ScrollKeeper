@@ -38,6 +38,7 @@ The bot container mounts the Docker socket and starts sibling containers as need
 - An Ollama container is kept running in `concurrent` mode so question answering remains available during session processing.
 - Set `SCROLLKEEPER_GPU_POLICY=serialize` to unload Ollama models while Whisper transcribes if GPU pressure is too high.
 - `SCROLLKEEPER_OLLAMA_IDLE_TIMEOUT=0` disables automatic Ollama shutdown (recommended for concurrency tests).
+- `SCROLLKEEPER_ENABLE_GPU=true` enables `--gpus all` for Ollama and Whisper containers.
 
 ## Storage layout
 
@@ -62,8 +63,10 @@ The bot container mounts the Docker socket and starts sibling containers as need
 
 - `SCROLLKEEPER_OLLAMA_MODEL=qwen3.5:9b`
 - `SCROLLKEEPER_WHISPER_MODEL=small.en`
+- `SCROLLKEEPER_OLLAMA_EMBED_MODEL=qwen3-embedding:4b`
 - `SCROLLKEEPER_GPU_POLICY=concurrent`
 - `SCROLLKEEPER_OLLAMA_IDLE_TIMEOUT=0`
+- `SCROLLKEEPER_ENABLE_GPU=true`
 
 ## Next improvements
 

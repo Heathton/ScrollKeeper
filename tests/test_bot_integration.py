@@ -103,9 +103,10 @@ def build_settings() -> Settings:
         ollama_container="scrollkeeper-ollama",
         ollama_port=11434,
         ollama_model="qwen3.5:9b",
-        ollama_embed_model="embeddinggemma",
+        ollama_embed_model="qwen3-embedding:4b",
         ollama_idle_timeout=0,
         gpu_policy="concurrent",
+        enable_gpu=True,
     )
 
 
