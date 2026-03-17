@@ -15,7 +15,8 @@ app = FastAPI(title="ScrollKeeper Whisper")
 def get_model() -> WhisperModel:
     model_name = os.getenv("WHISPER_MODEL", "base.en")
     compute_type = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
-    return WhisperModel(model_name, compute_type=compute_type)
+    device = os.getenv("WHISPER_DEVICE", "cpu")
+    return WhisperModel(model_name, device=device, compute_type=compute_type)
 
 
 @app.get("/health")

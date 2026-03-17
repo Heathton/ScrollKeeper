@@ -25,6 +25,7 @@ class Settings:
     ollama_embed_model: str
     ollama_idle_timeout: int
     gpu_policy: str
+    enable_gpu: bool
 
     @classmethod
     def load(cls) -> "Settings":
@@ -47,10 +48,11 @@ class Settings:
             ollama_model=os.getenv("SCROLLKEEPER_OLLAMA_MODEL", "qwen3.5:9b"),
             ollama_embed_model=os.getenv(
                 "SCROLLKEEPER_OLLAMA_EMBED_MODEL",
-                "embeddinggemma",
+                "qwen3-embedding:4b",
             ),
             ollama_idle_timeout=int(os.getenv("SCROLLKEEPER_OLLAMA_IDLE_TIMEOUT", "0")),
             gpu_policy=os.getenv("SCROLLKEEPER_GPU_POLICY", "concurrent").strip().lower(),
+            enable_gpu=os.getenv("SCROLLKEEPER_ENABLE_GPU", "true").strip().lower() in {"1", "true", "yes", "on"},
         )
 
     def validate(self) -> None:
