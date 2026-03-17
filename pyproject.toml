@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scrollkeeper"
+version = "0.1.0"
+description = "Discord campaign archivist with transcription, summaries, and retrieval-backed notes."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "discord.py[voice]>=2.4.0",
+  "discord-ext-voice-recv>=0.4.2a179",
+  "python-dotenv>=1.0.1",
+  "requests>=2.32.0",
+]
+
+[project.scripts]
+scrollkeeper = "scrollkeeper.main:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
