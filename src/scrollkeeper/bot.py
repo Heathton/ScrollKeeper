@@ -11,6 +11,7 @@ from .llm import LocalAIService
 from .service_manager import DockerServiceManager
 from .session_manager import SessionManager
 from .storage import Storage
+from .voice_compat import apply_voice_recv_compatibility_patch
 
 
 class ScrollKeeperBot(commands.Bot):
@@ -25,6 +26,8 @@ class ScrollKeeperBot(commands.Bot):
 
 
 def build_bot(settings: Settings) -> commands.Bot:
+    apply_voice_recv_compatibility_patch()
+
     intents = discord.Intents.default()
     intents.message_content = True
     intents.voice_states = True

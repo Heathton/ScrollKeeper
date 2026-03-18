@@ -7,7 +7,7 @@ ENV PYTHONUNBUFFERED=1
 COPY --from=dockercli /usr/local/bin/docker /usr/local/bin/docker
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg libopus0 \
+    && apt-get install -y --no-install-recommends ffmpeg git libopus0 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

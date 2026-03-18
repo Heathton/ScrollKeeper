@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -10,13 +11,18 @@ import requests
 from .service_manager import DockerServiceManager
 
 
+log = logging.getLogger(__name__)
+
+
 class LocalAIService:
     def __init__(self, services: DockerServiceManager) -> None:
         self.services = services
 
     async def transcribe_audio_segment(self, audio_path: Path) -> str:
+        log.info("Submitting %s to Whisper", audio_path)
         await self.services.ensure_whisper_running()
         text = await asyncio.to_thread(self._transcribe_audio_segment_sync, audio_path)
+        log.info("Whisper returned transcript for %s", audio_path)
         return text
 
     async def embed_text(self, text: str) -> list[float]:

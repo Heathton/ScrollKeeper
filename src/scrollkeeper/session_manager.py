@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
+import struct
 import wave
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -16,13 +18,24 @@ from .models import CampaignNote, SessionArtifacts, SpeakerSegment
 from .storage import Storage
 
 
+log = logging.getLogger(__name__)
 SAMPLE_RATE = 48000
 CHANNELS = 2
 SAMPLE_WIDTH = 2
 SEGMENT_IDLE_SECONDS = 1.5
 MIN_SEGMENT_SECONDS = 0.75
+OPUS_PACKET_EXTENSION = ".skopus"
+OPUS_FRAME_DURATION_SECONDS = 0.02
+OPUS_PACKET_HEADER = struct.Struct("<HIH")
 
 CompletionHandler = Callable[[int, int, SessionArtifacts | None, str | None], Awaitable[None]]
+
+
+@dataclass(slots=True)
+class BufferedOpusPacket:
+    sequence: int
+    timestamp: int
+    payload: bytes
 
 
 @dataclass(slots=True)
@@ -32,7 +45,7 @@ class ActiveSpeakerBuffer:
     character_name: str
     started_at: datetime
     last_packet_at: datetime
-    frames: bytearray = field(default_factory=bytearray)
+    packets: list[BufferedOpusPacket] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -68,10 +81,12 @@ class SessionAudioSink(voice_recv.AudioSink):
         self.buffers: dict[int, ActiveSpeakerBuffer] = {}
 
     def wants_opus(self) -> bool:
-        return False
+        return True
 
     def write(self, user: discord.User | discord.Member | None, data: voice_recv.VoiceData) -> None:
-        if user is None or not getattr(data, "pcm", None):
+        opus_payload = getattr(data, "opus", None)
+        packet = getattr(data, "packet", None)
+        if user is None or not opus_payload or packet is None:
             return
         now = datetime.utcnow()
         display_name = getattr(user, "display_name", None) or getattr(user, "name", str(user.id))
@@ -90,7 +105,13 @@ class SessionAudioSink(voice_recv.AudioSink):
                 last_packet_at=now,
             )
             self.buffers[user.id] = buffer
-        buffer.frames.extend(data.pcm)
+        buffer.packets.append(
+            BufferedOpusPacket(
+                sequence=packet.sequence,
+                timestamp=packet.timestamp,
+                payload=bytes(opus_payload),
+            )
+        )
         buffer.last_packet_at = now
 
     def cleanup(self) -> None:
@@ -158,6 +179,7 @@ class SessionManager:
         if session is None or session.closed:
             raise RuntimeError("No active session for this server.")
 
+        log.info("Ending session %s for guild %s", session.session_id, guild.id)
         await self._stop_recording_session(session)
         self.active_sessions.pop(guild.id, None)
         self.storage.set_session_status(session.session_id, "processing")
@@ -191,6 +213,7 @@ class SessionManager:
         artifacts: SessionArtifacts | None = None
         error_message: str | None = None
         try:
+            log.info("Starting post-session processing for session %s", session.session_id)
             artifacts = await self._process_closed_session(guild_id, session)
             self._set_status(
                 guild_id,
@@ -198,8 +221,10 @@ class SessionManager:
                 session.session_id,
                 "Session processing is complete.",
             )
+            log.info("Completed post-session processing for session %s", session.session_id)
         except Exception as exc:
             error_message = str(exc)
+            log.exception("Session %s processing failed", session.session_id)
             self._set_status(
                 guild_id,
                 "failed",
@@ -211,14 +236,32 @@ class SessionManager:
 
     async def _process_closed_session(self, guild_id: int, session: ActiveSession) -> SessionArtifacts:
         segments = self.storage.get_session_segments(session.session_id)
+        log.info("Session %s has %s recorded audio segments", session.session_id, len(segments))
+        if not segments:
+            raise RuntimeError(
+                "No decodable audio was captured for this session. "
+                "Voice packets were received, but no valid speaker audio could be saved."
+            )
         await self.llm.services.prepare_for_transcription()
         try:
             for segment in segments:
-                transcript_text = await self.llm.transcribe_audio_segment(Path(segment["audio_path"]))
+                source_audio_path = Path(segment["audio_path"])
+                wav_path = self._prepare_segment_for_transcription(source_audio_path)
+                log.info(
+                    "Transcribing session %s segment %s",
+                    session.session_id,
+                    wav_path,
+                )
+                transcript_text = await self.llm.transcribe_audio_segment(wav_path)
                 self.storage.update_segment_transcript(
                     session.session_id,
                     segment["audio_path"],
                     transcript_text,
+                )
+                log.info(
+                    "Finished transcribing session %s segment %s",
+                    session.session_id,
+                    wav_path,
                 )
         finally:
             await self.llm.services.stop_whisper()
@@ -226,6 +269,7 @@ class SessionManager:
 
         transcript_markdown = self._build_transcript_markdown(session.session_id)
         existing_notes_context = self._format_existing_notes_context(guild_id)
+        log.info("Generating summary and notes for session %s", session.session_id)
         summary_payload = await self.llm.summarize_session(transcript_markdown, existing_notes_context)
         session_notes = summary_payload["session_notes_markdown"].strip()
         cinematic = summary_payload["cinematic_summary_markdown"].strip()
@@ -327,8 +371,17 @@ class SessionManager:
         while not session.closed:
             await asyncio.sleep(5)
             voice_client = session.voice_client
-            if voice_client and voice_client.is_connected():
+            if voice_client and voice_client.is_connected() and voice_client.is_listening():
                 continue
+            if voice_client and voice_client.is_connected():
+                if session.sink is None:
+                    session.sink = SessionAudioSink(self, session)
+                try:
+                    voice_client.listen(session.sink)
+                    continue
+                except Exception:
+                    await asyncio.sleep(10)
+                    continue
             channel = guild.get_channel(session.voice_channel_id)
             if not isinstance(channel, discord.VoiceChannel):
                 continue
@@ -351,9 +404,12 @@ class SessionManager:
         buffer = buffers.get(user_id)
         if buffer is None:
             return
+        if not buffer.packets:
+            buffers.pop(user_id, None)
+            return
         now = datetime.utcnow()
         idle_for = now - buffer.last_packet_at
-        duration_seconds = len(buffer.frames) / (SAMPLE_RATE * CHANNELS * SAMPLE_WIDTH)
+        duration_seconds = len(buffer.packets) * OPUS_FRAME_DURATION_SECONDS
         if not force:
             if idle_for < timedelta(seconds=SEGMENT_IDLE_SECONDS):
                 return
@@ -364,12 +420,8 @@ class SessionManager:
         ended_at = buffer.last_packet_at
         safe_name = "".join(ch if ch.isalnum() else "_" for ch in buffer.character_name).strip("_") or "speaker"
         timestamp = int(buffer.started_at.timestamp() * 1000)
-        audio_path = session.audio_dir / f"{timestamp}_{user_id}_{safe_name}.wav"
-        with wave.open(str(audio_path), "wb") as wav_file:
-            wav_file.setnchannels(CHANNELS)
-            wav_file.setsampwidth(SAMPLE_WIDTH)
-            wav_file.setframerate(SAMPLE_RATE)
-            wav_file.writeframes(bytes(buffer.frames))
+        audio_path = session.audio_dir / f"{timestamp}_{user_id}_{safe_name}{OPUS_PACKET_EXTENSION}"
+        self._write_opus_packet_file(audio_path, buffer.packets)
         segment = SpeakerSegment(
             discord_user_id=buffer.user_id,
             discord_display_name=buffer.display_name,
@@ -379,7 +431,88 @@ class SessionManager:
             audio_path=audio_path,
         )
         self.storage.add_transcript_segment(session.session_id, segment)
+        log.info(
+            "Saved Opus segment for session %s user %s to %s (%.2fs, %s packets)",
+            session.session_id,
+            buffer.user_id,
+            audio_path,
+            duration_seconds,
+            len(buffer.packets),
+        )
         buffers.pop(user_id, None)
+
+    def _prepare_segment_for_transcription(self, audio_path: Path) -> Path:
+        if audio_path.suffix.lower() == ".wav":
+            return audio_path
+        if audio_path.suffix.lower() != OPUS_PACKET_EXTENSION:
+            raise RuntimeError(f"Unsupported segment format for transcription: {audio_path}")
+        wav_path = audio_path.with_suffix(".wav")
+        if wav_path.exists():
+            return wav_path
+        self._decode_opus_packet_file_to_wav(audio_path, wav_path)
+        return wav_path
+
+    def _write_opus_packet_file(self, audio_path: Path, packets: list[BufferedOpusPacket]) -> None:
+        with audio_path.open("wb") as handle:
+            for packet in packets:
+                handle.write(
+                    OPUS_PACKET_HEADER.pack(
+                        packet.sequence,
+                        packet.timestamp,
+                        len(packet.payload),
+                    )
+                )
+                handle.write(packet.payload)
+
+    def _read_opus_packet_file(self, audio_path: Path) -> list[BufferedOpusPacket]:
+        packets: list[BufferedOpusPacket] = []
+        with audio_path.open("rb") as handle:
+            while True:
+                header = handle.read(OPUS_PACKET_HEADER.size)
+                if not header:
+                    break
+                if len(header) != OPUS_PACKET_HEADER.size:
+                    raise RuntimeError(f"Corrupted Opus packet header in {audio_path}")
+                sequence, timestamp, payload_size = OPUS_PACKET_HEADER.unpack(header)
+                payload = handle.read(payload_size)
+                if len(payload) != payload_size:
+                    raise RuntimeError(f"Corrupted Opus packet payload in {audio_path}")
+                packets.append(
+                    BufferedOpusPacket(
+                        sequence=sequence,
+                        timestamp=timestamp,
+                        payload=payload,
+                    )
+                )
+        return packets
+
+    def _decode_opus_packet_file_to_wav(self, audio_path: Path, wav_path: Path) -> None:
+        packets = self._read_opus_packet_file(audio_path)
+        if not packets:
+            raise RuntimeError(f"No Opus packets were captured in {audio_path}")
+
+        decoder = discord.opus.Decoder()
+        pcm_frames = bytearray()
+        expected_sequence: int | None = None
+        max_gap_frames = int(SEGMENT_IDLE_SECONDS / OPUS_FRAME_DURATION_SECONDS)
+
+        for packet in packets:
+            if expected_sequence is not None:
+                gap = (packet.sequence - expected_sequence) % 65536
+                if 0 < gap <= max_gap_frames:
+                    for _ in range(gap):
+                        pcm_frames.extend(decoder.decode(None, fec=False))
+
+            pcm_frames.extend(decoder.decode(packet.payload, fec=False))
+            expected_sequence = (packet.sequence + 1) % 65536
+
+        with wave.open(str(wav_path), "wb") as wav_file:
+            wav_file.setnchannels(CHANNELS)
+            wav_file.setsampwidth(SAMPLE_WIDTH)
+            wav_file.setframerate(SAMPLE_RATE)
+            wav_file.writeframes(bytes(pcm_frames))
+
+        log.info("Decoded Opus segment %s to WAV %s", audio_path, wav_path)
 
     def _build_transcript_markdown(self, session_id: int) -> str:
         rows = self.storage.get_session_segments(session_id)
