@@ -184,9 +184,14 @@ class DockerServiceManager:
         with self._ensure_whisper_image_lock:
             if self._image_exists(self.whisper.image):
                 return
-            project_root = Path(__file__).resolve().parents[2]
+            project_root = self._resolve_project_root()
             dockerfile = project_root / "docker" / "whisper" / "Dockerfile"
             context = project_root / "docker" / "whisper"
+            if not dockerfile.exists() or not context.exists():
+                raise RuntimeError(
+                    f"Could not find Whisper Docker build context at {context}. "
+                    "Ensure the repository is mounted at /app in the bot container."
+                )
             self._run_container(
                 [
                     "docker",
@@ -198,6 +203,18 @@ class DockerServiceManager:
                     str(context),
                 ]
             )
+
+    def _resolve_project_root(self) -> Path:
+        candidates = [
+            Path.cwd(),
+            Path("/app"),
+            Path(__file__).resolve().parents[2],
+        ]
+        for candidate in candidates:
+            dockerfile = candidate / "docker" / "whisper" / "Dockerfile"
+            if dockerfile.exists():
+                return candidate
+        return Path.cwd()
 
     def _ensure_network_sync(self) -> None:
         with self._ensure_network_lock:
