@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -73,6 +74,63 @@ class LocalAIService:
         return list(embeddings[0]) if embeddings else []
 
     def _summarize_session_sync(self, transcript_markdown: str, existing_notes_context: str) -> dict[str, Any]:
+        single_pass_max_chars = int(os.getenv("SCROLLKEEPER_SUMMARY_SINGLE_PASS_MAX_CHARS", "90000"))
+        chunk_chars = int(os.getenv("SCROLLKEEPER_SUMMARY_CHUNK_CHARS", "45000"))
+        if len(transcript_markdown) <= single_pass_max_chars:
+            return self._summarize_with_retry(
+                transcript_markdown,
+                existing_notes_context,
+                min_content_chars=80,
+            )
+
+        chunks = self._split_transcript_chunks(transcript_markdown, max_chars=chunk_chars)
+        log.warning(
+            "Transcript is %s chars; using chunked summarization (%s chunks, chunk size %s chars)",
+            len(transcript_markdown),
+            len(chunks),
+            chunk_chars,
+        )
+        chunk_payloads: list[dict[str, Any]] = []
+        for index, chunk in enumerate(chunks, start=1):
+            chunk_payload = self._summarize_with_retry(
+                chunk,
+                existing_notes_context,
+                min_content_chars=40,
+                stage_label=f"chunk {index}/{len(chunks)}",
+            )
+            chunk_payloads.append(chunk_payload)
+
+        chunked_recap_sections = ["# Transcript", ""]
+        for payload in chunk_payloads:
+            chunked_recap_sections.extend(
+                [
+                    str(payload["session_notes_markdown"]).strip(),
+                    "",
+                    str(payload["cinematic_summary_markdown"]).strip(),
+                    "",
+                ]
+            )
+        combined_chunked_recap = "\n".join(chunked_recap_sections).strip() + "\n"
+        final_payload = self._summarize_with_retry(
+            combined_chunked_recap,
+            existing_notes_context,
+            min_content_chars=80,
+            stage_label="final-from-chunks",
+        )
+        merged_updates = self._merge_note_updates(
+            [update for payload in chunk_payloads for update in payload.get("note_updates", [])]
+            + final_payload.get("note_updates", [])
+        )
+        final_payload["note_updates"] = merged_updates
+        return final_payload
+
+    def _summarize_with_retry(
+        self,
+        transcript_markdown: str,
+        existing_notes_context: str,
+        min_content_chars: int,
+        stage_label: str = "single-pass",
+    ) -> dict[str, Any]:
         instructions = """
 You are a campaign chronicler for a tabletop RPG.
 
@@ -96,6 +154,7 @@ Rules:
 - Extract durable note updates for Characters, Events, Factions, Locations, Items, Mysteries, and Points of Interest.
 - If no durable updates exist, return an empty array for note_updates.
 - Do not wrap the JSON in markdown fences.
+- Never return placeholders like "No session notes available." or "No cinematic summary available.".
 """
         prompt = f"""
 Existing campaign note context:
@@ -104,8 +163,132 @@ Existing campaign note context:
 Session transcript:
 {transcript_markdown}
 """
-        payload = self._chat_json_sync(instructions, prompt)
-        return payload
+        last_error: Exception | None = None
+        for attempt in range(1, 4):
+            attempt_instructions = instructions
+            if attempt > 1:
+                attempt_instructions += """
+Additional retry requirements:
+- The previous response was invalid or too empty.
+- Provide substantive markdown in both summary fields.
+- Ensure each field has concrete details grounded in the transcript.
+"""
+            if stage_label == "final-from-chunks":
+                attempt_instructions += """
+Final synthesis requirements:
+- The source may be chunk-level recap text from the same session.
+- Return one cohesive session-notes section and one cohesive cinematic summary.
+- Do not structure output by phase/chunk/part/pass labels unless the players explicitly used those terms in-session.
+"""
+            try:
+                payload = self._chat_json_sync(attempt_instructions, prompt)
+                normalized = self._normalize_summary_payload(payload)
+                if self._summary_has_content(normalized, min_content_chars=min_content_chars):
+                    return normalized
+                log.warning(
+                    "Summary %s attempt %s returned low-content output; retrying",
+                    stage_label,
+                    attempt,
+                )
+            except Exception as exc:  # pragma: no cover - network/model failures are expected runtime paths
+                last_error = exc
+                log.warning("Summary %s attempt %s failed: %s", stage_label, attempt, exc)
+        if last_error is not None:
+            raise RuntimeError(f"Could not generate summary for {stage_label} after retries.") from last_error
+        raise RuntimeError(f"Could not generate non-empty summary for {stage_label} after retries.")
+
+    def _normalize_summary_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        session_notes = str(payload.get("session_notes_markdown", "")).strip()
+        cinematic = str(payload.get("cinematic_summary_markdown", "")).strip()
+        normalized_updates: list[dict[str, Any]] = []
+        raw_updates = payload.get("note_updates")
+        if isinstance(raw_updates, list):
+            for item in raw_updates:
+                if not isinstance(item, dict):
+                    continue
+                note_type = str(item.get("note_type", "")).strip()
+                title = str(item.get("title", "")).strip()
+                content = str(item.get("content", "")).strip()
+                metadata = item.get("metadata", {})
+                if not note_type or not title or not content:
+                    continue
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                normalized_updates.append(
+                    {
+                        "note_type": note_type,
+                        "title": title,
+                        "content": content,
+                        "metadata": metadata,
+                    }
+                )
+        return {
+            "session_notes_markdown": session_notes,
+            "cinematic_summary_markdown": cinematic,
+            "note_updates": normalized_updates,
+        }
+
+    def _summary_has_content(self, payload: dict[str, Any], min_content_chars: int) -> bool:
+        sentinels = {
+            "",
+            "none",
+            "n/a",
+            "no session notes available.",
+            "no cinematic summary available.",
+        }
+        notes = str(payload.get("session_notes_markdown", "")).strip()
+        cinematic = str(payload.get("cinematic_summary_markdown", "")).strip()
+        if notes.lower() in sentinels or cinematic.lower() in sentinels:
+            return False
+        return len(notes) >= min_content_chars and len(cinematic) >= min_content_chars
+
+    def _split_transcript_chunks(self, transcript_markdown: str, max_chars: int) -> list[str]:
+        if len(transcript_markdown) <= max_chars:
+            return [transcript_markdown]
+        lines = transcript_markdown.splitlines()
+        # Preserve markdown heading while chunking the body.
+        body_lines = lines[2:] if len(lines) > 2 else lines
+        chunks: list[str] = []
+        current: list[str] = []
+        current_len = 0
+        for line in body_lines:
+            rendered = f"{line}\n"
+            if current and current_len + len(rendered) > max_chars:
+                chunk_text = "# Transcript\n\n" + "".join(current).strip() + "\n"
+                chunks.append(chunk_text)
+                current = []
+                current_len = 0
+            current.append(rendered)
+            current_len += len(rendered)
+        if current:
+            chunk_text = "# Transcript\n\n" + "".join(current).strip() + "\n"
+            chunks.append(chunk_text)
+        return chunks
+
+    def _merge_note_updates(self, updates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        merged: dict[tuple[str, str], dict[str, Any]] = {}
+        for item in updates:
+            if not isinstance(item, dict):
+                continue
+            note_type = str(item.get("note_type", "")).strip()
+            title = str(item.get("title", "")).strip()
+            content = str(item.get("content", "")).strip()
+            metadata = item.get("metadata", {})
+            if not note_type or not title or not content:
+                continue
+            if not isinstance(metadata, dict):
+                metadata = {}
+            key = (note_type.lower(), title.lower())
+            candidate = {
+                "note_type": note_type,
+                "title": title,
+                "content": content,
+                "metadata": metadata,
+            }
+            existing = merged.get(key)
+            if existing is None or len(content) > len(str(existing.get("content", ""))):
+                merged[key] = candidate
+        return list(merged.values())
 
     def _answer_question_sync(self, question: str, note_context: str) -> str:
         instructions = """

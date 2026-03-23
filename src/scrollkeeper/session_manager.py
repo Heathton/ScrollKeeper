@@ -190,6 +190,88 @@ class SessionManager:
         task.add_done_callback(lambda _: self.processing_tasks.pop(guild.id, None))
         return session.session_id
 
+    async def reprocess_session(self, guild_id: int, session_id: int | None = None) -> int:
+        if guild_id in self.active_sessions:
+            raise RuntimeError("Cannot reprocess while a live session is recording in this server.")
+        if guild_id in self.processing_tasks:
+            raise RuntimeError("A session is already processing in this server.")
+
+        row = self.storage.get_session(session_id) if session_id is not None else self.storage.get_latest_session(guild_id)
+        if row is None:
+            raise RuntimeError("No saved session was found to reprocess.")
+        if int(row["guild_id"]) != guild_id:
+            raise RuntimeError("That session does not belong to this server.")
+
+        resolved_session_id = int(row["id"])
+        base_dir = self.storage.sessions_dir / str(resolved_session_id)
+        audio_dir = base_dir / "audio"
+        if not audio_dir.exists():
+            raise RuntimeError(f"Session #{resolved_session_id} has no recorded audio directory to reprocess.")
+
+        session = ActiveSession(
+            session_id=resolved_session_id,
+            guild_id=int(row["guild_id"]),
+            voice_channel_id=int(row["voice_channel_id"]),
+            text_channel_id=int(row["text_channel_id"]),
+            title=row["title"],
+            base_dir=base_dir,
+            audio_dir=audio_dir,
+            started_at=datetime.fromisoformat(row["started_at"]),
+            closed=True,
+        )
+
+        self.storage.reset_session_processing(resolved_session_id)
+        self._set_status(
+            guild_id,
+            "processing",
+            resolved_session_id,
+            "Reprocessing saved audio and regenerating notes.",
+        )
+        task = asyncio.create_task(self._process_session_job(guild_id, session, transcribe_audio=True))
+        self.processing_tasks[guild_id] = task
+        task.add_done_callback(lambda _: self.processing_tasks.pop(guild_id, None))
+        return resolved_session_id
+
+    async def reprocess_llm_only(self, guild_id: int, session_id: int | None = None) -> int:
+        if guild_id in self.active_sessions:
+            raise RuntimeError("Cannot reprocess while a live session is recording in this server.")
+        if guild_id in self.processing_tasks:
+            raise RuntimeError("A session is already processing in this server.")
+
+        row = self.storage.get_session(session_id) if session_id is not None else self.storage.get_latest_session(guild_id)
+        if row is None:
+            raise RuntimeError("No saved session was found to reprocess.")
+        if int(row["guild_id"]) != guild_id:
+            raise RuntimeError("That session does not belong to this server.")
+
+        resolved_session_id = int(row["id"])
+        base_dir = self.storage.sessions_dir / str(resolved_session_id)
+        audio_dir = base_dir / "audio"
+
+        session = ActiveSession(
+            session_id=resolved_session_id,
+            guild_id=int(row["guild_id"]),
+            voice_channel_id=int(row["voice_channel_id"]),
+            text_channel_id=int(row["text_channel_id"]),
+            title=row["title"],
+            base_dir=base_dir,
+            audio_dir=audio_dir,
+            started_at=datetime.fromisoformat(row["started_at"]),
+            closed=True,
+        )
+
+        self.storage.reset_session_llm_processing(resolved_session_id)
+        self._set_status(
+            guild_id,
+            "processing",
+            resolved_session_id,
+            "Reprocessing summaries and notes from existing transcript text.",
+        )
+        task = asyncio.create_task(self._process_session_job(guild_id, session, transcribe_audio=False))
+        self.processing_tasks[guild_id] = task
+        task.add_done_callback(lambda _: self.processing_tasks.pop(guild_id, None))
+        return resolved_session_id
+
     async def answer_campaign_question(self, guild_id: int, question: str) -> str:
         query_embedding = await self.llm.embed_text(question)
         results = self.storage.semantic_search_notes(guild_id, query_embedding, limit=8)
@@ -209,12 +291,12 @@ class SessionManager:
             return f"{session_label} status: {status.state}. {status.message}"
         return f"{session_label} status: {status.state}."
 
-    async def _process_session_job(self, guild_id: int, session: ActiveSession) -> None:
+    async def _process_session_job(self, guild_id: int, session: ActiveSession, transcribe_audio: bool = True) -> None:
         artifacts: SessionArtifacts | None = None
         error_message: str | None = None
         try:
             log.info("Starting post-session processing for session %s", session.session_id)
-            artifacts = await self._process_closed_session(guild_id, session)
+            artifacts = await self._process_closed_session(guild_id, session, transcribe_audio=transcribe_audio)
             self._set_status(
                 guild_id,
                 "completed",
@@ -225,6 +307,7 @@ class SessionManager:
         except Exception as exc:
             error_message = str(exc)
             log.exception("Session %s processing failed", session.session_id)
+            self.storage.set_session_status(session.session_id, "failed")
             self._set_status(
                 guild_id,
                 "failed",
@@ -234,7 +317,12 @@ class SessionManager:
         if self._completion_handler:
             await self._completion_handler(guild_id, session.text_channel_id, artifacts, error_message)
 
-    async def _process_closed_session(self, guild_id: int, session: ActiveSession) -> SessionArtifacts:
+    async def _process_closed_session(
+        self,
+        guild_id: int,
+        session: ActiveSession,
+        transcribe_audio: bool = True,
+    ) -> SessionArtifacts:
         segments = self.storage.get_session_segments(session.session_id)
         log.info("Session %s has %s recorded audio segments", session.session_id, len(segments))
         if not segments:
@@ -242,30 +330,70 @@ class SessionManager:
                 "No decodable audio was captured for this session. "
                 "Voice packets were received, but no valid speaker audio could be saved."
             )
-        await self.llm.services.prepare_for_transcription()
-        try:
-            for segment in segments:
-                source_audio_path = Path(segment["audio_path"])
-                wav_path = self._prepare_segment_for_transcription(source_audio_path)
-                log.info(
-                    "Transcribing session %s segment %s",
-                    session.session_id,
-                    wav_path,
+        if transcribe_audio:
+            transcribed_segments = 0
+            skipped_decode_segments = 0
+            await self.llm.services.prepare_for_transcription()
+            try:
+                for segment in segments:
+                    source_audio_path = Path(segment["audio_path"])
+                    try:
+                        wav_path = self._prepare_segment_for_transcription(source_audio_path)
+                    except Exception as exc:
+                        skipped_decode_segments += 1
+                        log.warning(
+                            "Skipping undecodable segment for session %s (%s): %s",
+                            session.session_id,
+                            source_audio_path,
+                            exc,
+                        )
+                        continue
+                    log.info(
+                        "Transcribing session %s segment %s",
+                        session.session_id,
+                        wav_path,
+                    )
+                    transcript_text = await self.llm.transcribe_audio_segment(wav_path)
+                    self.storage.update_segment_transcript(
+                        session.session_id,
+                        segment["audio_path"],
+                        transcript_text,
+                    )
+                    transcribed_segments += 1
+                    log.info(
+                        "Finished transcribing session %s segment %s",
+                        session.session_id,
+                        wav_path,
+                    )
+                if transcribed_segments == 0:
+                    raise RuntimeError(
+                        "No audio segments could be transcribed. All saved segments failed to decode."
+                    )
+                if skipped_decode_segments:
+                    log.warning(
+                        "Session %s skipped %s undecodable segment(s) and transcribed %s segment(s).",
+                        session.session_id,
+                        skipped_decode_segments,
+                        transcribed_segments,
+                    )
+            finally:
+                await self.llm.services.stop_whisper()
+                await self.llm.services.recover_after_transcription()
+        else:
+            transcribed_segments = sum(
+                1
+                for segment in segments
+                if (segment["transcript_text"] or "").strip()
+            )
+            if transcribed_segments == 0:
+                raise RuntimeError(
+                    "No transcript text exists for this session yet. Run `!reprocess-session` first."
                 )
-                transcript_text = await self.llm.transcribe_audio_segment(wav_path)
-                self.storage.update_segment_transcript(
-                    session.session_id,
-                    segment["audio_path"],
-                    transcript_text,
-                )
-                log.info(
-                    "Finished transcribing session %s segment %s",
-                    session.session_id,
-                    wav_path,
-                )
-        finally:
-            await self.llm.services.stop_whisper()
-            await self.llm.services.recover_after_transcription()
+            log.info(
+                "Skipping Whisper for session %s and reusing %s existing transcript segment(s)",
+                session.session_id,
+                transcribed_segments,
+            )
 
         transcript_markdown = self._build_transcript_markdown(session.session_id)
         existing_notes_context = self._format_existing_notes_context(guild_id)
@@ -495,6 +623,7 @@ class SessionManager:
         pcm_frames = bytearray()
         expected_sequence: int | None = None
         max_gap_frames = int(SEGMENT_IDLE_SECONDS / OPUS_FRAME_DURATION_SECONDS)
+        corrupted_packets = 0
 
         for packet in packets:
             if expected_sequence is not None:
@@ -503,8 +632,17 @@ class SessionManager:
                     for _ in range(gap):
                         pcm_frames.extend(decoder.decode(None, fec=False))
 
-            pcm_frames.extend(decoder.decode(packet.payload, fec=False))
+            try:
+                pcm_frames.extend(decoder.decode(packet.payload, fec=False))
+            except discord.opus.OpusError:
+                corrupted_packets += 1
+                # Packet loss concealment keeps the timeline aligned when a frame is corrupt.
+                with contextlib.suppress(discord.opus.OpusError):
+                    pcm_frames.extend(decoder.decode(None, fec=False))
             expected_sequence = (packet.sequence + 1) % 65536
+
+        if not pcm_frames:
+            raise RuntimeError(f"No decodable PCM frames were produced from {audio_path}")
 
         with wave.open(str(wav_path), "wb") as wav_file:
             wav_file.setnchannels(CHANNELS)
@@ -512,6 +650,14 @@ class SessionManager:
             wav_file.setframerate(SAMPLE_RATE)
             wav_file.writeframes(bytes(pcm_frames))
 
+        if corrupted_packets:
+            log.warning(
+                "Decoded Opus segment %s to WAV %s with %s corrupted packet(s) concealed",
+                audio_path,
+                wav_path,
+                corrupted_packets,
+            )
+            return
         log.info("Decoded Opus segment %s to WAV %s", audio_path, wav_path)
 
     def _build_transcript_markdown(self, session_id: int) -> str:
@@ -521,9 +667,8 @@ class SessionManager:
             transcript_text = (row["transcript_text"] or "").strip()
             if not transcript_text:
                 continue
-            time_label = row["started_at"][11:19]
             speaker = row["character_name"] or row["display_name"]
-            lines.append(f"**{time_label} - {speaker}:** {transcript_text}")
+            lines.append(f"{speaker}: {transcript_text}")
             lines.append("")
         return "\n".join(lines).strip() + "\n"
 

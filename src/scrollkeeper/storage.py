@@ -143,6 +143,65 @@ class Storage:
                 (status, session_id),
             )
 
+    def reset_session_processing(self, session_id: int) -> None:
+        with self.connection() as conn:
+            conn.execute(
+                """
+                UPDATE sessions
+                SET status = 'processing',
+                    transcript_path = NULL,
+                    summary_path = NULL
+                WHERE id = ?
+                """,
+                (session_id,),
+            )
+            conn.execute(
+                """
+                UPDATE transcript_segments
+                SET transcript_text = NULL
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            )
+
+    def reset_session_llm_processing(self, session_id: int) -> None:
+        with self.connection() as conn:
+            conn.execute(
+                """
+                UPDATE sessions
+                SET status = 'processing',
+                    summary_path = NULL
+                WHERE id = ?
+                """,
+                (session_id,),
+            )
+
+    def get_session(self, session_id: int) -> sqlite3.Row | None:
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM sessions
+                WHERE id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+        return row
+
+    def get_latest_session(self, guild_id: int) -> sqlite3.Row | None:
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM sessions
+                WHERE guild_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (guild_id,),
+            ).fetchone()
+        return row
+
     def finalize_session(
         self,
         session_id: int,

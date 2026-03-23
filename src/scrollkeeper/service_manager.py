@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import os
 import subprocess
 import threading
 import time
@@ -11,6 +13,9 @@ from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 from .config import Settings
+
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -103,31 +108,44 @@ class DockerServiceManager:
             self._ensure_network_sync()
             self._ensure_whisper_image_sync()
             if self._is_container_running(self.whisper.name):
+                log.info("Whisper container %s already running; checking health", self.whisper.name)
                 self._wait_for_http(f"{self.whisper_base_url}/health", timeout_seconds=120)
+                log.info("Whisper container %s is healthy", self.whisper.name)
                 return
+            log.info("Starting Whisper container %s from image %s", self.whisper.name, self.whisper.image)
             command = [
                 "docker",
                 "run",
                 "-d",
-                "--rm",
                 "--name",
                 self.whisper.name,
                 "--network",
                 self.settings.docker_network,
             ]
+            self._remove_container(self.whisper.name)
             if self.settings.enable_gpu:
                 command.extend(["--gpus", "all"])
+            optional_whisper_env = []
+            whisper_compute_type = os.getenv("SCROLLKEEPER_WHISPER_COMPUTE_TYPE")
+            if whisper_compute_type:
+                optional_whisper_env.extend(["-e", f"WHISPER_COMPUTE_TYPE={whisper_compute_type}"])
+            whisper_vad_filter = os.getenv("SCROLLKEEPER_WHISPER_VAD_FILTER")
+            if whisper_vad_filter:
+                optional_whisper_env.extend(["-e", f"WHISPER_VAD_FILTER={whisper_vad_filter}"])
             command.extend(
                 [
                     "-e",
                     f"WHISPER_MODEL={self.settings.whisper_model}",
                     "-e",
                     f"WHISPER_DEVICE={'cuda' if self.settings.enable_gpu else 'cpu'}",
+                    *optional_whisper_env,
                     self.whisper.image,
                 ]
             )
             self._run_container(command)
+            log.info("Waiting for Whisper health endpoint at %s/health", self.whisper_base_url)
             self._wait_for_http(f"{self.whisper_base_url}/health", timeout_seconds=300)
+            log.info("Whisper container %s is healthy", self.whisper.name)
 
     def _ensure_ollama_running_sync(self) -> None:
         with self._ensure_ollama_lock:
@@ -183,6 +201,7 @@ class DockerServiceManager:
     def _ensure_whisper_image_sync(self) -> None:
         with self._ensure_whisper_image_lock:
             if self._image_exists(self.whisper.image):
+                log.info("Whisper image %s already exists", self.whisper.image)
                 return
             project_root = self._resolve_project_root()
             dockerfile = project_root / "docker" / "whisper" / "Dockerfile"
@@ -192,6 +211,7 @@ class DockerServiceManager:
                     f"Could not find Whisper Docker build context at {context}. "
                     "Ensure the repository is mounted at /app in the bot container."
                 )
+            log.info("Building Whisper image %s from %s", self.whisper.image, dockerfile)
             self._run_container(
                 [
                     "docker",
@@ -203,6 +223,7 @@ class DockerServiceManager:
                     str(context),
                 ]
             )
+            log.info("Built Whisper image %s", self.whisper.image)
 
     def _resolve_project_root(self) -> Path:
         candidates = [
@@ -260,21 +281,85 @@ class DockerServiceManager:
             check=False,
         )
 
+    def _remove_container(self, name: str) -> None:
+        subprocess.run(
+            ["docker", "rm", "-f", name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+
     def _run_container(self, command: list[str]) -> None:
         result = subprocess.run(command, capture_output=True, text=True, check=False)
         if result.returncode != 0:
+            rendered = " ".join(command)
+            stderr = (result.stderr or "").strip()
+            stdout = (result.stdout or "").strip()
+            if stderr:
+                log.error("Docker command failed: %s\nstderr: %s", rendered, stderr)
+            elif stdout:
+                log.error("Docker command failed: %s\nstdout: %s", rendered, stdout)
+            else:
+                log.error("Docker command failed with no output: %s", rendered)
             raise RuntimeError(result.stderr.strip() or f"Command failed: {' '.join(command)}")
 
     def _wait_for_http(self, url: str, timeout_seconds: int) -> None:
         deadline = time.time() + timeout_seconds
+        next_log_at = time.time() + 10
         while time.time() < deadline:
             try:
                 with urlopen(url, timeout=5) as response:
                     if response.status < 500:
                         return
             except URLError:
+                now = time.time()
+                if now >= next_log_at:
+                    remaining = max(0, int(deadline - now))
+                    log.info("Still waiting for service readiness at %s (%ss remaining)", url, remaining)
+                    next_log_at = now + 10
                 time.sleep(2)
+        container_name = self._container_name_from_url(url)
+        if container_name:
+            self._log_container_diagnostics(container_name)
         raise RuntimeError(f"Service did not become ready in time: {url}")
+
+    def _container_name_from_url(self, url: str) -> str | None:
+        prefix = "http://"
+        if not url.startswith(prefix):
+            return None
+        host_port = url[len(prefix):].split("/", 1)[0]
+        if ":" not in host_port:
+            return host_port or None
+        host, _port = host_port.split(":", 1)
+        return host or None
+
+    def _log_container_diagnostics(self, name: str) -> None:
+        inspect_result = subprocess.run(
+            ["docker", "inspect", name],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if inspect_result.returncode == 0 and inspect_result.stdout.strip():
+            log.error("Docker inspect for %s:\n%s", name, inspect_result.stdout.strip())
+        else:
+            stderr = (inspect_result.stderr or "").strip()
+            if stderr:
+                log.error("Failed to inspect container %s: %s", name, stderr)
+
+        logs_result = subprocess.run(
+            ["docker", "logs", name],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        combined_logs = "\n".join(
+            part for part in [(logs_result.stdout or "").strip(), (logs_result.stderr or "").strip()] if part
+        )
+        if combined_logs:
+            log.error("Docker logs for %s:\n%s", name, combined_logs)
+        elif logs_result.returncode != 0:
+            log.error("Failed to read docker logs for %s", name)
 
     def _http_get(self, url: str, timeout_seconds: int) -> bytes:
         with urlopen(url, timeout=timeout_seconds) as response:

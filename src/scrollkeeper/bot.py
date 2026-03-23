@@ -42,6 +42,27 @@ def build_bot(settings: Settings) -> commands.Bot:
     storage = Storage(settings.data_dir)
     llm = LocalAIService(services)
     sessions = SessionManager(storage, llm)
+    discord_message_limit = 1900
+
+    def _split_long_message(message: str, max_len: int = discord_message_limit) -> list[str]:
+        if len(message) <= max_len:
+            return [message]
+
+        chunks: list[str] = []
+        block = message.strip()
+        while len(block) > max_len:
+            split_at = block.rfind("\n\n", 0, max_len)
+            if split_at < 0:
+                split_at = block.rfind("\n", 0, max_len)
+            if split_at < 0:
+                split_at = max_len
+            chunk = block[:split_at].strip()
+            if chunk:
+                chunks.append(chunk)
+            block = block[split_at:].lstrip()
+        if block:
+            chunks.append(block)
+        return chunks
 
     async def on_session_processed(
         guild_id: int,
@@ -75,7 +96,8 @@ def build_bot(settings: Settings) -> commands.Bot:
         ]
         if artifacts.note_updates:
             response.extend(["", f"Updated {len(artifacts.note_updates)} campaign notes."])
-        await channel.send("\n".join(response)[:1900])
+        for chunk in _split_long_message("\n".join(response)):
+            await channel.send(chunk)
 
     sessions.set_completion_handler(on_session_processed)
 
@@ -181,5 +203,37 @@ def build_bot(settings: Settings) -> commands.Bot:
             await ctx.reply("This command must be used in a server.")
             return
         await ctx.reply(sessions.session_status(ctx.guild.id))
+
+    @bot.command(name="reprocess-session")
+    async def reprocess_session(ctx: commands.Context, session_id: int | None = None) -> None:
+        if ctx.guild is None:
+            await ctx.reply("This command must be used in a server.")
+            return
+        await ctx.reply("Reprocessing saved session audio in the background.")
+        try:
+            resolved_session_id = await sessions.reprocess_session(ctx.guild.id, session_id=session_id)
+        except Exception as exc:
+            await ctx.send(str(exc))
+            return
+        await ctx.send(
+            f"Session **#{resolved_session_id}** is now reprocessing from saved audio. "
+            "Use `!session-status` to check progress."
+        )
+
+    @bot.command(name="reprocess-llm")
+    async def reprocess_llm(ctx: commands.Context, session_id: int | None = None) -> None:
+        if ctx.guild is None:
+            await ctx.reply("This command must be used in a server.")
+            return
+        await ctx.reply("Reprocessing summaries and notes from existing transcript text.")
+        try:
+            resolved_session_id = await sessions.reprocess_llm_only(ctx.guild.id, session_id=session_id)
+        except Exception as exc:
+            await ctx.send(str(exc))
+            return
+        await ctx.send(
+            f"Session **#{resolved_session_id}** is now reprocessing LLM outputs only (Whisper skipped). "
+            "Use `!session-status` to check progress."
+        )
 
     return bot
