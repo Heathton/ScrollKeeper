@@ -335,6 +335,50 @@ class Storage:
             ).fetchall()
         return list(rows)
 
+    def get_campaign_note_by_id(self, guild_id: int, note_id: int) -> sqlite3.Row | None:
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM campaign_notes
+                WHERE guild_id = ? AND id = ?
+                """,
+                (guild_id, note_id),
+            ).fetchone()
+        return row
+
+    def update_campaign_note_content(
+        self,
+        guild_id: int,
+        note_id: int,
+        content: str,
+        metadata: dict | None = None,
+    ) -> bool:
+        now = datetime.utcnow().isoformat()
+        with self.connection() as conn:
+            existing = conn.execute(
+                """
+                SELECT id, metadata_json
+                FROM campaign_notes
+                WHERE guild_id = ? AND id = ?
+                """,
+                (guild_id, note_id),
+            ).fetchone()
+            if existing is None:
+                return False
+            metadata_json = existing["metadata_json"]
+            if metadata is not None:
+                metadata_json = json.dumps(metadata, ensure_ascii=True)
+            conn.execute(
+                """
+                UPDATE campaign_notes
+                SET content = ?, metadata_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (content, metadata_json, now, note_id),
+            )
+        return True
+
     def semantic_search_notes(
         self,
         guild_id: int,

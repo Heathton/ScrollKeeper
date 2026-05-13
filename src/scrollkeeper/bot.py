@@ -8,6 +8,7 @@ from discord.ext import voice_recv
 
 from .config import Settings
 from .llm import LocalAIService
+from .models import CampaignNote
 from .service_manager import DockerServiceManager
 from .session_manager import SessionManager
 from .storage import Storage
@@ -196,6 +197,73 @@ def build_bot(settings: Settings) -> commands.Bot:
             await ctx.send(f"Could not answer right now: {str(exc)[:1800]}")
             return
         await ctx.send(answer[:1900])
+
+    @bot.command(name="list-notes")
+    async def list_notes(ctx: commands.Context) -> None:
+        if ctx.guild is None:
+            await ctx.reply("This command must be used in a server.")
+            return
+        notes = storage.get_recent_notes(ctx.guild.id)
+        if not notes:
+            await ctx.reply("No campaign notes exist yet.")
+            return
+        lines = ["Recent campaign notes (use `!correct-note <id> <new content>` to edit):", ""]
+        for note in notes[:25]:
+            preview = " ".join(str(note["content"]).split())
+            if len(preview) > 110:
+                preview = preview[:107] + "..."
+            lines.append(f"- #{note['id']} [{note['note_type']}] {note['title']}: {preview}")
+        for chunk in _split_long_message("\n".join(lines)):
+            await ctx.send(chunk)
+
+    @bot.command(name="correct-note")
+    async def correct_note(ctx: commands.Context, note_id: int, *, corrected_content: str) -> None:
+        if ctx.guild is None:
+            await ctx.reply("This command must be used in a server.")
+            return
+        corrected = corrected_content.strip()
+        if not corrected:
+            await ctx.reply("Corrected content cannot be empty.")
+            return
+        note = storage.get_campaign_note_by_id(ctx.guild.id, note_id)
+        if note is None:
+            await ctx.reply(f"Could not find note #{note_id} in this server.")
+            return
+        metadata = {}
+        try:
+            # Preserve existing metadata and mark manual edits for auditability.
+            import json
+
+            metadata = json.loads(note["metadata_json"] or "{}")
+            if not isinstance(metadata, dict):
+                metadata = {}
+        except Exception:
+            metadata = {}
+        metadata["manually_corrected"] = True
+        metadata["corrected_by_user_id"] = getattr(ctx.author, "id", None)
+
+        updated = storage.update_campaign_note_content(
+            ctx.guild.id,
+            note_id,
+            corrected,
+            metadata=metadata,
+        )
+        if not updated:
+            await ctx.reply(f"Could not update note #{note_id}.")
+            return
+        embedding = await llm.embed_text(f"{note['note_type']}\n{note['title']}\n{corrected}")
+        storage.upsert_campaign_note(
+            CampaignNote(
+                guild_id=ctx.guild.id,
+                note_type=note["note_type"],
+                title=note["title"],
+                content=corrected,
+                source_session_id=note["source_session_id"],
+                metadata=metadata,
+            ),
+            embedding,
+        )
+        await ctx.reply(f"Updated note #{note_id}: **[{note['note_type']}] {note['title']}**")
 
     @bot.command(name="session-status")
     async def session_status(ctx: commands.Context) -> None:

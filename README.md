@@ -19,6 +19,8 @@ ScrollKeeper is a Discord bot for tabletop campaigns. It can join a voice channe
 - `!start-session [title]`: begin recording/transcription for the active voice channel
 - `!end-session`: stop recording, finalize transcript, generate summaries/notes, and post the result
 - `!campaign-question <question>`: ask about campaign notes
+- `!list-notes`: list recent campaign notes with IDs
+- `!correct-note <note-id> <corrected content>`: manually fix an incorrect campaign note
 - `!session-status`: show the current session state
 - `!reprocess-session [session-id]`: rerun Whisper + summary/note generation from saved audio
 - `!reprocess-llm [session-id]`: rerun summary/note generation only from existing transcript text (skips Whisper)
@@ -45,6 +47,7 @@ The bot container mounts the Docker socket and starts sibling containers as need
 - `SCROLLKEEPER_WHISPER_VAD_FILTER=true` keeps VAD enabled; set to `false` if ONNX Runtime VAD warnings are noisy or unnecessary for your clips.
 - `SCROLLKEEPER_SUMMARY_SINGLE_PASS_MAX_CHARS=90000` sets when the bot switches from single-pass summary generation to chunked summarization.
 - `SCROLLKEEPER_SUMMARY_CHUNK_CHARS=45000` sets chunk size used when transcripts are too long for single-pass summarization.
+- `SCROLLKEEPER_SUMMARY_PROMPT_APPEND=` appends your own instructions to the summary/note-generation system prompt (for tone, taxonomy emphasis, or house rules).
 
 ## Storage layout
 
@@ -59,6 +62,7 @@ The bot container mounts the Docker socket and starts sibling containers as need
 - Discord voice receive in Python relies on `discord-ext-voice-recv`.
 - The bot records speaker-specific WAV segments and transcribes them after the session ends. This is simpler and more reliable than trying to stream partial text live.
 - Transcript markdown is saved in speaker-only format (`**Speaker:** line`) without timestamp prefixes to reduce context-token overhead in summarization.
+- Session summaries are generated from the current session transcript only, so prior campaign notes are not used as summary source material.
 - Notes are indexed with embeddings stored in SQLite. Transcript text is archived but intentionally excluded from retrieval, matching your requirement.
 - If the voice connection drops mid-session, the bot will try to reconnect to the same channel and continue the session.
 - The bot calls the local Whisper HTTP service for speech-to-text, then stops that container after transcription completes.

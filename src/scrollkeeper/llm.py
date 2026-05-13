@@ -74,12 +74,12 @@ class LocalAIService:
         return list(embeddings[0]) if embeddings else []
 
     def _summarize_session_sync(self, transcript_markdown: str, existing_notes_context: str) -> dict[str, Any]:
+        _ = existing_notes_context  # Intentionally ignored to prevent prior-note leakage into session summaries.
         single_pass_max_chars = int(os.getenv("SCROLLKEEPER_SUMMARY_SINGLE_PASS_MAX_CHARS", "90000"))
         chunk_chars = int(os.getenv("SCROLLKEEPER_SUMMARY_CHUNK_CHARS", "45000"))
         if len(transcript_markdown) <= single_pass_max_chars:
             return self._summarize_with_retry(
                 transcript_markdown,
-                existing_notes_context,
                 min_content_chars=80,
             )
 
@@ -94,7 +94,6 @@ class LocalAIService:
         for index, chunk in enumerate(chunks, start=1):
             chunk_payload = self._summarize_with_retry(
                 chunk,
-                existing_notes_context,
                 min_content_chars=40,
                 stage_label=f"chunk {index}/{len(chunks)}",
             )
@@ -113,7 +112,6 @@ class LocalAIService:
         combined_chunked_recap = "\n".join(chunked_recap_sections).strip() + "\n"
         final_payload = self._summarize_with_retry(
             combined_chunked_recap,
-            existing_notes_context,
             min_content_chars=80,
             stage_label="final-from-chunks",
         )
@@ -127,39 +125,11 @@ class LocalAIService:
     def _summarize_with_retry(
         self,
         transcript_markdown: str,
-        existing_notes_context: str,
         min_content_chars: int,
         stage_label: str = "single-pass",
     ) -> dict[str, Any]:
-        instructions = """
-You are a campaign chronicler for a tabletop RPG.
-
-Return valid JSON only with this exact schema:
-{
-  "session_notes_markdown": "string",
-  "cinematic_summary_markdown": "string",
-  "note_updates": [
-    {
-      "note_type": "string",
-      "title": "string",
-      "content": "string",
-      "metadata": {}
-    }
-  ]
-}
-
-Rules:
-- Use the transcript as the source of truth.
-- Produce practical session notes and a cinematic narrative recap.
-- Extract durable note updates for Characters, Events, Factions, Locations, Items, Mysteries, and Points of Interest.
-- If no durable updates exist, return an empty array for note_updates.
-- Do not wrap the JSON in markdown fences.
-- Never return placeholders like "No session notes available." or "No cinematic summary available.".
-"""
+        instructions = self._build_summary_instructions()
         prompt = f"""
-Existing campaign note context:
-{existing_notes_context}
-
 Session transcript:
 {transcript_markdown}
 """
@@ -196,6 +166,42 @@ Final synthesis requirements:
         if last_error is not None:
             raise RuntimeError(f"Could not generate summary for {stage_label} after retries.") from last_error
         raise RuntimeError(f"Could not generate non-empty summary for {stage_label} after retries.")
+
+    def _build_summary_instructions(self) -> str:
+        base = """
+You are a campaign chronicler for a tabletop RPG.
+
+Return valid JSON only with this exact schema:
+{
+  "session_notes_markdown": "string",
+  "cinematic_summary_markdown": "string",
+  "note_updates": [
+    {
+      "note_type": "string",
+      "title": "string",
+      "content": "string",
+      "metadata": {}
+    }
+  ]
+}
+
+Rules:
+- Use only the provided session transcript as the source of truth.
+- Produce practical session notes and a cinematic narrative recap.
+- For `note_updates`, include only durable world-state updates that should persist across sessions.
+- Use only these `note_type` values: Character, Event, Faction, Location, Item, Mystery, PointOfInterest.
+- Prefer updating existing concepts over creating near-duplicate titles.
+- Do not invent facts; if uncertain, omit from `note_updates`.
+- Avoid ephemeral chatter, jokes, and tactical minute-by-minute actions unless they permanently changed the world state.
+- Write note `content` as factual bullet points with concrete details (who/what/where/when/why when available).
+- If no durable updates exist, return an empty array for note_updates.
+- Do not wrap the JSON in markdown fences.
+- Never return placeholders like "No session notes available." or "No cinematic summary available.".
+"""
+        prompt_append = os.getenv("SCROLLKEEPER_SUMMARY_PROMPT_APPEND", "").strip()
+        if prompt_append:
+            base += f"\n\nAdditional project instructions:\n{prompt_append}\n"
+        return base
 
     def _normalize_summary_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         session_notes = str(payload.get("session_notes_markdown", "")).strip()
