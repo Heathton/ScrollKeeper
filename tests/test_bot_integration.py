@@ -45,20 +45,8 @@ class FakeStorage:
         return
 
 
-class FakeServices:
-    def __init__(self, _settings: Settings) -> None:
-        self.warmup_calls = 0
-        self.shutdown_calls = 0
-
-    async def ensure_ollama_running(self) -> None:
-        self.warmup_calls += 1
-
-    async def shutdown(self) -> None:
-        self.shutdown_calls += 1
-
-
 class FakeLocalAIService:
-    def __init__(self, _services: FakeServices) -> None:
+    def __init__(self, _settings: Settings) -> None:
         pass
 
 
@@ -67,6 +55,7 @@ class FakeSessionManager:
 
     def __init__(self, _storage: FakeStorage, _llm: FakeLocalAIService) -> None:
         self.completion_handler = None
+        self.notice_handler = None
         self.end_session_calls: list[int] = []
         self.reprocess_calls: list[tuple[int, int | None]] = []
         self.reprocess_llm_calls: list[tuple[int, int | None]] = []
@@ -77,12 +66,15 @@ class FakeSessionManager:
     def set_completion_handler(self, handler) -> None:
         self.completion_handler = handler
 
+    def set_notice_handler(self, handler) -> None:
+        self.notice_handler = handler
+
     async def end_session(self, guild) -> int:
         self.end_session_calls.append(guild.id)
         self.status_map[guild.id] = "Session #42 status: processing. Transcribing and generating notes."
         return 42
 
-    async def answer_campaign_question(self, guild_id: int, question: str) -> str:
+    async def answer_campaign_question(self, guild_id: int, question: str, on_wait=None) -> str:
         self.answer_calls.append((guild_id, question))
         return "Campaign answer from notes."
 
@@ -108,19 +100,17 @@ def build_settings() -> Settings:
         command_prefix="!",
         data_dir=Path("/tmp/scrollkeeper-tests"),
         bot_name="ScrollKeeper",
-        docker_network="scrollkeeper-net",
-        whisper_image="scrollkeeper-whisper:latest",
-        whisper_container="scrollkeeper-whisper",
-        whisper_port=9000,
-        whisper_model="small.en",
-        ollama_image="ollama/ollama:latest",
-        ollama_container="scrollkeeper-ollama",
-        ollama_port=11434,
-        ollama_model="qwen3.5:9b",
-        ollama_embed_model="qwen3-embedding:4b",
-        ollama_idle_timeout=0,
-        gpu_policy="concurrent",
-        enable_gpu=True,
+        stt_base_url="http://stt/v1",
+        stt_model="whisper-1",
+        stt_timeout_seconds=600,
+        llm_base_url="http://llm/v1",
+        llm_model="test-model",
+        llm_api_key="",
+        llm_timeout_seconds=900,
+        embed_base_url="http://llm/v1",
+        embed_model="test-embed",
+        wait_notice_seconds=20,
+        health_port=0,
     )
 
 
@@ -128,7 +118,6 @@ def build_settings() -> Settings:
 class BotIntegrationHarnessTests(unittest.IsolatedAsyncioTestCase):
     async def test_end_session_returns_immediately_and_posts_completion_later(self) -> None:
         with (
-            patch("scrollkeeper.bot.DockerServiceManager", FakeServices),
             patch("scrollkeeper.bot.Storage", FakeStorage),
             patch("scrollkeeper.bot.LocalAIService", FakeLocalAIService),
             patch("scrollkeeper.bot.SessionManager", FakeSessionManager),
@@ -175,7 +164,6 @@ class BotIntegrationHarnessTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_completion_handler_splits_long_summary_across_messages(self) -> None:
         with (
-            patch("scrollkeeper.bot.DockerServiceManager", FakeServices),
             patch("scrollkeeper.bot.Storage", FakeStorage),
             patch("scrollkeeper.bot.LocalAIService", FakeLocalAIService),
             patch("scrollkeeper.bot.SessionManager", FakeSessionManager),
@@ -209,7 +197,6 @@ class BotIntegrationHarnessTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_campaign_question_works_while_processing(self) -> None:
         with (
-            patch("scrollkeeper.bot.DockerServiceManager", FakeServices),
             patch("scrollkeeper.bot.Storage", FakeStorage),
             patch("scrollkeeper.bot.LocalAIService", FakeLocalAIService),
             patch("scrollkeeper.bot.SessionManager", FakeSessionManager),
@@ -231,7 +218,6 @@ class BotIntegrationHarnessTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_completion_handler_posts_failure_message(self) -> None:
         with (
-            patch("scrollkeeper.bot.DockerServiceManager", FakeServices),
             patch("scrollkeeper.bot.Storage", FakeStorage),
             patch("scrollkeeper.bot.LocalAIService", FakeLocalAIService),
             patch("scrollkeeper.bot.SessionManager", FakeSessionManager),
@@ -256,7 +242,6 @@ class BotIntegrationHarnessTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_reprocess_session_uses_latest_by_default(self) -> None:
         with (
-            patch("scrollkeeper.bot.DockerServiceManager", FakeServices),
             patch("scrollkeeper.bot.Storage", FakeStorage),
             patch("scrollkeeper.bot.LocalAIService", FakeLocalAIService),
             patch("scrollkeeper.bot.SessionManager", FakeSessionManager),
@@ -281,7 +266,6 @@ class BotIntegrationHarnessTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_reprocess_llm_uses_latest_by_default(self) -> None:
         with (
-            patch("scrollkeeper.bot.DockerServiceManager", FakeServices),
             patch("scrollkeeper.bot.Storage", FakeStorage),
             patch("scrollkeeper.bot.LocalAIService", FakeLocalAIService),
             patch("scrollkeeper.bot.SessionManager", FakeSessionManager),
@@ -297,7 +281,7 @@ class BotIntegrationHarnessTests(unittest.IsolatedAsyncioTestCase):
                 await reprocess_command.callback(ctx)
 
                 self.assertEqual(ctx.replies[0], "Reprocessing summaries and notes from existing transcript text.")
-                self.assertIn("Session **#85** is now reprocessing LLM outputs only (Whisper skipped).", ctx.sent[0])
+                self.assertIn("Session **#85** is now reprocessing LLM outputs only (speech-to-text skipped).", ctx.sent[0])
                 manager = FakeSessionManager.last_instance
                 self.assertIsNotNone(manager)
                 self.assertEqual(manager.reprocess_llm_calls, [(404, None)])

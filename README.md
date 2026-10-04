@@ -9,8 +9,8 @@ ScrollKeeper is a Discord bot for tabletop campaigns. It can join a voice channe
 - Persistent SQLite storage for sessions, transcripts, character mappings, notes, and embeddings
 - File archives for audio segments, transcripts, summaries, and generated notes
 - Retrieval-backed campaign Q&A over saved notes
-- Local Whisper transcription service started on demand in Docker
-- Local Ollama inference service started on demand for summaries, embeddings, and campaign Q&A
+- Speech-to-text through an OpenAI-compatible `/v1/audio/transcriptions` endpoint (a CPU faster-whisper service is included)
+- Summaries, embeddings, and campaign Q&A through any OpenAI-compatible LLM endpoint (`/v1/chat/completions`, `/v1/embeddings`)
 
 ## Commands
 
@@ -22,32 +22,44 @@ ScrollKeeper is a Discord bot for tabletop campaigns. It can join a voice channe
 - `!list-notes`: list recent campaign notes with IDs
 - `!correct-note <note-id> <corrected content>`: manually fix an incorrect campaign note
 - `!session-status`: show the current session state
-- `!reprocess-session [session-id]`: rerun Whisper + summary/note generation from saved audio
-- `!reprocess-llm [session-id]`: rerun summary/note generation only from existing transcript text (skips Whisper)
+- `!reprocess-session [session-id]`: rerun speech-to-text + summary/note generation from saved audio
+- `!reprocess-llm [session-id]`: rerun summary/note generation only from existing transcript text (skips speech-to-text)
 
-## Docker Setup
+## Configuration
 
-1. Copy `.env.example` to `.env` and fill in your Discord bot token.
-2. Create a Discord bot with the `MESSAGE CONTENT`, `SERVER MEMBERS INTENT`, and `VOICE STATES INTENT` enabled.
-3. Invite the bot to your server with voice permissions.
-4. Start the stack:
+All configuration comes from environment variables (a `.env` file is optional and only for local development). Copy `.env.example` for the full list. Required:
+
+- `DISCORD_BOT_TOKEN`
+- `SCROLLKEEPER_STT_BASE_URL`: OpenAI-compatible speech-to-text server, including `/v1` (the bot calls `POST /audio/transcriptions` with `response_format=verbose_json` and word timestamps).
+- `SCROLLKEEPER_LLM_BASE_URL` and `SCROLLKEEPER_LLM_MODEL`: OpenAI-compatible chat server (`POST /chat/completions`). `SCROLLKEEPER_LLM_API_KEY` is optional.
+- `SCROLLKEEPER_EMBED_MODEL`: embedding model served at `POST /embeddings` on `SCROLLKEEPER_EMBED_BASE_URL` (defaults to the LLM base URL).
+
+Optional:
+
+- `SCROLLKEEPER_LLM_TIMEOUT_SECONDS=900` / `SCROLLKEEPER_STT_TIMEOUT_SECONDS=600`: read timeouts. They are long on purpose because the LLM host may cold-start for several minutes.
+- `SCROLLKEEPER_WAIT_NOTICE_SECONDS=20`: if a request takes longer than this, the bot posts a "waking the inference box" notice in the Discord channel.
+- `SCROLLKEEPER_HEALTH_PORT=8080`: serves `GET /healthz` for Kubernetes liveness probes (`0` disables). It returns 503 if the bot's event loop has stalled for over a minute.
+- `SCROLLKEEPER_SUMMARY_SINGLE_PASS_MAX_CHARS=90000` sets when the bot switches from single-pass summary generation to chunked summarization.
+- `SCROLLKEEPER_SUMMARY_CHUNK_CHARS=45000` sets chunk size used when transcripts are too long for single-pass summarization.
+- `SCROLLKEEPER_SUMMARY_PROMPT_APPEND=` appends your own instructions to the summary/note-generation system prompt.
+
+Logs go to stdout. The bot never starts other containers and does not need the Docker socket.
+
+## Local development with Docker Compose
+
+1. Copy `.env.example` to `.env`; fill in the Discord bot token and your LLM endpoint and model.
+2. Create a Discord bot with the `MESSAGE CONTENT`, `SERVER MEMBERS INTENT`, and `VOICE STATES INTENT` enabled, and invite it with voice permissions.
+3. Start the stack:
 
 ```bash
 docker compose up --build
 ```
 
-The bot container mounts the Docker socket and starts sibling containers as needed:
+Compose runs the bot and a CPU faster-whisper service (`docker/whisper`) that implements `/v1/audio/transcriptions`. The LLM is not started by compose: point `SCROLLKEEPER_LLM_BASE_URL` at any OpenAI-compatible server.
 
-- A local Whisper service is built from `docker/whisper` and started only during transcript finalization.
-- An Ollama container is kept running in `concurrent` mode so question answering remains available during session processing.
-- Set `SCROLLKEEPER_GPU_POLICY=serialize` to unload Ollama models while Whisper transcribes if GPU pressure is too high.
-- `SCROLLKEEPER_OLLAMA_IDLE_TIMEOUT=0` disables automatic Ollama shutdown (recommended for concurrency tests).
-- `SCROLLKEEPER_ENABLE_GPU=true` enables `--gpus all` for Ollama and Whisper containers.
-- `SCROLLKEEPER_WHISPER_COMPUTE_TYPE=float16` keeps Whisper on GPU-friendly precision (when CUDA is enabled).
-- `SCROLLKEEPER_WHISPER_VAD_FILTER=true` keeps VAD enabled; set to `false` if ONNX Runtime VAD warnings are noisy or unnecessary for your clips.
-- `SCROLLKEEPER_SUMMARY_SINGLE_PASS_MAX_CHARS=90000` sets when the bot switches from single-pass summary generation to chunked summarization.
-- `SCROLLKEEPER_SUMMARY_CHUNK_CHARS=45000` sets chunk size used when transcripts are too long for single-pass summarization.
-- `SCROLLKEEPER_SUMMARY_PROMPT_APPEND=` appends your own instructions to the summary/note-generation system prompt (for tone, taxonomy emphasis, or house rules).
+## Container images
+
+Pushing a `v*` tag runs `.github/workflows/images.yml`, which publishes `ghcr.io/<owner>/scrollkeeper` (the bot) and `ghcr.io/<owner>/scrollkeeper-stt` (speech-to-text) tagged with the version. Pin these tags in deployments; there is no `latest`.
 
 ## Storage layout
 
@@ -65,25 +77,11 @@ The bot container mounts the Docker socket and starts sibling containers as need
 - Session summaries are generated from the current session transcript only, so prior campaign notes are not used as summary source material.
 - Notes are indexed with embeddings stored in SQLite. Transcript text is archived but intentionally excluded from retrieval, matching your requirement.
 - If the voice connection drops mid-session, the bot will try to reconnect to the same channel and continue the session.
-- The bot calls the local Whisper HTTP service for speech-to-text, then stops that container after transcription completes.
-- If you see `onnxruntime ... device_discovery ... /sys/class/drm/card0/device/vendor`, that warning comes from VAD probing and does not necessarily mean the core Whisper model is on CPU.
-- The bot calls Ollama's local REST API for summaries, note updates, embeddings, and campaign Q&A.
+- `discord-ext-voice-recv` is pinned to a commit SHA in `pyproject.toml`; change it deliberately, in its own PR. If Python voice receive keeps breaking, the fallback is a small Node `@discordjs/voice` recorder feeding this pipeline.
+- The bot calls the configured speech-to-text endpoint per speaker segment after the session ends.
+- Summaries, note updates, embeddings, and campaign Q&A go to the configured OpenAI-compatible LLM endpoint.
 - Long completion posts are split across multiple Discord messages automatically to avoid message-length truncation.
 - `!end-session` now queues background processing so users can still run `!campaign-question` while transcription and note generation continue.
-- The first Ollama use may take a while because the requested models need to be pulled into the persistent `scrollkeeper_ollama` volume.
-
-## Recommended Defaults For Your Hardware
-
-- `SCROLLKEEPER_OLLAMA_MODEL=qwen3.5:9b`
-- `SCROLLKEEPER_WHISPER_MODEL=small.en`
-- `SCROLLKEEPER_WHISPER_COMPUTE_TYPE=float16`
-- `SCROLLKEEPER_WHISPER_VAD_FILTER=true`
-- `SCROLLKEEPER_SUMMARY_SINGLE_PASS_MAX_CHARS=90000`
-- `SCROLLKEEPER_SUMMARY_CHUNK_CHARS=45000`
-- `SCROLLKEEPER_OLLAMA_EMBED_MODEL=qwen3-embedding:4b`
-- `SCROLLKEEPER_GPU_POLICY=concurrent`
-- `SCROLLKEEPER_OLLAMA_IDLE_TIMEOUT=0`
-- `SCROLLKEEPER_ENABLE_GPU=true`
 
 ## Next improvements
 

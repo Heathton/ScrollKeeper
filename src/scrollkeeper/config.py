@@ -7,60 +7,62 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 
+def _optional_env(name: str) -> str:
+    return os.getenv(name, "").strip()
+
+
 @dataclass(slots=True)
 class Settings:
     discord_bot_token: str
     command_prefix: str
     data_dir: Path
     bot_name: str
-    docker_network: str
-    whisper_image: str
-    whisper_container: str
-    whisper_port: int
-    whisper_model: str
-    ollama_image: str
-    ollama_container: str
-    ollama_port: int
-    ollama_model: str
-    ollama_embed_model: str
-    ollama_idle_timeout: int
-    gpu_policy: str
-    enable_gpu: bool
+    stt_base_url: str
+    stt_model: str
+    stt_timeout_seconds: int
+    llm_base_url: str
+    llm_model: str
+    llm_api_key: str
+    llm_timeout_seconds: int
+    embed_base_url: str
+    embed_model: str
+    wait_notice_seconds: int
+    health_port: int
 
     @classmethod
     def load(cls) -> "Settings":
+        # A .env file is optional (local dev); in Kubernetes everything comes from the environment.
         load_dotenv()
         data_dir = Path(os.getenv("SCROLLKEEPER_DATA_DIR", "./data")).resolve()
         data_dir.mkdir(parents=True, exist_ok=True)
+        llm_base_url = _optional_env("SCROLLKEEPER_LLM_BASE_URL").rstrip("/")
         return cls(
             discord_bot_token=os.getenv("DISCORD_BOT_TOKEN", ""),
             command_prefix=os.getenv("DISCORD_COMMAND_PREFIX", "!"),
             data_dir=data_dir,
             bot_name=os.getenv("SCROLLKEEPER_BOT_NAME", "ScrollKeeper"),
-            docker_network=os.getenv("SCROLLKEEPER_DOCKER_NETWORK", "scrollkeeper-net"),
-            whisper_image=os.getenv("SCROLLKEEPER_WHISPER_IMAGE", "scrollkeeper-whisper:latest"),
-            whisper_container=os.getenv("SCROLLKEEPER_WHISPER_CONTAINER", "scrollkeeper-whisper"),
-            whisper_port=int(os.getenv("SCROLLKEEPER_WHISPER_PORT", "9000")),
-            whisper_model=os.getenv("SCROLLKEEPER_WHISPER_MODEL", "small.en"),
-            ollama_image=os.getenv("SCROLLKEEPER_OLLAMA_IMAGE", "ollama/ollama:latest"),
-            ollama_container=os.getenv("SCROLLKEEPER_OLLAMA_CONTAINER", "scrollkeeper-ollama"),
-            ollama_port=int(os.getenv("SCROLLKEEPER_OLLAMA_PORT", "11434")),
-            ollama_model=os.getenv("SCROLLKEEPER_OLLAMA_MODEL", "qwen3.5:9b"),
-            ollama_embed_model=os.getenv(
-                "SCROLLKEEPER_OLLAMA_EMBED_MODEL",
-                "qwen3-embedding:4b",
-            ),
-            ollama_idle_timeout=int(os.getenv("SCROLLKEEPER_OLLAMA_IDLE_TIMEOUT", "0")),
-            gpu_policy=os.getenv("SCROLLKEEPER_GPU_POLICY", "concurrent").strip().lower(),
-            enable_gpu=os.getenv("SCROLLKEEPER_ENABLE_GPU", "true").strip().lower() in {"1", "true", "yes", "on"},
+            stt_base_url=_optional_env("SCROLLKEEPER_STT_BASE_URL").rstrip("/"),
+            stt_model=os.getenv("SCROLLKEEPER_STT_MODEL", "whisper-1").strip(),
+            stt_timeout_seconds=int(os.getenv("SCROLLKEEPER_STT_TIMEOUT_SECONDS", "600")),
+            llm_base_url=llm_base_url,
+            llm_model=_optional_env("SCROLLKEEPER_LLM_MODEL"),
+            llm_api_key=_optional_env("SCROLLKEEPER_LLM_API_KEY"),
+            llm_timeout_seconds=int(os.getenv("SCROLLKEEPER_LLM_TIMEOUT_SECONDS", "900")),
+            embed_base_url=_optional_env("SCROLLKEEPER_EMBED_BASE_URL").rstrip("/") or llm_base_url,
+            embed_model=_optional_env("SCROLLKEEPER_EMBED_MODEL"),
+            wait_notice_seconds=int(os.getenv("SCROLLKEEPER_WAIT_NOTICE_SECONDS", "20")),
+            health_port=int(os.getenv("SCROLLKEEPER_HEALTH_PORT", "8080")),
         )
 
     def validate(self) -> None:
-        missing = []
-        if not self.discord_bot_token:
-            missing.append("DISCORD_BOT_TOKEN")
+        required = {
+            "DISCORD_BOT_TOKEN": self.discord_bot_token,
+            "SCROLLKEEPER_STT_BASE_URL": self.stt_base_url,
+            "SCROLLKEEPER_LLM_BASE_URL": self.llm_base_url,
+            "SCROLLKEEPER_LLM_MODEL": self.llm_model,
+            "SCROLLKEEPER_EMBED_MODEL": self.embed_model,
+        }
+        missing = [name for name, value in required.items() if not value]
         if missing:
             joined = ", ".join(missing)
             raise RuntimeError(f"Missing required environment variables: {joined}")
-        if self.gpu_policy not in {"concurrent", "serialize"}:
-            raise RuntimeError("SCROLLKEEPER_GPU_POLICY must be either 'concurrent' or 'serialize'.")

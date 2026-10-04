@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import logging
 import os
+import tempfile
 from functools import lru_cache
 from pathlib import Path
 
 import ctranslate2
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from faster_whisper import WhisperModel
 
 
@@ -90,16 +91,46 @@ def health() -> dict[str, str]:
     return response
 
 
-@app.post("/transcribe")
-async def transcribe(file: UploadFile = File(...)) -> dict[str, str]:
+@app.post("/v1/audio/transcriptions")
+async def transcribe(
+    file: UploadFile = File(...),
+    model: str = Form(""),
+    response_format: str = Form("json"),
+    timestamp_granularities: list[str] = Form(default=[], alias="timestamp_granularities[]"),
+) -> dict[str, object]:
+    """OpenAI-compatible transcription endpoint. The `model` field is ignored; WHISPER_MODEL decides."""
     suffix = Path(file.filename or "audio.wav").suffix or ".wav"
-    temp_path = Path("/tmp") / f"scrollkeeper_upload{suffix}"
-    contents = await file.read()
-    temp_path.write_bytes(contents)
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as handle:
+        handle.write(await file.read())
+        temp_path = Path(handle.name)
+    want_words = response_format == "verbose_json" and "word" in timestamp_granularities
     try:
-        segments, _ = get_model().transcribe(str(temp_path), vad_filter=should_use_vad_filter())
+        segments, info = get_model().transcribe(
+            str(temp_path),
+            vad_filter=should_use_vad_filter(),
+            word_timestamps=want_words,
+        )
+        segments = list(segments)
         text = " ".join(segment.text.strip() for segment in segments).strip()
-        return {"text": text}
+        if response_format != "verbose_json":
+            return {"text": text}
+        result: dict[str, object] = {
+            "task": "transcribe",
+            "language": info.language,
+            "duration": info.duration,
+            "text": text,
+            "segments": [
+                {"id": index, "start": seg.start, "end": seg.end, "text": seg.text.strip()}
+                for index, seg in enumerate(segments)
+            ],
+        }
+        if want_words:
+            result["words"] = [
+                {"word": word.word.strip(), "start": word.start, "end": word.end}
+                for seg in segments
+                for word in (seg.words or [])
+            ]
+        return result
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     finally:

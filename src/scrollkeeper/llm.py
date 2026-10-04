@@ -5,55 +5,103 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import requests
 
-from .service_manager import DockerServiceManager
+from .config import Settings
 
 
 log = logging.getLogger(__name__)
 
+WaitNotifier = Callable[[str], Awaitable[None]]
+
+CONNECT_TIMEOUT_SECONDS = 60
+
 
 class LocalAIService:
-    def __init__(self, services: DockerServiceManager) -> None:
-        self.services = services
+    """Client for OpenAI-compatible speech-to-text, chat, and embedding endpoints.
 
-    async def transcribe_audio_segment(self, audio_path: Path) -> str:
-        log.info("Submitting %s to Whisper", audio_path)
-        await self.services.ensure_whisper_running()
-        text = await asyncio.to_thread(self._transcribe_audio_segment_sync, audio_path)
-        log.info("Whisper returned transcript for %s", audio_path)
+    The LLM host may cold-start for minutes, so reads use long timeouts and callers can pass
+    `on_wait` to tell the Discord channel when a request is taking unusually long.
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+
+    async def transcribe_audio_segment(self, audio_path: Path, on_wait: WaitNotifier | None = None) -> str:
+        log.info("Submitting %s to the speech-to-text service", audio_path)
+        text = await self._run_blocking(
+            self._transcribe_audio_segment_sync,
+            audio_path,
+            on_wait=on_wait,
+            wait_message="Waiting on the speech-to-text service (it may be starting up)...",
+        )
+        log.info("Speech-to-text returned transcript for %s", audio_path)
         return text
 
-    async def embed_text(self, text: str) -> list[float]:
-        await self.services.ensure_ollama_running()
-        embedding = await asyncio.to_thread(self._embed_text_sync, text)
-        self.services.mark_ollama_used()
-        return embedding
+    async def embed_text(self, text: str, on_wait: WaitNotifier | None = None) -> list[float]:
+        return await self._run_blocking(
+            self._embed_text_sync,
+            text,
+            on_wait=on_wait,
+            wait_message="Waking the inference box, this can take a few minutes...",
+        )
 
-    async def summarize_session(self, transcript_markdown: str, existing_notes_context: str) -> dict[str, Any]:
-        await self.services.ensure_ollama_running()
-        summary = await asyncio.to_thread(
+    async def summarize_session(
+        self,
+        transcript_markdown: str,
+        existing_notes_context: str,
+        on_wait: WaitNotifier | None = None,
+    ) -> dict[str, Any]:
+        return await self._run_blocking(
             self._summarize_session_sync,
             transcript_markdown,
             existing_notes_context,
+            on_wait=on_wait,
+            wait_message="Waking the inference box, this can take a few minutes...",
         )
-        self.services.mark_ollama_used()
-        return summary
 
-    async def answer_question(self, question: str, note_context: str) -> str:
-        await self.services.ensure_ollama_running()
-        answer = await asyncio.to_thread(self._answer_question_sync, question, note_context)
-        self.services.mark_ollama_used()
-        return answer
+    async def answer_question(self, question: str, note_context: str, on_wait: WaitNotifier | None = None) -> str:
+        return await self._run_blocking(
+            self._answer_question_sync,
+            question,
+            note_context,
+            on_wait=on_wait,
+            wait_message="Waking the inference box, this can take a few minutes...",
+        )
+
+    async def _run_blocking(self, func, *args, on_wait: WaitNotifier | None, wait_message: str):
+        """Run a blocking call in a worker thread; post `wait_message` once if it runs long."""
+        task = asyncio.ensure_future(asyncio.to_thread(func, *args))
+        if on_wait is not None:
+            done, _ = await asyncio.wait({task}, timeout=self.settings.wait_notice_seconds)
+            if not done:
+                try:
+                    await on_wait(wait_message)
+                except Exception:
+                    log.warning("Could not post wait notice", exc_info=True)
+        return await task
+
+    def _timeout(self, read_seconds: int) -> tuple[int, int]:
+        return (CONNECT_TIMEOUT_SECONDS, read_seconds)
+
+    def _headers(self) -> dict[str, str]:
+        if self.settings.llm_api_key:
+            return {"Authorization": f"Bearer {self.settings.llm_api_key}"}
+        return {}
 
     def _transcribe_audio_segment_sync(self, audio_path: Path) -> str:
         with audio_path.open("rb") as handle:
             response = requests.post(
-                f"{self.services.whisper_base_url}/transcribe",
+                f"{self.settings.stt_base_url}/audio/transcriptions",
                 files={"file": (audio_path.name, handle, "audio/wav")},
-                timeout=600,
+                data={
+                    "model": self.settings.stt_model,
+                    "response_format": "verbose_json",
+                    "timestamp_granularities[]": "word",
+                },
+                timeout=self._timeout(self.settings.stt_timeout_seconds),
             )
         response.raise_for_status()
         payload = response.json()
@@ -61,17 +109,14 @@ class LocalAIService:
 
     def _embed_text_sync(self, text: str) -> list[float]:
         response = requests.post(
-            f"{self.services.ollama_base_url}/api/embed",
-            json={
-                "model": self.services.settings.ollama_embed_model,
-                "input": text,
-            },
-            timeout=180,
+            f"{self.settings.embed_base_url}/embeddings",
+            json={"model": self.settings.embed_model, "input": text},
+            headers=self._headers(),
+            timeout=self._timeout(self.settings.llm_timeout_seconds),
         )
         response.raise_for_status()
-        payload = response.json()
-        embeddings = payload.get("embeddings", [])
-        return list(embeddings[0]) if embeddings else []
+        data = response.json().get("data", [])
+        return list(data[0].get("embedding", [])) if data else []
 
     def _summarize_session_sync(self, transcript_markdown: str, existing_notes_context: str) -> dict[str, Any]:
         _ = existing_notes_context  # Intentionally ignored to prevent prior-note leakage into session summaries.
@@ -302,40 +347,42 @@ You answer questions about a tabletop campaign using only the retrieved note con
 If the answer is uncertain or absent, say that clearly.
 Be concise but useful.
 """
+        return self._chat_sync(
+            [
+                {"role": "system", "content": instructions},
+                {
+                    "role": "user",
+                    "content": f"Question: {question}\n\nRelevant campaign notes:\n{note_context}",
+                },
+            ],
+        )
+
+    def _chat_sync(self, messages: list[dict[str, str]], json_mode: bool = False) -> str:
+        body: dict[str, Any] = {
+            "model": self.settings.llm_model,
+            "stream": False,
+            "messages": messages,
+        }
+        if json_mode:
+            body["response_format"] = {"type": "json_object"}
         response = requests.post(
-            f"{self.services.ollama_base_url}/api/chat",
-            json={
-                "model": self.services.settings.ollama_model,
-                "stream": False,
-                "messages": [
-                    {"role": "system", "content": instructions},
-                    {
-                        "role": "user",
-                        "content": f"Question: {question}\n\nRelevant campaign notes:\n{note_context}",
-                    },
-                ],
-            },
-            timeout=300,
+            f"{self.settings.llm_base_url}/chat/completions",
+            json=body,
+            headers=self._headers(),
+            timeout=self._timeout(self.settings.llm_timeout_seconds),
         )
         response.raise_for_status()
-        payload = response.json()
-        return str(payload.get("message", {}).get("content", "")).strip()
+        choices = response.json().get("choices", [])
+        if not choices:
+            return ""
+        return str(choices[0].get("message", {}).get("content") or "").strip()
 
     def _chat_json_sync(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
-        response = requests.post(
-            f"{self.services.ollama_base_url}/api/chat",
-            json={
-                "model": self.services.settings.ollama_model,
-                "stream": False,
-                "format": "json",
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-            },
-            timeout=600,
+        content = self._chat_sync(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            json_mode=True,
         )
-        response.raise_for_status()
-        payload = response.json()
-        content = str(payload.get("message", {}).get("content", "")).strip()
         return json.loads(content)
