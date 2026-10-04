@@ -2,22 +2,38 @@ from __future__ import annotations
 
 import os
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
+from scrollkeeper.config import Settings
 from scrollkeeper.llm import LocalAIService
 
 
-class FakeServices:
-    async def ensure_ollama_running(self) -> None:
-        return
-
-    def mark_ollama_used(self) -> None:
-        return
+def fake_settings(**overrides) -> Settings:
+    values = dict(
+        discord_bot_token="token",
+        command_prefix="!",
+        data_dir=Path("/tmp/scrollkeeper-tests"),
+        bot_name="ScrollKeeper",
+        stt_base_url="http://stt/v1",
+        stt_model="whisper-1",
+        stt_timeout_seconds=600,
+        llm_base_url="http://llm/v1",
+        llm_model="test-model",
+        llm_api_key="",
+        llm_timeout_seconds=900,
+        embed_base_url="http://llm/v1",
+        embed_model="test-embed",
+        wait_notice_seconds=20,
+        health_port=0,
+    )
+    values.update(overrides)
+    return Settings(**values)
 
 
 class StubLocalAIService(LocalAIService):
     def __init__(self, responses: list[dict]) -> None:
-        super().__init__(FakeServices())  # type: ignore[arg-type]
+        super().__init__(fake_settings())
         self._responses = list(responses)
 
     def _chat_json_sync(self, _system_prompt: str, _user_prompt: str) -> dict:  # type: ignore[override]
@@ -28,7 +44,7 @@ class StubLocalAIService(LocalAIService):
 
 class CapturingLocalAIService(LocalAIService):
     def __init__(self) -> None:
-        super().__init__(FakeServices())  # type: ignore[arg-type]
+        super().__init__(fake_settings())
         self.calls: list[tuple[str, str]] = []
 
     def _chat_json_sync(self, system_prompt: str, user_prompt: str) -> dict:  # type: ignore[override]

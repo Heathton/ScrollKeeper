@@ -29,6 +29,7 @@ OPUS_FRAME_DURATION_SECONDS = 0.02
 OPUS_PACKET_HEADER = struct.Struct("<HIH")
 
 CompletionHandler = Callable[[int, int, SessionArtifacts | None, str | None], Awaitable[None]]
+NoticeHandler = Callable[[int, str], Awaitable[None]]
 
 
 @dataclass(slots=True)
@@ -127,9 +128,21 @@ class SessionManager:
         self.processing_tasks: dict[int, asyncio.Task] = {}
         self.statuses: dict[int, SessionStatus] = {}
         self._completion_handler: CompletionHandler | None = None
+        self._notice_handler: NoticeHandler | None = None
 
     def set_completion_handler(self, handler: CompletionHandler) -> None:
         self._completion_handler = handler
+
+    def set_notice_handler(self, handler: NoticeHandler) -> None:
+        """Handler(text_channel_id, message) used to post "still waiting" notices during processing."""
+        self._notice_handler = handler
+
+    def _channel_notifier(self, text_channel_id: int) -> Callable[[str], Awaitable[None]]:
+        async def notify(message: str) -> None:
+            if self._notice_handler:
+                await self._notice_handler(text_channel_id, message)
+
+        return notify
 
     async def start_session(
         self,
@@ -272,15 +285,20 @@ class SessionManager:
         task.add_done_callback(lambda _: self.processing_tasks.pop(guild_id, None))
         return resolved_session_id
 
-    async def answer_campaign_question(self, guild_id: int, question: str) -> str:
-        query_embedding = await self.llm.embed_text(question)
+    async def answer_campaign_question(
+        self,
+        guild_id: int,
+        question: str,
+        on_wait: Callable[[str], Awaitable[None]] | None = None,
+    ) -> str:
+        query_embedding = await self.llm.embed_text(question, on_wait=on_wait)
         results = self.storage.semantic_search_notes(guild_id, query_embedding, limit=8)
         if not results:
             return "I do not have any campaign notes saved yet."
         context_chunks = []
         for row in results:
             context_chunks.append(f"[{row['note_type']}] {row['title']}\n{row['content']}")
-        return await self.llm.answer_question(question, "\n\n".join(context_chunks))
+        return await self.llm.answer_question(question, "\n\n".join(context_chunks), on_wait=on_wait)
 
     def session_status(self, guild_id: int) -> str:
         status = self.statuses.get(guild_id)
@@ -323,6 +341,7 @@ class SessionManager:
         session: ActiveSession,
         transcribe_audio: bool = True,
     ) -> SessionArtifacts:
+        notify = self._channel_notifier(session.text_channel_id)
         segments = self.storage.get_session_segments(session.session_id)
         log.info("Session %s has %s recorded audio segments", session.session_id, len(segments))
         if not segments:
@@ -333,52 +352,47 @@ class SessionManager:
         if transcribe_audio:
             transcribed_segments = 0
             skipped_decode_segments = 0
-            await self.llm.services.prepare_for_transcription()
-            try:
-                for segment in segments:
-                    source_audio_path = Path(segment["audio_path"])
-                    try:
-                        wav_path = self._prepare_segment_for_transcription(source_audio_path)
-                    except Exception as exc:
-                        skipped_decode_segments += 1
-                        log.warning(
-                            "Skipping undecodable segment for session %s (%s): %s",
-                            session.session_id,
-                            source_audio_path,
-                            exc,
-                        )
-                        continue
-                    log.info(
-                        "Transcribing session %s segment %s",
-                        session.session_id,
-                        wav_path,
-                    )
-                    transcript_text = await self.llm.transcribe_audio_segment(wav_path)
-                    self.storage.update_segment_transcript(
-                        session.session_id,
-                        segment["audio_path"],
-                        transcript_text,
-                    )
-                    transcribed_segments += 1
-                    log.info(
-                        "Finished transcribing session %s segment %s",
-                        session.session_id,
-                        wav_path,
-                    )
-                if transcribed_segments == 0:
-                    raise RuntimeError(
-                        "No audio segments could be transcribed. All saved segments failed to decode."
-                    )
-                if skipped_decode_segments:
+            for segment in segments:
+                source_audio_path = Path(segment["audio_path"])
+                try:
+                    wav_path = self._prepare_segment_for_transcription(source_audio_path)
+                except Exception as exc:
+                    skipped_decode_segments += 1
                     log.warning(
-                        "Session %s skipped %s undecodable segment(s) and transcribed %s segment(s).",
+                        "Skipping undecodable segment for session %s (%s): %s",
                         session.session_id,
-                        skipped_decode_segments,
-                        transcribed_segments,
+                        source_audio_path,
+                        exc,
                     )
-            finally:
-                await self.llm.services.stop_whisper()
-                await self.llm.services.recover_after_transcription()
+                    continue
+                log.info(
+                    "Transcribing session %s segment %s",
+                    session.session_id,
+                    wav_path,
+                )
+                transcript_text = await self.llm.transcribe_audio_segment(wav_path, on_wait=notify)
+                self.storage.update_segment_transcript(
+                    session.session_id,
+                    segment["audio_path"],
+                    transcript_text,
+                )
+                transcribed_segments += 1
+                log.info(
+                    "Finished transcribing session %s segment %s",
+                    session.session_id,
+                    wav_path,
+                )
+            if transcribed_segments == 0:
+                raise RuntimeError(
+                    "No audio segments could be transcribed. All saved segments failed to decode."
+                )
+            if skipped_decode_segments:
+                log.warning(
+                    "Session %s skipped %s undecodable segment(s) and transcribed %s segment(s).",
+                    session.session_id,
+                    skipped_decode_segments,
+                    transcribed_segments,
+                )
         else:
             transcribed_segments = sum(
                 1
@@ -390,7 +404,7 @@ class SessionManager:
                     "No transcript text exists for this session yet. Run `!reprocess-session` first."
                 )
             log.info(
-                "Skipping Whisper for session %s and reusing %s existing transcript segment(s)",
+                "Skipping speech-to-text for session %s and reusing %s existing transcript segment(s)",
                 session.session_id,
                 transcribed_segments,
             )
@@ -398,7 +412,11 @@ class SessionManager:
         transcript_markdown = self._build_transcript_markdown(session.session_id)
         existing_notes_context = self._format_existing_notes_context(guild_id)
         log.info("Generating summary and notes for session %s", session.session_id)
-        summary_payload = await self.llm.summarize_session(transcript_markdown, existing_notes_context)
+        summary_payload = await self.llm.summarize_session(
+            transcript_markdown,
+            existing_notes_context,
+            on_wait=notify,
+        )
         session_notes = summary_payload["session_notes_markdown"].strip()
         cinematic = summary_payload["cinematic_summary_markdown"].strip()
         note_updates = summary_payload["note_updates"]
@@ -428,7 +446,10 @@ class SessionManager:
                 source_session_id=session.session_id,
                 metadata=update.get("metadata", {}),
             )
-            embedding = await self.llm.embed_text(f"{note.note_type}\n{note.title}\n{note.content}")
+            embedding = await self.llm.embed_text(
+                f"{note.note_type}\n{note.title}\n{note.content}",
+                on_wait=notify,
+            )
             self.storage.upsert_campaign_note(note, embedding)
 
         exported_notes_path = self._export_notes_snapshot(guild_id, session.base_dir)

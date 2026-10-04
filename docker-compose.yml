@@ -1,3 +1,6 @@
+# Local development stack: the bot plus a CPU speech-to-text service.
+# The LLM is NOT started here: point SCROLLKEEPER_LLM_BASE_URL (in .env) at any
+# OpenAI-compatible server (vLLM, llama.cpp, Ollama's /v1, ...).
 services:
   bot:
     build:
@@ -5,14 +8,19 @@ services:
       dockerfile: Dockerfile
     env_file:
       - .env
+    environment:
+      SCROLLKEEPER_STT_BASE_URL: http://stt:9000/v1
     volumes:
       - ./data:/app/data
-      - /var/run/docker.sock:/var/run/docker.sock
-      - ./:/app
+    depends_on:
+      - stt
     restart: unless-stopped
-    networks:
-      - scrollkeeper
 
-networks:
-  scrollkeeper:
-    name: scrollkeeper-net
+  stt:
+    build:
+      context: docker/whisper
+    environment:
+      WHISPER_MODEL: ${SCROLLKEEPER_STT_WHISPER_MODEL:-small.en}
+      WHISPER_DEVICE: cpu
+      WHISPER_COMPUTE_TYPE: int8
+    restart: unless-stopped

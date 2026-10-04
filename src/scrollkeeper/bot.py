@@ -9,20 +9,29 @@ from discord.ext import voice_recv
 from .config import Settings
 from .llm import LocalAIService
 from .models import CampaignNote
-from .service_manager import DockerServiceManager
+from .health import Heartbeat, start_health_server
 from .session_manager import SessionManager
 from .storage import Storage
 from .voice_compat import apply_voice_recv_compatibility_patch
 
 
 class ScrollKeeperBot(commands.Bot):
-    def __init__(self, services: DockerServiceManager, *args, **kwargs) -> None:
+    def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self.services = services
-        self.ollama_warmup_started = False
+        self.heartbeat = Heartbeat()
+        self._heartbeat_task: asyncio.Task | None = None
+
+    async def setup_hook(self) -> None:
+        self._heartbeat_task = asyncio.create_task(self._beat_forever())
+
+    async def _beat_forever(self) -> None:
+        while True:
+            self.heartbeat.beat()
+            await asyncio.sleep(10)
 
     async def close(self) -> None:
-        await self.services.shutdown()
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
         await super().close()
 
 
@@ -34,14 +43,12 @@ def build_bot(settings: Settings) -> commands.Bot:
     intents.voice_states = True
     intents.members = True
 
-    services = DockerServiceManager(settings)
     bot = ScrollKeeperBot(
-        services,
         command_prefix=settings.command_prefix,
         intents=intents,
     )
     storage = Storage(settings.data_dir)
-    llm = LocalAIService(services)
+    llm = LocalAIService(settings)
     sessions = SessionManager(storage, llm)
     discord_message_limit = 1900
 
@@ -100,21 +107,18 @@ def build_bot(settings: Settings) -> commands.Bot:
         for chunk in _split_long_message("\n".join(response)):
             await channel.send(chunk)
 
+    async def post_notice(text_channel_id: int, message: str) -> None:
+        channel = bot.get_channel(text_channel_id)
+        if isinstance(channel, discord.TextChannel):
+            await channel.send(message)
+
     sessions.set_completion_handler(on_session_processed)
+    sessions.set_notice_handler(post_notice)
 
     @bot.event
     async def on_ready() -> None:
         if bot.user:
             print(f"{bot.user} is ready.")
-        if settings.gpu_policy == "concurrent" and not bot.ollama_warmup_started:
-            bot.ollama_warmup_started = True
-            asyncio.create_task(_warm_ollama())
-
-    async def _warm_ollama() -> None:
-        try:
-            await services.ensure_ollama_running()
-        except Exception as exc:
-            print(f"Ollama warmup failed: {exc}")
 
     @bot.command(name="register-character")
     async def register_character(ctx: commands.Context, *, character_name: str) -> None:
@@ -192,7 +196,11 @@ def build_bot(settings: Settings) -> commands.Bot:
             return
         await ctx.reply("Searching campaign notes.")
         try:
-            answer = await sessions.answer_campaign_question(ctx.guild.id, question.strip())
+            answer = await sessions.answer_campaign_question(
+                ctx.guild.id,
+                question.strip(),
+                on_wait=ctx.send,
+            )
         except Exception as exc:
             await ctx.send(f"Could not answer right now: {str(exc)[:1800]}")
             return
@@ -251,7 +259,10 @@ def build_bot(settings: Settings) -> commands.Bot:
         if not updated:
             await ctx.reply(f"Could not update note #{note_id}.")
             return
-        embedding = await llm.embed_text(f"{note['note_type']}\n{note['title']}\n{corrected}")
+        embedding = await llm.embed_text(
+            f"{note['note_type']}\n{note['title']}\n{corrected}",
+            on_wait=ctx.send,
+        )
         storage.upsert_campaign_note(
             CampaignNote(
                 guild_id=ctx.guild.id,
@@ -300,7 +311,7 @@ def build_bot(settings: Settings) -> commands.Bot:
             await ctx.send(str(exc))
             return
         await ctx.send(
-            f"Session **#{resolved_session_id}** is now reprocessing LLM outputs only (Whisper skipped). "
+            f"Session **#{resolved_session_id}** is now reprocessing LLM outputs only (speech-to-text skipped). "
             "Use `!session-status` to check progress."
         )
 
