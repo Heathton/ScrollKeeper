@@ -23,6 +23,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from metrics import glossary_recall, realtime_factor, word_error_rate  # noqa: E402
 
+CHUNK_SECONDS = 30
+
 # Word = (text, start_seconds, end_seconds)
 Word = tuple[str, float, float]
 
@@ -34,13 +36,21 @@ def audio_seconds(path: Path) -> float:
         return wav.getnframes() / wav.getframerate()
 
 
+def read_samples(path: Path):
+    import numpy as np
+
+    with wave.open(str(path), "rb") as wav:
+        pcm = np.frombuffer(wav.readframes(wav.getnframes()), dtype=np.int16)
+    return pcm.astype(np.float32) / 32768.0
+
+
 def load_faster_whisper(model: str, threads: int):
     from faster_whisper import WhisperModel
 
     engine = WhisperModel(model, device="cpu", compute_type="int8", cpu_threads=threads)
 
     def transcribe(path: Path) -> tuple[str, list[Word]]:
-        segments, _ = engine.transcribe(str(path), word_timestamps=True, vad_filter=True)
+        segments, _ = engine.transcribe(read_samples(path), word_timestamps=True, vad_filter=True)
         words: list[Word] = []
         for segment in segments:  # lazy generator: consuming it is the decode
             words.extend((w.word.strip(), w.start, w.end) for w in segment.words or [])
@@ -58,15 +68,19 @@ def load_onnx_asr(model: str, threads: int):
     engine = onnx_asr.load_model(model, quantization="int8", sess_options=options)
 
     def transcribe(path: Path) -> tuple[str, list[Word]]:
-        # Token timestamps are not exposed uniformly across onnx-asr versions.
-        return str(engine.recognize(str(path))), []
+        # Parakeet fails on inputs of many minutes (attention shape error), so
+        # decode in fixed chunks like the real service will. Token timestamps are
+        # not exposed uniformly across onnx-asr versions.
+        samples = read_samples(path)
+        step = 16000 * CHUNK_SECONDS
+        texts = [str(engine.recognize(samples[i : i + step])) for i in range(0, len(samples), step)]
+        return " ".join(texts), []
 
     return transcribe
 
 
 def load_sherpa_onnx(model: str, threads: int):
     """`model` is a directory holding encoder/decoder/joiner .int8.onnx and tokens.txt."""
-    import numpy as np
     import sherpa_onnx
 
     root = Path(model)
@@ -81,10 +95,8 @@ def load_sherpa_onnx(model: str, threads: int):
     )
 
     def transcribe(path: Path) -> tuple[str, list[Word]]:
-        with wave.open(str(path), "rb") as wav:
-            pcm = np.frombuffer(wav.readframes(wav.getnframes()), dtype=np.int16)
         stream = recognizer.create_stream()
-        stream.accept_waveform(16000, pcm.astype(np.float32) / 32768.0)
+        stream.accept_waveform(16000, read_samples(path))
         recognizer.decode_stream(stream)
         result = stream.result
         words: list[Word] = [
