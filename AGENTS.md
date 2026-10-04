@@ -34,6 +34,10 @@ Design for where the bot will run, not for the developer's machine:
 - **Closing keywords:** use `Closes #N` when the PR fully delivers the issue's recommended action, and `Refs #N` when it delivers part of it. If work remains, file a follow-up issue and link it before the PR merges.
 - **Never merge, and never push to `main`.** The operator reviews and merges every PR.
 - Comment on issues to record decisions or findings. Append rather than rewriting issue bodies.
+- **`gh` quirk:** with the Ubuntu-packaged `gh` (2.46), plain `gh issue view N`, `gh pr view N` and `gh pr edit` can fail with a GraphQL "Projects (classic) is being deprecated" error (the repo has no classic projects; the CLI still requests the field). Workarounds:
+  - Read: `gh issue view N --json title,body,comments` / `gh pr view N --json ...` (explicit `--json` fields avoid it), or `gh api repos/{owner}/{repo}/issues/N/comments`.
+  - Edit a PR body: `gh api -X PATCH repos/{owner}/{repo}/pulls/N -F body=@file.md`.
+  - `gh issue list`, `gh pr list` and `gh pr create` are unaffected.
 
 ### Delegated agents (subagents)
 
