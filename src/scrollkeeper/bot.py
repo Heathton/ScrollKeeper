@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import discord
 from discord.ext import commands
@@ -8,11 +9,15 @@ from discord.ext import voice_recv
 
 from .config import Settings
 from .llm import LocalAIService
-from .models import CampaignNote
 from .health import Heartbeat, start_health_server
+from .models import ENTITY_TYPES, Entity
 from .session_manager import SessionManager
 from .storage import Storage
+from .wiki import CampaignWiki, format_change_report
 from .voice_compat import apply_voice_recv_compatibility_patch
+
+
+log = logging.getLogger(__name__)
 
 
 class ScrollKeeperBot(commands.Bot):
@@ -49,7 +54,8 @@ def build_bot(settings: Settings) -> commands.Bot:
     )
     storage = Storage(settings.data_dir)
     llm = LocalAIService(settings)
-    sessions = SessionManager(storage, llm)
+    wiki = CampaignWiki(storage, llm, settings)
+    sessions = SessionManager(storage, llm, wiki)
     discord_message_limit = 1900
 
     def _split_long_message(message: str, max_len: int = discord_message_limit) -> list[str]:
@@ -102,8 +108,8 @@ def build_bot(settings: Settings) -> commands.Bot:
             "### Cinematic Summary",
             artifacts.cinematic_summary_markdown,
         ]
-        if artifacts.note_updates:
-            response.extend(["", f"Updated {len(artifacts.note_updates)} campaign notes."])
+        if artifacts.wiki_report is not None:
+            response.extend(["", format_change_report(artifacts.wiki_report)])
         for chunk in _split_long_message("\n".join(response)):
             await channel.send(chunk)
 
@@ -126,6 +132,7 @@ def build_bot(settings: Settings) -> commands.Bot:
             await ctx.reply("This command must be used in a server.")
             return
         storage.register_character(ctx.guild.id, ctx.author.id, character_name.strip())
+        await wiki.ensure_player_characters(ctx.guild.id)
         await ctx.reply(f"Registered character name: **{character_name.strip()}**")
 
     @bot.command(name="join")
@@ -206,75 +213,178 @@ def build_bot(settings: Settings) -> commands.Bot:
             return
         await ctx.send(answer[:1900])
 
-    @bot.command(name="list-notes")
-    async def list_notes(ctx: commands.Context) -> None:
-        if ctx.guild is None:
-            await ctx.reply("This command must be used in a server.")
-            return
-        notes = storage.get_recent_notes(ctx.guild.id)
-        if not notes:
-            await ctx.reply("No campaign notes exist yet.")
-            return
-        lines = ["Recent campaign notes (use `!correct-note <id> <new content>` to edit):", ""]
-        for note in notes[:25]:
-            preview = " ".join(str(note["content"]).split())
-            if len(preview) > 110:
-                preview = preview[:107] + "..."
-            lines.append(f"- #{note['id']} [{note['note_type']}] {note['title']}: {preview}")
-        for chunk in _split_long_message("\n".join(lines)):
+    async def _send_long(ctx: commands.Context, message: str) -> None:
+        for chunk in _split_long_message(message):
             await ctx.send(chunk)
 
-    @bot.command(name="correct-note")
-    async def correct_note(ctx: commands.Context, note_id: int, *, corrected_content: str) -> None:
+    async def _one_entity(ctx: commands.Context, ref: str) -> Entity | None:
+        """Resolve `#id`, name or alias to exactly one entity, replying when that isn't possible."""
+        matches = await wiki.resolve_entity(ctx.guild.id, ref)
+        if not matches:
+            await ctx.reply(f"No entity matches **{ref}**. Use `!entities` to list them.")
+            return None
+        if len(matches) > 1:
+            listed = ", ".join(f"#{e.id} {e.canonical_name} ({e.type})" for e in matches)
+            await ctx.reply(f"**{ref}** matches several entities: {listed}. Use the `#id` instead.")
+            return None
+        return matches[0]
+
+    async def _wiki_update(ctx: commands.Context, update) -> bool:
+        """Await a wiki change; the stored change survives an LLM failure, so say so instead of failing."""
+        try:
+            await update
+            return True
+        except Exception as exc:
+            log.exception("Wiki page update failed")
+            await ctx.reply(
+                f"The change was saved, but the page could not be rewritten right now ({str(exc)[:300]}). "
+                "It is retried after the next processed session."
+            )
+            return False
+
+    async def _active_fact(ctx: commands.Context, fact_id: int):
+        fact = await asyncio.to_thread(storage.get_fact, ctx.guild.id, fact_id)
+        if fact is None:
+            await ctx.reply(f"Could not find fact F{fact_id} in this server.")
+            return None
+        if not fact.active:
+            await ctx.reply(f"Fact F{fact_id} was already corrected or retracted.")
+            return None
+        return fact
+
+    @bot.command(name="entities")
+    async def list_entities(ctx: commands.Context, entity_type: str | None = None) -> None:
         if ctx.guild is None:
             await ctx.reply("This command must be used in a server.")
             return
-        corrected = corrected_content.strip()
-        if not corrected:
-            await ctx.reply("Corrected content cannot be empty.")
+        entities = await asyncio.to_thread(storage.list_entities, ctx.guild.id)
+        if entity_type:
+            wanted = entity_type.strip().casefold()
+            entities = [e for e in entities if e.type.casefold() == wanted]
+        if not entities:
+            if entity_type:
+                await ctx.reply(f"No entities of type **{entity_type}**. Types: {', '.join(ENTITY_TYPES)}.")
+            else:
+                await ctx.reply("No campaign wiki entities yet.")
             return
-        note = storage.get_campaign_note_by_id(ctx.guild.id, note_id)
-        if note is None:
-            await ctx.reply(f"Could not find note #{note_id} in this server.")
-            return
-        metadata = {}
-        try:
-            # Preserve existing metadata and mark manual edits for auditability.
-            import json
+        counts = await asyncio.to_thread(storage.count_active_facts, ctx.guild.id)
+        lines = ["Campaign wiki entities (`!entity <name or #id>` to read one):"]
+        current_type = None
+        for entity in entities:
+            if entity.type != current_type:
+                current_type = entity.type
+                lines.extend(["", f"**{current_type}**"])
+            line = f"- #{entity.id} {entity.canonical_name} ({counts.get(entity.id, 0)} facts)"
+            if entity.short_description:
+                line += f": {entity.short_description[:90]}"
+            lines.append(line)
+        await _send_long(ctx, "\n".join(lines))
 
-            metadata = json.loads(note["metadata_json"] or "{}")
-            if not isinstance(metadata, dict):
-                metadata = {}
-        except Exception:
-            metadata = {}
-        metadata["manually_corrected"] = True
-        metadata["corrected_by_user_id"] = getattr(ctx.author, "id", None)
-
-        updated = storage.update_campaign_note_content(
-            ctx.guild.id,
-            note_id,
-            corrected,
-            metadata=metadata,
-        )
-        if not updated:
-            await ctx.reply(f"Could not update note #{note_id}.")
+    @bot.command(name="entity")
+    async def show_entity(ctx: commands.Context, *, ref: str) -> None:
+        if ctx.guild is None:
+            await ctx.reply("This command must be used in a server.")
             return
-        embedding = await llm.embed_text(
-            f"{note['note_type']}\n{note['title']}\n{corrected}",
-            on_wait=ctx.send,
+        entity = await _one_entity(ctx, ref)
+        if entity is None:
+            return
+        await _send_long(ctx, await wiki.render_entity(ctx.guild.id, entity))
+
+    @bot.command(name="merge-entity")
+    async def merge_entity(ctx: commands.Context, source_ref: str, target_ref: str) -> None:
+        if ctx.guild is None:
+            await ctx.reply("This command must be used in a server.")
+            return
+        source = await _one_entity(ctx, source_ref)
+        target = await _one_entity(ctx, target_ref) if source else None
+        if source is None or target is None:
+            return
+        if source.id == target.id:
+            await ctx.reply("Those are the same entity.")
+            return
+        await ctx.reply(f"Merging #{source.id} {source.canonical_name} into #{target.id} {target.canonical_name}.")
+        if not await _wiki_update(ctx, wiki.merge(ctx.guild.id, source, target, on_wait=ctx.send)):
+            return
+        await ctx.send(f"Merged. **{source.canonical_name}** is now an alias of **{target.canonical_name}** (#{target.id}).")
+
+    @bot.command(name="rename-entity")
+    async def rename_entity(ctx: commands.Context, ref: str, *, new_name: str) -> None:
+        if ctx.guild is None:
+            await ctx.reply("This command must be used in a server.")
+            return
+        entity = await _one_entity(ctx, ref)
+        if entity is None:
+            return
+        if not await _wiki_update(ctx, wiki.rename(ctx.guild.id, entity, new_name.strip(), on_wait=ctx.send)):
+            return
+        await ctx.reply(f"Renamed #{entity.id} to **{new_name.strip()}** (old name kept as an alias).")
+
+    @bot.command(name="add-alias")
+    async def add_alias(ctx: commands.Context, ref: str, *, alias: str) -> None:
+        if ctx.guild is None:
+            await ctx.reply("This command must be used in a server.")
+            return
+        entity = await _one_entity(ctx, ref)
+        if entity is None:
+            return
+        if await wiki.has_name(ctx.guild.id, entity, alias):
+            await ctx.reply(f"#{entity.id} {entity.canonical_name} already has that name.")
+            return
+        if await _wiki_update(ctx, wiki.add_alias(ctx.guild.id, entity, alias.strip(), on_wait=ctx.send)):
+            await ctx.reply(f"Added alias **{alias.strip()}** to #{entity.id} {entity.canonical_name}.")
+
+    @bot.command(name="pin-fact")
+    async def pin_fact(ctx: commands.Context, ref: str, *, text: str) -> None:
+        if ctx.guild is None:
+            await ctx.reply("This command must be used in a server.")
+            return
+        entity = await _one_entity(ctx, ref)
+        if entity is None:
+            return
+        fact_id = await asyncio.to_thread(
+            storage.add_fact, ctx.guild.id, entity.id, text.strip(), "pinned", None, None, None, getattr(ctx.author, "id", None)
         )
-        storage.upsert_campaign_note(
-            CampaignNote(
-                guild_id=ctx.guild.id,
-                note_type=note["note_type"],
-                title=note["title"],
-                content=corrected,
-                source_session_id=note["source_session_id"],
-                metadata=metadata,
-            ),
-            embedding,
+        if await _wiki_update(ctx, wiki.refresh_after_change(ctx.guild.id, entity.id, on_wait=ctx.send)):
+            await ctx.reply(f"Pinned F{fact_id} on #{entity.id} {entity.canonical_name}; its page was rewritten.")
+
+    @bot.command(name="correct-fact")
+    async def correct_fact(ctx: commands.Context, fact_id: int, *, text: str) -> None:
+        if ctx.guild is None:
+            await ctx.reply("This command must be used in a server.")
+            return
+        fact = await _active_fact(ctx, fact_id)
+        if fact is None:
+            return
+        new_id = await asyncio.to_thread(
+            storage.add_fact, ctx.guild.id, fact.entity_id, text.strip(), "pinned", None, None, None, getattr(ctx.author, "id", None)
         )
-        await ctx.reply(f"Updated note #{note_id}: **[{note['note_type']}] {note['title']}**")
+        await asyncio.to_thread(storage.supersede_fact, fact.id, new_id)
+        if await _wiki_update(ctx, wiki.refresh_after_change(ctx.guild.id, fact.entity_id, on_wait=ctx.send)):
+            await ctx.reply(f"F{fact_id} is superseded by pinned fact F{new_id}; the page was rewritten.")
+
+    @bot.command(name="retract-fact")
+    async def retract_fact(ctx: commands.Context, fact_id: int, *, reason: str = "retracted by a user") -> None:
+        if ctx.guild is None:
+            await ctx.reply("This command must be used in a server.")
+            return
+        fact = await _active_fact(ctx, fact_id)
+        if fact is None:
+            return
+        await asyncio.to_thread(storage.retract_fact, fact.id, reason.strip())
+        if await _wiki_update(ctx, wiki.refresh_after_change(ctx.guild.id, fact.entity_id, on_wait=ctx.send)):
+            await ctx.reply(f"Retracted F{fact_id}; the page was rewritten.")
+
+    @bot.command(name="rebuild-pages")
+    async def rebuild_pages(ctx: commands.Context) -> None:
+        if ctx.guild is None:
+            await ctx.reply("This command must be used in a server.")
+            return
+        await ctx.reply("Rebuilding every wiki page from its facts. This makes one LLM call per entity.")
+        rebuilt, failures = await wiki.rebuild_all_pages(ctx.guild.id, on_wait=ctx.send)
+        message = f"Rebuilt {rebuilt} wiki page(s)."
+        if failures:
+            message += f" Could not rebuild: {', '.join(failures)} (retried after the next processed session)."
+        await ctx.send(message)
 
     @bot.command(name="session-status")
     async def session_status(ctx: commands.Context) -> None:

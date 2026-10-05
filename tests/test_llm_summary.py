@@ -58,7 +58,6 @@ class CapturingLocalAIService(LocalAIService):
                 "A coherent cinematic recap grounded in the provided source text, with major turning points, "
                 "threat escalation, and the party's response presented as one unified narrative."
             ),
-            "note_updates": [],
         }
 
 
@@ -69,7 +68,6 @@ class SummaryValidationTests(unittest.TestCase):
                 {
                     "session_notes_markdown": "No session notes available.",
                     "cinematic_summary_markdown": "No cinematic summary available.",
-                    "note_updates": [],
                 },
                 {
                     "session_notes_markdown": (
@@ -80,13 +78,11 @@ class SummaryValidationTests(unittest.TestCase):
                         "Steel rang against stone as the party forced open the gate and flooded the keep. "
                         "They fought through confusion, regrouped under pressure, and pressed into the throne room."
                     ),
-                    "note_updates": [],
                 },
             ]
         )
         payload = service._summarize_session_sync(
             transcript_markdown="# Transcript\n\nSpeaker: text\n",
-            existing_notes_context="No prior campaign notes.",
         )
         self.assertNotEqual(payload["session_notes_markdown"], "No session notes available.")
         self.assertNotEqual(payload["cinematic_summary_markdown"], "No cinematic summary available.")
@@ -108,7 +104,6 @@ class SummaryValidationTests(unittest.TestCase):
         ):
             service._summarize_session_sync(
                 transcript_markdown=transcript,
-                existing_notes_context="No prior campaign notes.",
             )
 
         self.assertGreaterEqual(len(service.calls), 3)
