@@ -55,7 +55,13 @@ def build_bot(settings: Settings) -> commands.Bot:
     storage = Storage(settings.data_dir)
     llm = LocalAIService(settings)
     wiki = CampaignWiki(storage, llm, settings)
-    sessions = SessionManager(storage, llm, wiki)
+    sessions = SessionManager(
+        storage,
+        llm,
+        wiki,
+        spool_dir=settings.spool_dir,
+        audio_retention_days=settings.audio_retention_days,
+    )
     discord_message_limit = 1900
 
     def _split_long_message(message: str, max_len: int = discord_message_limit) -> list[str]:
@@ -125,6 +131,8 @@ def build_bot(settings: Settings) -> commands.Bot:
     async def on_ready() -> None:
         if bot.user:
             print(f"{bot.user} is ready.")
+        # Picks up sessions a restart interrupted (runs once; on_ready also fires on reconnects).
+        await sessions.start()
 
     @bot.command(name="register-character")
     async def register_character(ctx: commands.Context, *, character_name: str) -> None:
@@ -132,6 +140,7 @@ def build_bot(settings: Settings) -> commands.Bot:
             await ctx.reply("This command must be used in a server.")
             return
         storage.register_character(ctx.guild.id, ctx.author.id, character_name.strip())
+        sessions.forget_speaker(ctx.guild.id, ctx.author.id)  # start recording them if a session is live
         await wiki.ensure_player_characters(ctx.guild.id)
         await ctx.reply(f"Registered character name: **{character_name.strip()}**")
 
@@ -176,9 +185,21 @@ def build_bot(settings: Settings) -> commands.Bot:
         except RuntimeError as exc:
             await ctx.reply(str(exc))
             return
-        await ctx.reply(
-            f"Session **#{session.session_id}** is now recording in **{ctx.author.voice.channel.name}**."
-        )
+        voice_channel = ctx.author.voice.channel
+        registered = await asyncio.to_thread(storage.registered_user_ids, ctx.guild.id)
+        unregistered = [
+            member.display_name
+            for member in getattr(voice_channel, "members", [])
+            if not member.bot and member.id not in registered
+        ]
+        notice = [
+            f"Session **#{session.session_id}** is now recording in **{voice_channel.name}**.",
+            "Recording notice: the voices of players who have run `!register-character` are recorded and "
+            "transcribed for the session notes. Everyone else, and bots, are not recorded.",
+        ]
+        if unregistered:
+            notice.append(f"Not being recorded (no character registered): {', '.join(unregistered)}.")
+        await ctx.reply("\n".join(notice))
 
     @bot.command(name="end-session")
     async def end_session(ctx: commands.Context) -> None:

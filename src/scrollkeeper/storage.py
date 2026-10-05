@@ -67,7 +67,34 @@ MIGRATIONS: list[str] = [
         updated_at TEXT NOT NULL
     );
     """,
+    # 2: per-speaker Ogg Opus tracks; utterance rows point at their track; the processing queue
+    # lives on `sessions` (status 'processing' + kind) so it survives restarts.
+    """
+    CREATE TABLE audio_tracks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        user_id INTEGER NOT NULL,
+        display_name TEXT NOT NULL,
+        character_name TEXT NOT NULL,
+        path TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        ended_at TEXT,
+        UNIQUE (session_id, user_id)
+    );
+
+    ALTER TABLE transcript_segments ADD COLUMN track_id INTEGER REFERENCES audio_tracks(id) ON DELETE CASCADE;
+    CREATE INDEX transcript_segments_session ON transcript_segments(session_id);
+
+    ALTER TABLE sessions ADD COLUMN processing_kind TEXT;
+    ALTER TABLE sessions ADD COLUMN processing_attempts INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE sessions ADD COLUMN interrupted_at TEXT;
+    ALTER TABLE sessions ADD COLUMN audio_deleted_at TEXT;
+    """,
 ]
+
+# Values of sessions.processing_kind: run speech-to-text then the LLM steps, or the LLM steps only.
+PROCESS_TRANSCRIBE = "transcribe"
+PROCESS_LLM_ONLY = "llm"
 
 
 class Storage:
@@ -157,6 +184,10 @@ class Storage:
         return [row["character_name"] for row in rows]
 
     def get_character_name(self, guild_id: int, user_id: int, fallback_name: str) -> str:
+        return self.get_registered_character_name(guild_id, user_id) or fallback_name
+
+    def get_registered_character_name(self, guild_id: int, user_id: int) -> str | None:
+        """The name from `!register-character`, or None if the user hasn't registered (and isn't recorded)."""
         with self.connection() as conn:
             row = conn.execute(
                 """
@@ -166,7 +197,12 @@ class Storage:
                 """,
                 (guild_id, user_id),
             ).fetchone()
-        return row["character_name"] if row else fallback_name
+        return row["character_name"] if row else None
+
+    def registered_user_ids(self, guild_id: int) -> set[int]:
+        with self.connection() as conn:
+            rows = conn.execute("SELECT user_id FROM character_registry WHERE guild_id = ?", (guild_id,)).fetchall()
+        return {int(row["user_id"]) for row in rows}
 
     def create_session(
         self,
@@ -196,16 +232,35 @@ class Storage:
                 (status, session_id),
             )
 
+    def queue_session(self, session_id: int, kind: str = PROCESS_TRANSCRIBE) -> None:
+        """Put a session on the processing queue (status 'processing'); the queue survives restarts."""
+        with self.connection() as conn:
+            conn.execute(
+                """
+                UPDATE sessions
+                SET status = 'processing', processing_kind = ?, processing_attempts = 0
+                WHERE id = ?
+                """,
+                (kind, session_id),
+            )
+
     def reset_session_processing(self, session_id: int) -> None:
         with self.connection() as conn:
             conn.execute(
                 """
                 UPDATE sessions
                 SET status = 'processing',
+                    processing_kind = ?,
+                    processing_attempts = 0,
                     transcript_path = NULL,
                     summary_path = NULL
                 WHERE id = ?
                 """,
+                (PROCESS_TRANSCRIBE, session_id),
+            )
+            # Track utterances are recreated by speech-to-text; legacy clip rows keep their row.
+            conn.execute(
+                "DELETE FROM transcript_segments WHERE session_id = ? AND track_id IS NOT NULL",
                 (session_id,),
             )
             conn.execute(
@@ -223,11 +278,114 @@ class Storage:
                 """
                 UPDATE sessions
                 SET status = 'processing',
+                    processing_kind = ?,
+                    processing_attempts = 0,
                     summary_path = NULL
                 WHERE id = ?
                 """,
+                (PROCESS_LLM_ONLY, session_id),
+            )
+
+    def next_queued_session(self, guild_id: int) -> sqlite3.Row | None:
+        with self.connection() as conn:
+            return conn.execute(
+                "SELECT * FROM sessions WHERE guild_id = ? AND status = 'processing' ORDER BY id LIMIT 1",
+                (guild_id,),
+            ).fetchone()
+
+    def begin_processing_attempt(self, session_id: int) -> int:
+        """Count a processing attempt (so a session that crashes the bot isn't retried forever)."""
+        with self.connection() as conn:
+            conn.execute(
+                "UPDATE sessions SET processing_attempts = processing_attempts + 1 WHERE id = ?",
                 (session_id,),
             )
+            row = conn.execute("SELECT processing_attempts FROM sessions WHERE id = ?", (session_id,)).fetchone()
+        return int(row["processing_attempts"]) if row else 0
+
+    def get_sessions_with_status(self, status: str) -> list[sqlite3.Row]:
+        with self.connection() as conn:
+            return list(conn.execute("SELECT * FROM sessions WHERE status = ? ORDER BY id", (status,)).fetchall())
+
+    def mark_session_interrupted(self, session_id: int, interrupted_at: datetime) -> None:
+        """A recording cut short by a restart: queue it for processing and note when capture stopped."""
+        with self.connection() as conn:
+            conn.execute(
+                """
+                UPDATE sessions
+                SET status = 'processing', processing_kind = ?, processing_attempts = 0, interrupted_at = ?
+                WHERE id = ?
+                """,
+                (PROCESS_TRANSCRIBE, interrupted_at.isoformat(), session_id),
+            )
+
+    def sessions_for_audio_cleanup(self, ended_before: datetime) -> list[sqlite3.Row]:
+        with self.connection() as conn:
+            return list(
+                conn.execute(
+                    """
+                    SELECT * FROM sessions
+                    WHERE status = 'completed' AND audio_deleted_at IS NULL
+                      AND ended_at IS NOT NULL AND ended_at < ?
+                    ORDER BY id
+                    """,
+                    (ended_before.isoformat(),),
+                ).fetchall()
+            )
+
+    def mark_audio_deleted(self, session_id: int) -> None:
+        with self.connection() as conn:
+            conn.execute(
+                "UPDATE sessions SET audio_deleted_at = ? WHERE id = ?",
+                (datetime.utcnow().isoformat(), session_id),
+            )
+
+    # --- Per-speaker audio tracks -----------------------------------------------------------
+
+    def create_track(
+        self,
+        session_id: int,
+        user_id: int,
+        display_name: str,
+        character_name: str,
+        path: Path,
+        started_at: datetime,
+    ) -> int:
+        with self.connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO audio_tracks (session_id, user_id, display_name, character_name, path, started_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (session_id, user_id, display_name, character_name, str(path), started_at.isoformat()),
+            )
+            return int(cursor.lastrowid)
+
+    def close_track(self, track_id: int, ended_at: datetime) -> None:
+        with self.connection() as conn:
+            conn.execute("UPDATE audio_tracks SET ended_at = ? WHERE id = ?", (ended_at.isoformat(), track_id))
+
+    def update_track_path(self, track_id: int, path: Path) -> None:
+        with self.connection() as conn:
+            conn.execute("UPDATE audio_tracks SET path = ? WHERE id = ?", (str(path), track_id))
+
+    def get_session_tracks(self, session_id: int) -> list[sqlite3.Row]:
+        with self.connection() as conn:
+            return list(
+                conn.execute(
+                    "SELECT * FROM audio_tracks WHERE session_id = ? ORDER BY started_at, id", (session_id,)
+                ).fetchall()
+            )
+
+    def replace_track_segments(self, track: sqlite3.Row, character_name: str, segments: list[SpeakerSegment]) -> None:
+        """Store a track's utterances, replacing any from an earlier run, in one transaction."""
+        with self.connection() as conn:
+            conn.execute("DELETE FROM transcript_segments WHERE track_id = ?", (track["id"],))
+            conn.execute(
+                "UPDATE audio_tracks SET character_name = ? WHERE id = ?", (character_name, track["id"])
+            )
+            for segment in segments:
+                self._insert_segment(conn, int(track["session_id"]), segment)
 
     def get_session(self, session_id: int) -> sqlite3.Row | None:
         with self.connection() as conn:
@@ -277,25 +435,29 @@ class Storage:
 
     def add_transcript_segment(self, session_id: int, segment: SpeakerSegment) -> None:
         with self.connection() as conn:
-            conn.execute(
-                """
-                INSERT INTO transcript_segments (
-                    session_id, user_id, display_name, character_name,
-                    started_at, ended_at, audio_path, transcript_text
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    session_id,
-                    segment.discord_user_id,
-                    segment.discord_display_name,
-                    segment.character_name,
-                    segment.started_at.isoformat(),
-                    segment.ended_at.isoformat(),
-                    str(segment.audio_path),
-                    segment.transcript_text,
-                ),
+            self._insert_segment(conn, session_id, segment)
+
+    def _insert_segment(self, conn: sqlite3.Connection, session_id: int, segment: SpeakerSegment) -> None:
+        conn.execute(
+            """
+            INSERT INTO transcript_segments (
+                session_id, user_id, display_name, character_name,
+                started_at, ended_at, audio_path, transcript_text, track_id
             )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session_id,
+                segment.discord_user_id,
+                segment.discord_display_name,
+                segment.character_name,
+                segment.started_at.isoformat(),
+                segment.ended_at.isoformat(),
+                str(segment.audio_path),
+                segment.transcript_text,
+                segment.track_id,
+            ),
+        )
 
     def update_segment_transcript(self, session_id: int, audio_path: str, transcript_text: str) -> None:
         with self.connection() as conn:

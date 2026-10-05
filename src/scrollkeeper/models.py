@@ -20,6 +20,25 @@ class SpeakerSegment:
     ended_at: datetime
     audio_path: Path
     transcript_text: str = ""
+    track_id: int | None = None
+
+
+@dataclass(slots=True)
+class TimedText:
+    """A word or an utterance, with start/end in seconds from the start of its audio track."""
+
+    text: str
+    start: float
+    end: float
+
+
+@dataclass(slots=True)
+class TranscriptionResult:
+    """What the speech-to-text service returned for one track."""
+
+    text: str
+    words: list[TimedText] = field(default_factory=list)
+    segments: list[TimedText] = field(default_factory=list)
 
 
 @dataclass(slots=True)

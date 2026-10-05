@@ -7,7 +7,7 @@ ScrollKeeper is a Discord bot for tabletop campaigns. It can join a voice channe
 - Text commands to join a voice channel, start/end a session, register character names, and ask campaign questions
 - Voice receive pipeline built for `discord-ext-voice-recv`
 - Persistent SQLite storage for sessions, transcripts, character mappings, the campaign wiki, and embeddings
-- File archives for audio segments, transcripts, summaries, and an Obsidian-style wiki export
+- Per-speaker Ogg Opus audio tracks, transcripts, summaries, and an Obsidian-style wiki export
 - A campaign wiki: entities with aliases, an append-only log of facts with their source (session and transcript time), and pages rewritten from those facts
 - Retrieval-backed campaign Q&A over wiki pages
 - Speech-to-text through an OpenAI-compatible `/v1/audio/transcriptions` endpoint (a CPU Parakeet-TDT service with word timestamps is included)
@@ -15,13 +15,13 @@ ScrollKeeper is a Discord bot for tabletop campaigns. It can join a voice channe
 
 ## Commands
 
-- `!register-character <character name>`: map your Discord user to an in-game character
+- `!register-character <character name>`: map your Discord user to an in-game character. **Recording is opt-in:** only players who have registered a character are recorded (bots never are).
 - `!join`: bot joins your current voice channel
-- `!start-session [title]`: begin recording/transcription for the active voice channel
+- `!start-session [title]`: begin recording the active voice channel. The bot posts a recording notice and names anyone in the channel who is not being recorded.
 - `!end-session`: stop recording, finalize transcript, write the summary, update the campaign wiki, and post the result with a wiki change report
 - `!campaign-question <question>`: ask about the campaign (answers come from wiki pages)
 - `!session-status`: show the current session state
-- `!reprocess-session [session-id]`: rerun speech-to-text + summary/note generation from saved audio
+- `!reprocess-session [session-id]`: rerun speech-to-text + summary/note generation from saved audio (also works for sessions recorded before per-speaker tracks; see [Recording](#recording))
 - `!reprocess-llm [session-id]`: rerun the summary and wiki update from existing transcript text (skips speech-to-text). The session's earlier extracted facts are retracted and replaced.
 
 ### Campaign wiki
@@ -80,7 +80,10 @@ All configuration comes from environment variables (a `.env` file is optional an
 
 Optional:
 
-- `SCROLLKEEPER_LLM_TIMEOUT_SECONDS=900` / `SCROLLKEEPER_STT_TIMEOUT_SECONDS=600`: read timeouts. They are long on purpose because the LLM host may cold-start for several minutes.
+- `SCROLLKEEPER_LLM_TIMEOUT_SECONDS=900`: read timeout for LLM and embedding calls. It is long on purpose because the LLM host may cold-start for several minutes.
+- `SCROLLKEEPER_STT_TIMEOUT_SECONDS=7200`: read timeout for one speech-to-text call. Each call transcribes a **whole speaker track**, so it must cover the longest track: the bundled service runs about 9x realtime, so a 3-hour track takes roughly 20 minutes. Raise it for very long sessions or a busy node.
+- `SCROLLKEEPER_SPOOL_DIR=`: where tracks are written while recording. Empty (the default) records straight into `data/sessions/`. Set it to a fast local disk when `SCROLLKEEPER_DATA_DIR` is on network storage; tracks move to the archive when processing starts. It must be **persistent** (for example a local-path volume, not an `emptyDir`), or a restart during a session loses its audio. Speech-to-text scratch files also go here (otherwise the system temp directory).
+- `SCROLLKEEPER_AUDIO_RETENTION_DAYS=0`: delete a session's audio this many days after its summary was written (`0` keeps audio forever). Transcripts, summaries and the wiki are kept; `!reprocess-llm` still works, `!reprocess-session` does not.
 - `SCROLLKEEPER_LLM_EXTRA_BODY=`: a JSON object merged into every chat request for server-specific options, such as a reasoning model's effort level. See [Recommended models and settings](#recommended-models-and-settings).
 - `SCROLLKEEPER_WAIT_NOTICE_SECONDS=20`: if a request takes longer than this, the bot posts a "waking the inference box" notice in the Discord channel.
 - `SCROLLKEEPER_HEALTH_PORT=8080`: serves `GET /healthz` for Kubernetes liveness probes (`0` disables). It returns 503 if the bot's event loop has stalled for over a minute.
@@ -183,10 +186,20 @@ Service settings (environment variables of the STT container, not the bot):
 
 Pushing a `v*` tag runs `.github/workflows/images.yml`, which publishes `ghcr.io/<owner>/scrollkeeper` (the bot) and `ghcr.io/<owner>/scrollkeeper-stt` (speech-to-text) tagged with the version. Pin these tags in deployments; there is no `latest`.
 
+## Recording
+
+- **One track per speaker.** Each recorded player gets one Ogg Opus file per session (`audio/<discord-user-id>.ogg`). Discord's Opus packets are written as they arrive, without re-encoding. That is about 30 MB per speaker-hour, and any player (VLC, ffmpeg, Audacity) can open it.
+- **Real timeline.** Packets are placed by their RTP timestamp (a 48 kHz clock that keeps running through silence), and silent gaps are filled in, so a point N seconds into a track is N seconds after that speaker's first packet. If RTP time and arrival time disagree by more than 2 seconds (a reconnect, a client restart), the track follows arrival time instead.
+- **Crash-safe.** A writer thread does all file I/O off the event loop. It ends an Ogg page every second and fsyncs every 10 seconds, so a killed pod loses about a second of audio.
+- **Restart recovery.** The processing queue is stored in SQLite. On startup, the bot queues any session that was still recording, keeps its audio, notes the gap in the transcript and the channel, and resumes sessions that were mid-processing. A session that kills the bot 3 times in a row is marked failed.
+- **Transcription.** After the session, each track is decoded with ffmpeg to 16 kHz mono FLAC (soxr resampling) in a scratch directory, sent whole to the speech-to-text service, and the scratch file is deleted. The Opus tracks are the only audio kept.
+- **Transcript.** Each track's words are split into utterances at pauses longer than 0.8 s. Utterances from all speakers are merged by start time, and a speaker's consecutive utterances are joined into one line. Every utterance keeps its own timestamp in the database. The summarizer sees `Speaker: text` lines; fact extraction sees `[HH:MM:SS]` offsets from the session start, which become citations.
+- **Older recordings.** Sessions recorded before per-speaker tracks (many short `.skopus` clips) are converted to one Ogg track per speaker the first time `!reprocess-session` runs on them. The old clips are left in place, and you can delete them once the session has reprocessed successfully.
+
 ## Storage layout
 
 - `data/scrollkeeper.db`: SQLite database
-- `data/sessions/<session-id>/audio`: recorded WAV segments
+- `data/sessions/<session-id>/audio/<discord-user-id>.ogg`: one Ogg Opus track per recorded speaker
 - `data/sessions/<session-id>/transcript.md`: finalized transcript
 - `data/sessions/<session-id>/summary.md`: session notes + cinematic summary
 - `data/wiki/<guild-id>/<Type>/<Name>.md`: Obsidian-style wiki export, one file per entity with `aliases` frontmatter, `[[links]]` and session citations. It is regenerated from the database, so edits there are overwritten; use the commands above.
@@ -194,14 +207,14 @@ Pushing a `v*` tag runs `.github/workflows/images.yml`, which publishes `ghcr.io
 ## Important implementation notes
 
 - Discord voice receive in Python relies on `discord-ext-voice-recv`.
-- The bot records speaker-specific WAV segments and transcribes them after the session ends. This is simpler and more reliable than trying to stream partial text live.
-- Transcript markdown is saved in speaker-only format (`**Speaker:** line`) without timestamp prefixes to reduce context-token overhead in summarization.
+- The bot records one track per speaker and transcribes it after the session ends (see [Recording](#recording)). This is simpler and more reliable than trying to stream partial text live.
+- `transcript.md` uses speaker-only lines (`Speaker: text`) without timestamps to reduce context-token overhead in summarization; per-utterance timestamps stay in the database.
 - Session summaries are generated from the current session transcript only, so prior campaign notes are not used as summary source material.
 - Wiki pages are indexed with embeddings stored in SQLite. Transcript text is archived but intentionally excluded from retrieval.
 - The wiki pipeline after each session: (1) summary from the transcript only; (2) fact extraction per timestamped transcript chunk, given the entity index, attaching facts to existing entities or proposing new ones; (3) rewrite of every page whose facts changed. Pinned facts are authoritative. Retracting or superseding a fact rebuilds the page from the remaining facts.
 - If the voice connection drops mid-session, the bot will try to reconnect to the same channel and continue the session.
 - `discord-ext-voice-recv` is pinned to a commit SHA in `pyproject.toml`; change it deliberately, in its own PR. If Python voice receive keeps breaking, the fallback is a small Node `@discordjs/voice` recorder feeding this pipeline.
-- The bot calls the configured speech-to-text endpoint per speaker segment after the session ends.
+- The bot calls the configured speech-to-text endpoint once per speaker track after the session ends.
 - Summaries, wiki updates, and campaign Q&A go to the configured OpenAI-compatible LLM endpoint; embeddings go to the embeddings endpoint.
 - Long completion posts are split across multiple Discord messages automatically to avoid message-length truncation.
 - `!end-session` now queues background processing so users can still run `!campaign-question` while transcription and note generation continue.

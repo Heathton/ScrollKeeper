@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import email.parser
+import email.policy
 import json
+import os
 import tempfile
 import unittest
 import urllib.error
@@ -11,7 +14,7 @@ from unittest.mock import MagicMock, patch
 
 from scrollkeeper.config import Settings
 from scrollkeeper.health import Heartbeat, start_health_server
-from scrollkeeper.llm import LocalAIService
+from scrollkeeper.llm import LocalAIService, parse_transcription
 from test_llm_summary import fake_settings
 
 
@@ -55,22 +58,60 @@ class OpenAIClientTests(unittest.TestCase):
         self.assertEqual(post.call_args.args[0], "http://llm/v1/embeddings")
         self.assertEqual(post.call_args.kwargs["json"], {"model": "test-embed", "input": "hello"})
 
-    def test_transcribe_requests_verbose_json_with_word_timestamps(self) -> None:
+    def test_transcribe_track_streams_a_multipart_upload_with_word_timestamps(self) -> None:
         service = LocalAIService(fake_settings())
+        captured: dict = {}
+
+        def fake_post(url, **kwargs):
+            body = kwargs["data"]
+            captured["length"] = len(body)
+            captured["body"] = b"".join(iter(body))  # what requests would send
+            captured["kwargs"] = kwargs
+            captured["url"] = url
+            return fake_response(
+                {
+                    "text": " Roll initiative. ",
+                    "words": [{"word": "Roll", "start": 1.0, "end": 1.2}, {"word": "initiative.", "start": 1.3, "end": 1.9}],
+                    "segments": [{"id": 0, "text": "Roll initiative.", "start": 1.0, "end": 1.9}],
+                }
+            )
+
         with tempfile.TemporaryDirectory() as tmp:
-            audio = Path(tmp) / "clip.wav"
-            audio.write_bytes(b"RIFF")
-            with patch(
-                "scrollkeeper.llm.requests.post",
-                return_value=fake_response({"text": " Hello there. "}),
-            ) as post:
-                text = service._transcribe_audio_segment_sync(audio)
-        self.assertEqual(text, "Hello there.")
-        self.assertEqual(post.call_args.args[0], "http://stt/v1/audio/transcriptions")
-        data = post.call_args.kwargs["data"]
-        self.assertEqual(data["response_format"], "verbose_json")
-        self.assertEqual(data["timestamp_granularities[]"], "word")
-        self.assertEqual(post.call_args.kwargs["timeout"], (60, 600))
+            audio = Path(tmp) / "track-7.flac"
+            audio.write_bytes(b"fLaC" + bytes(range(256)) * 10)
+            with patch("scrollkeeper.llm.requests.post", side_effect=fake_post):
+                result = service._transcribe_track_sync(audio)
+
+        self.assertEqual(captured["url"], "http://stt/v1/audio/transcriptions")
+        self.assertEqual(captured["kwargs"]["timeout"], (60, 600))
+        self.assertEqual(captured["length"], len(captured["body"]), "Content-Length matches the streamed body")
+        content_type = captured["kwargs"]["headers"]["Content-Type"]
+        message = email.parser.BytesParser(policy=email.policy.HTTP).parsebytes(
+            f"Content-Type: {content_type}\r\n\r\n".encode() + captured["body"]
+        )
+        parts = {part.get_param("name", header="content-disposition"): part for part in message.iter_parts()}
+        self.assertEqual(parts["response_format"].get_content().strip(), "verbose_json")
+        self.assertEqual(parts["timestamp_granularities[]"].get_content().strip(), "word")
+        self.assertEqual(parts["model"].get_content().strip(), "whisper-1")
+        self.assertEqual(parts["file"].get_filename(), "track-7.flac")
+        self.assertEqual(parts["file"].get_content(), b"fLaC" + bytes(range(256)) * 10)
+
+        self.assertEqual(result.text, "Roll initiative.")
+        self.assertEqual([(w.text, w.start, w.end) for w in result.words], [("Roll", 1.0, 1.2), ("initiative.", 1.3, 1.9)])
+        self.assertEqual([s.text for s in result.segments], ["Roll initiative."])
+
+    def test_parse_transcription_tolerates_missing_or_bad_timestamps(self) -> None:
+        result = parse_transcription({"text": "Hi", "words": [{"word": "Hi"}, "junk", {"word": " ", "start": 0, "end": 1}]})
+        self.assertEqual((result.text, result.words, result.segments), ("Hi", [], []))
+
+    def test_stt_timeout_default_covers_whole_tracks(self) -> None:
+        with patch.dict(os.environ, {"SCROLLKEEPER_STT_TIMEOUT_SECONDS": ""}, clear=False):
+            os.environ.pop("SCROLLKEEPER_STT_TIMEOUT_SECONDS")
+            with patch("scrollkeeper.config.load_dotenv"):
+                settings = Settings.load()
+        self.assertEqual(settings.stt_timeout_seconds, 7200)
+        self.assertIsNone(settings.spool_dir)
+        self.assertEqual(settings.audio_retention_days, 0)
 
 
 class WaitNoticeTests(unittest.IsolatedAsyncioTestCase):

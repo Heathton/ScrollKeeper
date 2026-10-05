@@ -42,6 +42,8 @@ class Settings:
     extract_chunk_chars: int = 24000
     wiki_export: bool = True
     llm_extra_body: dict = field(default_factory=dict)
+    spool_dir: Path | None = None
+    audio_retention_days: int = 0
 
     @classmethod
     def load(cls) -> "Settings":
@@ -57,7 +59,8 @@ class Settings:
             bot_name=os.getenv("SCROLLKEEPER_BOT_NAME", "ScrollKeeper"),
             stt_base_url=_optional_env("SCROLLKEEPER_STT_BASE_URL").rstrip("/"),
             stt_model=os.getenv("SCROLLKEEPER_STT_MODEL", "parakeet-tdt-0.6b-v2").strip(),
-            stt_timeout_seconds=int(os.getenv("SCROLLKEEPER_STT_TIMEOUT_SECONDS", "600")),
+            # One request transcribes a whole speaker track, so this must cover the longest track.
+            stt_timeout_seconds=int(os.getenv("SCROLLKEEPER_STT_TIMEOUT_SECONDS", "7200")),
             llm_base_url=llm_base_url,
             llm_model=_optional_env("SCROLLKEEPER_LLM_MODEL"),
             llm_api_key=_optional_env("SCROLLKEEPER_LLM_API_KEY"),
@@ -69,6 +72,8 @@ class Settings:
             extract_chunk_chars=int(os.getenv("SCROLLKEEPER_EXTRACT_CHUNK_CHARS", "24000")),
             wiki_export=os.getenv("SCROLLKEEPER_WIKI_EXPORT", "1").strip().lower() not in {"0", "false", "no", "off"},
             llm_extra_body=_json_object_env("SCROLLKEEPER_LLM_EXTRA_BODY"),
+            spool_dir=Path(spool).resolve() if (spool := _optional_env("SCROLLKEEPER_SPOOL_DIR")) else None,
+            audio_retention_days=int(os.getenv("SCROLLKEEPER_AUDIO_RETENTION_DAYS", "0")),
         )
 
     def validate(self) -> None:
