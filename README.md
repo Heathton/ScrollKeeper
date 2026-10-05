@@ -9,7 +9,7 @@ ScrollKeeper is a Discord bot for tabletop campaigns. It can join a voice channe
 - Persistent SQLite storage for sessions, transcripts, character mappings, notes, and embeddings
 - File archives for audio segments, transcripts, summaries, and generated notes
 - Retrieval-backed campaign Q&A over saved notes
-- Speech-to-text through an OpenAI-compatible `/v1/audio/transcriptions` endpoint (a CPU faster-whisper service is included)
+- Speech-to-text through an OpenAI-compatible `/v1/audio/transcriptions` endpoint (a CPU Parakeet-TDT service with word timestamps is included)
 - Summaries, embeddings, and campaign Q&A through any OpenAI-compatible LLM endpoint (`/v1/chat/completions`, `/v1/embeddings`)
 
 ## Commands
@@ -61,7 +61,21 @@ Logs go to stdout. The bot never starts other containers and does not need the D
 docker compose up --build
 ```
 
-Compose runs the bot and a CPU faster-whisper service (`docker/whisper`) that implements `/v1/audio/transcriptions`. The LLM is not started by compose: point `SCROLLKEEPER_LLM_BASE_URL` at any OpenAI-compatible server.
+Compose runs the bot and the CPU speech-to-text service (`docker/stt`, below) that implements `/v1/audio/transcriptions`. The LLM is not started by compose: point `SCROLLKEEPER_LLM_BASE_URL` at any OpenAI-compatible server.
+
+## Speech-to-text service
+
+`docker/stt` serves NVIDIA Parakeet-TDT 0.6B v2 (int8 ONNX, English) through sherpa-onnx on CPU. It was chosen by the benchmark in #3 (about 9x realtime at 3 threads on a 4-core Skylake, ~1.7 GB RAM). The model and the Silero VAD model are downloaded and checksum-verified at image build time, so the container needs no network or volume at runtime.
+
+- `POST /v1/audio/transcriptions`: multipart `file` (any format ffmpeg reads), `response_format` = `json` | `text` | `verbose_json`, and `timestamp_granularities[]` = `segment` and/or `word`. `verbose_json` returns `text`, `duration`, `segments` (one per speech region) and `words`, each with `start`/`end` in seconds from the start of the file. `model` and `prompt` are accepted and ignored; hotwords are not supported (the benchmark found them unusable), so names are corrected downstream.
+- Long input: a whole per-speaker track of several hours is fine. The audio is streamed through ffmpeg, cut into speech regions by Silero VAD, and decoded region by region; progress is logged every 30 seconds. Requests are handled one at a time (others queue), since parallel decodes would compete for the same cores.
+- `GET /health`: `{"status": "ok", "model": ..., "threads": ..., "busy": ...}`. The model loads before the server accepts connections, so use it as a readiness probe.
+
+Service settings (environment variables of the STT container, not the bot):
+
+- `STT_THREADS=3`: ONNX Runtime threads. 3 leaves a core free on a 4-core node; going from 2 to 3 threads gave ~20% more speed in the benchmark.
+- `STT_MAX_SPEECH_SECONDS=20`: longest speech region decoded in one call (longer speech is split by the VAD). Memory grows with region length.
+- `STT_MODEL_DIR=/models/parakeet-tdt-0.6b-v2-int8` and `STT_VAD_MODEL=/models/silero_vad.onnx`: override to mount different model files.
 
 ## Container images
 
