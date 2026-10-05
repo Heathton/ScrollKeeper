@@ -28,7 +28,7 @@ ScrollKeeper is a Discord bot for tabletop campaigns. It can join a voice channe
 - `!session-status`: show the current session state
 - `!reprocess-session [session-id]`: rerun speech-to-text + summary/note generation from saved audio (also works for sessions recorded before per-speaker tracks; see [Recording](#recording))
 - `!reprocess-llm [session-id]`: rerun the summary and wiki update from existing transcript text (skips speech-to-text). The session's earlier extracted facts are retracted and replaced.
-- `!import-journal [preview]` with a journal export attached: import a VTT journal into the active campaign's wiki, or with `preview` show what it would import (needs the Manage Server permission; see [Importing a VTT journal](#importing-a-vtt-journal))
+- `!import-journal [preview]` with a journal export attached: import a VTT journal into the active campaign's wiki, or with `preview` show what it would import (any member can run it; see [Importing a VTT journal](#importing-a-vtt-journal))
 - `!import-status`: show the progress of a running journal import
 
 ### Campaigns

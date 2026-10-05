@@ -507,11 +507,9 @@ def build_bot(settings: Settings) -> commands.Bot:
 
     @bot.command(name="import-journal")
     async def import_journal(ctx: commands.Context, *, options: str = "") -> None:
+        # Open to every member for now: the game master who runs imports may not administer the server.
         if ctx.guild is None:
             await ctx.reply("This command must be used in a server.")
-            return
-        if not _can_manage(ctx):
-            await ctx.reply("Only members with the Manage Server permission can import a journal.")
             return
         option = options.strip().lower()
         attachments = getattr(ctx.message, "attachments", [])
