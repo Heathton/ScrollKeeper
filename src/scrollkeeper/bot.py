@@ -11,6 +11,8 @@ from .config import Settings
 from .llm import LocalAIService
 from .health import Heartbeat, start_health_server
 from .models import ENTITY_TYPES, Entity
+from .embeddings import EMBEDDING_MODELS, LocalEmbedder
+from .search import SearchIndex
 from .session_manager import SessionManager
 from .storage import Storage
 from .wiki import CampaignWiki, format_change_report
@@ -54,13 +56,20 @@ def build_bot(settings: Settings) -> commands.Bot:
     )
     storage = Storage(settings.data_dir)
     llm = LocalAIService(settings)
-    wiki = CampaignWiki(storage, llm, settings)
+    embedder = LocalEmbedder(
+        EMBEDDING_MODELS[settings.embed_model],
+        settings.embed_model_dir or settings.data_dir / "models",
+        threads=settings.embed_threads,
+    )
+    search = SearchIndex(storage, llm, embedder)
+    wiki = CampaignWiki(storage, llm, settings, search=search)
     sessions = SessionManager(
         storage,
         llm,
         wiki,
         spool_dir=settings.spool_dir,
         audio_retention_days=settings.audio_retention_days,
+        search=search,
     )
     discord_message_limit = 1900
 
@@ -133,6 +142,8 @@ def build_bot(settings: Settings) -> commands.Bot:
             print(f"{bot.user} is ready.")
         # Picks up sessions a restart interrupted (runs once; on_ready also fires on reconnects).
         await sessions.start()
+        # Loads (first time: downloads) the embedding model and indexes anything new, in the background.
+        search.start()
 
     @bot.command(name="register-character")
     async def register_character(ctx: commands.Context, *, character_name: str) -> None:
@@ -217,22 +228,50 @@ def build_bot(settings: Settings) -> commands.Bot:
             "You can continue using `!campaign-question` while this runs."
         )
 
-    @bot.command(name="campaign-question")
-    async def campaign_question(ctx: commands.Context, *, question: str) -> None:
+    async def _answer(ctx: commands.Context, question: str, deep: bool) -> None:
         if ctx.guild is None:
             await ctx.reply("This command must be used in a server.")
             return
-        await ctx.reply("Searching campaign notes.")
+        await ctx.reply("Searching campaign notes and session transcripts." if deep else "Searching campaign notes.")
         try:
-            answer = await sessions.answer_campaign_question(
-                ctx.guild.id,
-                question.strip(),
-                on_wait=ctx.send,
-            )
+            answer = await sessions.answer_campaign_question(ctx.guild.id, question.strip(), on_wait=ctx.send, deep=deep)
         except Exception as exc:
+            log.exception("Could not answer a campaign question")
             await ctx.send(f"Could not answer right now: {str(exc)[:1800]}")
             return
-        await ctx.send(answer[:1900])
+        await _send_long(ctx, answer)
+
+    @bot.command(name="campaign-question")
+    async def campaign_question(ctx: commands.Context, *, question: str) -> None:
+        await _answer(ctx, question, deep=False)
+
+    @bot.command(name="deep-question")
+    async def deep_question(ctx: commands.Context, *, question: str) -> None:
+        await _answer(ctx, question, deep=True)
+
+    @bot.command(name="reindex")
+    async def reindex(ctx: commands.Context) -> None:
+        if ctx.guild is None:
+            await ctx.reply("This command must be used in a server.")
+            return
+        permissions = getattr(ctx.author, "guild_permissions", None)
+        if not getattr(permissions, "manage_guild", False):
+            await ctx.reply("Only members with the Manage Server permission can rebuild the search index.")
+            return
+        await ctx.reply("Rebuilding the search index: every wiki page and session summary is re-embedded on CPU.")
+        try:
+            total, pending = await search.reindex(ctx.guild.id)
+        except Exception as exc:
+            log.exception("Reindex failed")
+            await ctx.send(f"Reindex failed: {str(exc)[:1800]}")
+            return
+        message = f"Indexed {total} document(s)."
+        if pending:
+            message += (
+                f" {pending} could not be embedded (the embedding model is not available; see the bot log). "
+                "Name and keyword search still find them."
+            )
+        await ctx.send(message)
 
     async def _send_long(ctx: commands.Context, message: str) -> None:
         for chunk in _split_long_message(message):

@@ -75,6 +75,19 @@ class SessionWikiPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([e.canonical_name for e in artifacts.wiki_report.new_entities], ["Varric"])
         self.assertEqual(self.storage.get_session(self.session_id)["status"], "completed")
 
+    async def test_processed_session_is_indexed_for_questions(self) -> None:
+        from scrollkeeper.search import SearchIndex
+        from test_search import FakeEmbedder
+
+        search = SearchIndex(self.storage, self.llm, FakeEmbedder())
+        self.manager = SessionManager(self.storage, self.llm, self.wiki, search=search)
+        await self.manager._process_closed_session(1, self.session, transcribe_audio=False)
+
+        indexed = {kind for kind, _ref, _part in self.storage.search_doc_versions(1)}
+        self.assertEqual(indexed, {"summary", "transcript"})
+        result = await search.search(1, "who owes us?", deep=True)
+        self.assertIn("[00:00:05] Mira: Varric owes us.", result.docs[0].body)
+
     async def test_wiki_failure_does_not_fail_the_session(self) -> None:
         async def broken(*_args, **_kwargs):
             raise RuntimeError("extraction exploded")

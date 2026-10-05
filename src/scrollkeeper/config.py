@@ -7,6 +7,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from .embeddings import DEFAULT_EMBED_MODEL, EMBEDDING_MODELS
+
 
 def _optional_env(name: str) -> str:
     return os.getenv(name, "").strip()
@@ -35,8 +37,6 @@ class Settings:
     llm_model: str
     llm_api_key: str
     llm_timeout_seconds: int
-    embed_base_url: str
-    embed_model: str
     wait_notice_seconds: int
     health_port: int
     extract_chunk_chars: int = 24000
@@ -44,6 +44,11 @@ class Settings:
     llm_extra_body: dict = field(default_factory=dict)
     spool_dir: Path | None = None
     audio_retention_days: int = 0
+    # In-process embedding model (a key of EMBEDDING_MODELS), where its files live (default
+    # <data dir>/models), and its ONNX Runtime threads.
+    embed_model: str = DEFAULT_EMBED_MODEL
+    embed_model_dir: Path | None = None
+    embed_threads: int = 2
 
     @classmethod
     def load(cls) -> "Settings":
@@ -65,8 +70,6 @@ class Settings:
             llm_model=_optional_env("SCROLLKEEPER_LLM_MODEL"),
             llm_api_key=_optional_env("SCROLLKEEPER_LLM_API_KEY"),
             llm_timeout_seconds=int(os.getenv("SCROLLKEEPER_LLM_TIMEOUT_SECONDS", "900")),
-            embed_base_url=_optional_env("SCROLLKEEPER_EMBED_BASE_URL").rstrip("/") or llm_base_url,
-            embed_model=_optional_env("SCROLLKEEPER_EMBED_MODEL"),
             wait_notice_seconds=int(os.getenv("SCROLLKEEPER_WAIT_NOTICE_SECONDS", "20")),
             health_port=int(os.getenv("SCROLLKEEPER_HEALTH_PORT", "8080")),
             extract_chunk_chars=int(os.getenv("SCROLLKEEPER_EXTRACT_CHUNK_CHARS", "24000")),
@@ -74,6 +77,9 @@ class Settings:
             llm_extra_body=_json_object_env("SCROLLKEEPER_LLM_EXTRA_BODY"),
             spool_dir=Path(spool).resolve() if (spool := _optional_env("SCROLLKEEPER_SPOOL_DIR")) else None,
             audio_retention_days=int(os.getenv("SCROLLKEEPER_AUDIO_RETENTION_DAYS", "0")),
+            embed_model=_optional_env("SCROLLKEEPER_EMBED_MODEL") or DEFAULT_EMBED_MODEL,
+            embed_model_dir=Path(path).resolve() if (path := _optional_env("SCROLLKEEPER_EMBED_MODEL_DIR")) else None,
+            embed_threads=int(os.getenv("SCROLLKEEPER_EMBED_THREADS", "2")),
         )
 
     def validate(self) -> None:
@@ -82,9 +88,13 @@ class Settings:
             "SCROLLKEEPER_STT_BASE_URL": self.stt_base_url,
             "SCROLLKEEPER_LLM_BASE_URL": self.llm_base_url,
             "SCROLLKEEPER_LLM_MODEL": self.llm_model,
-            "SCROLLKEEPER_EMBED_MODEL": self.embed_model,
         }
         missing = [name for name, value in required.items() if not value]
         if missing:
             joined = ", ".join(missing)
             raise RuntimeError(f"Missing required environment variables: {joined}")
+        if self.embed_model not in EMBEDDING_MODELS:
+            raise RuntimeError(
+                f"SCROLLKEEPER_EMBED_MODEL={self.embed_model!r} is not supported; use one of: "
+                f"{', '.join(EMBEDDING_MODELS)} (embeddings now run inside the bot)"
+            )

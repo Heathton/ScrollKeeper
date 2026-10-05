@@ -22,8 +22,6 @@ def fake_settings(**overrides) -> Settings:
         llm_model="test-model",
         llm_api_key="",
         llm_timeout_seconds=900,
-        embed_base_url="http://llm/v1",
-        embed_model="test-embed",
         wait_notice_seconds=20,
         health_port=0,
     )

@@ -17,12 +17,15 @@ import threading
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from .config import Settings
 from .llm import LocalAIService, split_transcript_chunks
 from .models import DuplicateCandidate, Entity, Fact, Page, WikiChangeReport, normalize_name
 from .storage import Storage
+
+if TYPE_CHECKING:
+    from .search import SearchIndex
 
 
 log = logging.getLogger(__name__)
@@ -55,14 +58,20 @@ class ExtractionResult:
     facts_added: int = 0
     flagged: list[DuplicateCandidate] = field(default_factory=list)
     renamed: list[tuple[str, str]] = field(default_factory=list)
-    renamed_ids: set[int] = field(default_factory=set)
 
 
 class CampaignWiki:
-    def __init__(self, storage: Storage, llm: LocalAIService, settings: Settings) -> None:
+    def __init__(
+        self,
+        storage: Storage,
+        llm: LocalAIService,
+        settings: Settings,
+        search: "SearchIndex | None" = None,
+    ) -> None:
         self.storage = storage
         self.llm = llm
         self.settings = settings
+        self.search = search
         self.export_root = storage.data_dir / "wiki"
         self._export_lock = threading.Lock()
 
@@ -100,14 +109,8 @@ class CampaignWiki:
         report.renamed = result.renamed
 
         report.page_failures = await self.refresh_stale_pages(guild_id, on_wait=on_wait, on_progress=on_progress)
-        report.pages_without_embedding = len(
-            await asyncio.to_thread(self.storage.page_ids_without_embedding, guild_id)
-        )
-        for entity_id in result.renamed_ids:
-            try:
-                await self.reembed_page(guild_id, entity_id, on_wait=on_wait)
-            except Exception:
-                log.exception("Could not re-embed renamed entity %s", entity_id)
+        if self.search is not None:
+            report.pages_without_embedding = await self.search.pending_count(guild_id)
 
         entities = await asyncio.to_thread(self.storage.list_entities, guild_id)
         by_id = {entity.id: entity for entity in entities}
@@ -322,7 +325,6 @@ class CampaignWiki:
             return
         await asyncio.to_thread(self.storage.rename_entity, entity.id, new_name)
         result.renamed.append((entity.canonical_name, new_name))
-        result.renamed_ids.add(entity.id)
 
     def _find_by_any_name(self, guild_id: int, names: list[str]) -> list[Entity]:
         found: dict[int, Entity] = {}
@@ -363,9 +365,7 @@ class CampaignWiki:
                 log.exception("Could not rewrite the wiki page for entity %s", entity_id)
                 entity = await asyncio.to_thread(self.storage.get_entity, guild_id, entity_id)
                 failures.append(entity.canonical_name if entity else f"#{entity_id}")
-        await self.embed_missing_pages(guild_id, on_wait=on_wait)
-        if self.settings.wiki_export:
-            await asyncio.to_thread(self.export, guild_id)
+        await self._after_change(guild_id)
         return failures
 
     async def refresh_page(
@@ -420,8 +420,7 @@ class CampaignWiki:
             status = result.get("status", "") if entity.type == "Quest" else ""
             short_description = _strip_citations(result["short_description"]) or short_description
 
-        embedding = await self._try_embed(entity, markdown, on_wait)
-        await asyncio.to_thread(self.storage.save_page, entity.id, markdown, sorted(active_ids), embedding)
+        await asyncio.to_thread(self.storage.save_page, entity.id, markdown, sorted(active_ids))
         if short_description != entity.short_description:
             await asyncio.to_thread(self.storage.set_entity_short_description, entity.id, short_description)
         if status and status != entity.status:
@@ -429,17 +428,7 @@ class CampaignWiki:
         return True
 
     def linked_quests(self, guild_id: int) -> dict[int, list[Entity]]:
-        """Quests each entity is involved in: those whose active facts name it (name or alias)."""
-        entities = self.storage.list_entities(guild_id)
-        quests = {entity.id: entity for entity in entities if entity.type == "Quest"}
-        links: dict[int, list[Entity]] = {}
-        for quest_id, texts in self.storage.active_facts_by_type(guild_id, "Quest").items():
-            if quest_id not in quests:
-                continue
-            for entity_id in sorted(mentioned_entity_ids(entities, "\n".join(texts), fuzzy=False)):
-                if entity_id != quest_id:
-                    links.setdefault(entity_id, []).append(quests[quest_id])
-        return links
+        return linked_quests(self.storage, guild_id)
 
     async def rebuild_all_pages(
         self,
@@ -459,7 +448,7 @@ class CampaignWiki:
                 log.exception("Could not rebuild the wiki page for entity %s", entity_id)
                 entity = await asyncio.to_thread(self.storage.get_entity, guild_id, entity_id)
                 failures.append(entity.canonical_name if entity else f"#{entity_id}")
-        await self._export_if_enabled(guild_id)
+        await self._after_change(guild_id)
         return rebuilt, failures
 
     def _is_player_character(self, guild_id: int, entity: Entity) -> bool:
@@ -467,31 +456,6 @@ class CampaignWiki:
             return False
         names = {normalize_name(name) for name in entity.names()}
         return any(normalize_name(name) in names for name in self.storage.list_registered_characters(guild_id))
-
-    async def reembed_page(self, guild_id: int, entity_id: int, on_wait: WaitNotifier | None = None) -> None:
-        """Refresh a page's embedding after a name or alias change (the text is unchanged)."""
-        entity = await asyncio.to_thread(self.storage.get_entity, guild_id, entity_id)
-        page = await asyncio.to_thread(self.storage.get_page, entity_id)
-        if entity is None or page is None:
-            return
-        embedding = await self._try_embed(entity, page.markdown, on_wait)
-        if embedding:
-            await asyncio.to_thread(self.storage.update_page_embedding, entity_id, embedding)
-
-    async def _try_embed(self, entity: Entity, markdown: str, on_wait: WaitNotifier | None) -> list[float] | None:
-        """Embed a page for search. A failure leaves the page unsearchable until the next run
-        retries it, rather than losing the rewritten page."""
-        try:
-            return await self.llm.embed_text(page_embedding_text(entity, markdown), on_wait=on_wait) or None
-        except Exception as exc:
-            log.warning("Could not embed the wiki page for %s: %s", entity.canonical_name, exc)
-            return None
-
-    async def embed_missing_pages(self, guild_id: int, on_wait: WaitNotifier | None = None) -> int:
-        """Retry embeddings for pages saved without one. Returns how many are still missing."""
-        for entity_id in await asyncio.to_thread(self.storage.page_ids_without_embedding, guild_id):
-            await self.reembed_page(guild_id, entity_id, on_wait=on_wait)
-        return len(await asyncio.to_thread(self.storage.page_ids_without_embedding, guild_id))
 
     # --- Review commands ----------------------------------------------------------------
 
@@ -511,21 +475,19 @@ class CampaignWiki:
 
     async def rename(self, guild_id: int, entity: Entity, new_name: str, on_wait: WaitNotifier | None = None) -> None:
         await asyncio.to_thread(self.storage.rename_entity, entity.id, new_name)
-        await self.reembed_page(guild_id, entity.id, on_wait=on_wait)
-        await self._export_if_enabled(guild_id)
+        await self._after_change(guild_id)
 
     async def has_name(self, guild_id: int, entity: Entity, name: str) -> bool:
         return normalize_name(name) in {normalize_name(existing) for existing in entity.names()}
 
     async def add_alias(self, guild_id: int, entity: Entity, alias: str, on_wait: WaitNotifier | None = None) -> None:
         if await asyncio.to_thread(self.storage.add_alias, entity.id, alias):
-            await self.reembed_page(guild_id, entity.id, on_wait=on_wait)
-            await self._export_if_enabled(guild_id)
+            await self._after_change(guild_id)
 
     async def refresh_after_change(self, guild_id: int, entity_id: int, on_wait: WaitNotifier | None = None) -> None:
         """Rewrite one entity's page after a manual fact change (pin, correction, retraction, merge)."""
         await self.refresh_page(guild_id, entity_id, on_wait=on_wait)
-        await self._export_if_enabled(guild_id)
+        await self._after_change(guild_id)
 
     async def render_entity(self, guild_id: int, entity: Entity) -> str:
         """Discord view of one entity: page (or raw facts) plus the sources it cites."""
@@ -553,22 +515,6 @@ class CampaignWiki:
             lines.extend(["", "**Sources**"])
             lines.extend(f"- F{fact.id} ({fact.source_label()}): {fact.text}" for fact in sources)
         return "\n".join(lines)
-
-    async def answer_question(self, guild_id: int, question: str, on_wait: WaitNotifier | None = None) -> str:
-        query_embedding = await self.llm.embed_text(question, on_wait=on_wait)
-        results = await asyncio.to_thread(self.storage.semantic_search_pages, guild_id, query_embedding, 8)
-        if not results:
-            return "I do not have any campaign wiki pages yet."
-        fact_ids = sorted({fact_id for _, page in results for fact_id in cited_fact_ids(page.markdown)})
-        facts = await asyncio.to_thread(self.storage.get_facts, guild_id, fact_ids)
-        links = await asyncio.to_thread(self.linked_quests, guild_id)
-        context = "\n\n".join(
-            "\n".join(
-                [entity_header(entity), render_citations(page.markdown, facts), *quest_list(links.get(entity.id, []))]
-            )
-            for entity, page in results
-        )
-        return await self.llm.answer_question(question, context, on_wait=on_wait)
 
     # --- Export -------------------------------------------------------------------------
 
@@ -606,9 +552,16 @@ class CampaignWiki:
             (folder / f"{file_names[entity.id]}.md").write_text(content, encoding="utf-8")
         return target
 
-    async def _export_if_enabled(self, guild_id: int) -> None:
+    async def _after_change(self, guild_id: int) -> None:
+        """Export the vault and re-index changed pages for search. Search indexing failures are
+        logged, not raised: the wiki change itself is saved."""
         if self.settings.wiki_export:
             await asyncio.to_thread(self.export, guild_id)
+        if self.search is not None:
+            try:
+                await self.search.refresh(guild_id)
+            except Exception:
+                log.exception("Could not update the search index for guild %s", guild_id)
 
 
 # --- Page layouts ----------------------------------------------------------------------------
@@ -742,6 +695,20 @@ def entity_header(entity: Entity) -> str:
     if entity.aliases:
         header += f" (aka {', '.join(entity.aliases)})"
     return header
+
+
+def linked_quests(storage: Storage, guild_id: int) -> dict[int, list[Entity]]:
+    """Quests each entity is involved in: those whose active facts name it (name or alias)."""
+    entities = storage.list_entities(guild_id)
+    quests = {entity.id: entity for entity in entities if entity.type == "Quest"}
+    links: dict[int, list[Entity]] = {}
+    for quest_id, texts in storage.active_facts_by_type(guild_id, "Quest").items():
+        if quest_id not in quests:
+            continue
+        for entity_id in sorted(mentioned_entity_ids(entities, "\n".join(texts), fuzzy=False)):
+            if entity_id != quest_id:
+                links.setdefault(entity_id, []).append(quests[quest_id])
+    return links
 
 
 def page_embedding_text(entity: Entity, markdown: str) -> str:
@@ -948,8 +915,8 @@ def format_change_report(report: WikiChangeReport) -> str:
         )
     if report.pages_without_embedding:
         lines.append(
-            f"**{report.pages_without_embedding} page(s) not searchable yet**: the embedding endpoint "
-            "failed, so `!campaign-question` can't find them. Retried on the next run."
+            f"**{report.pages_without_embedding} document(s) not in semantic search yet**: the embedding "
+            "model is not available. Name and keyword search still find them; retried on the next change."
         )
     return "\n".join(lines)
 

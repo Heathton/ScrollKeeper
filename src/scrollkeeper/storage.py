@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import json
-import math
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Iterator
 
-from .models import FACT_KINDS, Entity, Fact, Page, SpeakerSegment, normalize_name
+from .models import FACT_KINDS, Entity, Fact, Page, SearchDoc, SpeakerSegment, normalize_name
 
 
 # Forward-only schema migrations, applied in order; `PRAGMA user_version` records how many ran.
@@ -89,6 +88,45 @@ MIGRATIONS: list[str] = [
     ALTER TABLE sessions ADD COLUMN processing_attempts INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE sessions ADD COLUMN interrupted_at TEXT;
     ALTER TABLE sessions ADD COLUMN audio_deleted_at TEXT;
+    """,
+    # 3: hybrid retrieval. Searchable documents (wiki pages, session summaries, transcript
+    # chunks) are derived from the tables above by `SearchIndex.refresh`, with an FTS5 keyword
+    # index and an embedding that records the model and dimension it was made with. Page
+    # embeddings from the old HTTP endpoint are dropped: they came from another model.
+    """
+    CREATE TABLE search_docs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id INTEGER NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('page', 'summary', 'transcript')),
+        ref_id INTEGER NOT NULL,
+        part INTEGER NOT NULL DEFAULT 0,
+        session_id INTEGER,
+        start_ts TEXT,
+        title TEXT NOT NULL,
+        body TEXT NOT NULL,
+        version TEXT NOT NULL,
+        embedding BLOB,
+        embed_model TEXT,
+        embed_dim INTEGER,
+        UNIQUE (guild_id, kind, ref_id, part)
+    );
+
+    CREATE VIRTUAL TABLE search_fts USING fts5(
+        title, body, content='search_docs', content_rowid='id',
+        tokenize='porter unicode61 remove_diacritics 2'
+    );
+    CREATE TRIGGER search_docs_ai AFTER INSERT ON search_docs BEGIN
+        INSERT INTO search_fts(rowid, title, body) VALUES (new.id, new.title, new.body);
+    END;
+    CREATE TRIGGER search_docs_ad AFTER DELETE ON search_docs BEGIN
+        INSERT INTO search_fts(search_fts, rowid, title, body) VALUES ('delete', old.id, old.title, old.body);
+    END;
+    CREATE TRIGGER search_docs_au AFTER UPDATE OF title, body ON search_docs BEGIN
+        INSERT INTO search_fts(search_fts, rowid, title, body) VALUES ('delete', old.id, old.title, old.body);
+        INSERT INTO search_fts(rowid, title, body) VALUES (new.id, new.title, new.body);
+    END;
+
+    ALTER TABLE pages DROP COLUMN embedding_json;
     """,
 ]
 
@@ -807,49 +845,20 @@ class Storage:
             row = conn.execute("SELECT * FROM pages WHERE entity_id = ?", (entity_id,)).fetchone()
         return _page_from_row(row) if row else None
 
-    def save_page(
-        self,
-        entity_id: int,
-        markdown: str,
-        source_fact_ids: list[int],
-        embedding: list[float] | None,
-    ) -> None:
+    def save_page(self, entity_id: int, markdown: str, source_fact_ids: list[int]) -> None:
         now = datetime.utcnow().isoformat()
-        embedding_json = json.dumps(embedding, ensure_ascii=True) if embedding else None
         with self.connection() as conn:
             conn.execute(
                 """
-                INSERT INTO pages (entity_id, markdown, source_fact_ids_json, embedding_json, updated_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO pages (entity_id, markdown, source_fact_ids_json, updated_at)
+                VALUES (?, ?, ?, ?)
                 ON CONFLICT(entity_id) DO UPDATE SET
                     markdown = excluded.markdown,
                     source_fact_ids_json = excluded.source_fact_ids_json,
-                    embedding_json = excluded.embedding_json,
                     updated_at = excluded.updated_at
                 """,
-                (entity_id, markdown, json.dumps(sorted(set(source_fact_ids))), embedding_json, now),
+                (entity_id, markdown, json.dumps(sorted(set(source_fact_ids))), now),
             )
-
-    def update_page_embedding(self, entity_id: int, embedding: list[float]) -> None:
-        with self.connection() as conn:
-            conn.execute(
-                "UPDATE pages SET embedding_json = ? WHERE entity_id = ?",
-                (json.dumps(embedding, ensure_ascii=True), entity_id),
-            )
-
-    def page_ids_without_embedding(self, guild_id: int) -> list[int]:
-        with self.connection() as conn:
-            rows = conn.execute(
-                """
-                SELECT p.entity_id
-                FROM pages p
-                JOIN entities e ON e.id = p.entity_id
-                WHERE e.guild_id = ? AND e.merged_into IS NULL AND p.embedding_json IS NULL
-                ORDER BY p.entity_id
-                """,
-                (guild_id,),
-            ).fetchall()
-        return [int(row["entity_id"]) for row in rows]
 
     def delete_page(self, entity_id: int) -> None:
         with self.connection() as conn:
@@ -880,40 +889,194 @@ class Storage:
                 for row in rows
             ]
 
-    def semantic_search_pages(
-        self,
-        guild_id: int,
-        query_embedding: list[float],
-        limit: int = 8,
-    ) -> list[tuple[Entity, Page]]:
+    # --- Search index (#8): documents derived from pages and sessions -----------------------
+
+    def search_guild_ids(self) -> list[int]:
         with self.connection() as conn:
             rows = conn.execute(
-                """
-                SELECT e.*, p.markdown, p.source_fact_ids_json, p.embedding_json,
-                       p.updated_at AS page_updated_at
-                FROM pages p
-                JOIN entities e ON e.id = p.entity_id
-                WHERE e.guild_id = ? AND e.merged_into IS NULL AND p.embedding_json IS NOT NULL
-                """,
+                "SELECT guild_id FROM entities UNION SELECT guild_id FROM sessions ORDER BY guild_id"
+            ).fetchall()
+        return [int(row["guild_id"]) for row in rows]
+
+    def page_doc_sources(self, guild_id: int) -> list[sqlite3.Row]:
+        """Live pages with a version string that changes when the page text or the entity's names do."""
+        with self.connection() as conn:
+            return list(
+                conn.execute(
+                    """
+                    SELECT e.id AS entity_id, p.updated_at || '|' || e.updated_at || '|' || e.canonical_name AS version
+                    FROM pages p
+                    JOIN entities e ON e.id = p.entity_id
+                    WHERE e.guild_id = ? AND e.merged_into IS NULL
+                    ORDER BY e.id
+                    """,
+                    (guild_id,),
+                ).fetchall()
+            )
+
+    def summarized_sessions(self, guild_id: int) -> list[sqlite3.Row]:
+        """Sessions with a written summary; `ended_at` changes each time a session is (re)processed."""
+        with self.connection() as conn:
+            return list(
+                conn.execute(
+                    """
+                    SELECT * FROM sessions
+                    WHERE guild_id = ? AND summary_path IS NOT NULL AND status = 'completed'
+                    ORDER BY id
+                    """,
+                    (guild_id,),
+                ).fetchall()
+            )
+
+    def search_doc_versions(self, guild_id: int) -> dict[tuple[str, int, int], tuple[int, str]]:
+        """(kind, ref_id, part) -> (doc id, version) for every indexed document of a guild."""
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT id, kind, ref_id, part, version FROM search_docs WHERE guild_id = ?",
                 (guild_id,),
             ).fetchall()
-            scored: list[tuple[float, sqlite3.Row]] = []
-            for row in rows:
-                score = cosine_similarity(query_embedding, json.loads(row["embedding_json"]))
-                scored.append((score, row))
-            scored.sort(key=lambda item: item[0], reverse=True)
-            return [
-                (
-                    self._entity_from_row(conn, row),
-                    Page(
-                        entity_id=int(row["id"]),
-                        markdown=row["markdown"],
-                        source_fact_ids=json.loads(row["source_fact_ids_json"]),
-                        updated_at=row["page_updated_at"],
-                    ),
-                )
-                for _, row in scored[:limit]
-            ]
+        return {(row["kind"], int(row["ref_id"]), int(row["part"])): (int(row["id"]), row["version"]) for row in rows}
+
+    def replace_search_docs(
+        self,
+        guild_id: int,
+        kind: str,
+        ref_id: int,
+        docs: list[SearchDoc],
+        version: str,
+    ) -> None:
+        """Store the documents made from one source (a page, a summary, one session's transcript),
+        replacing the earlier ones. A document whose text is unchanged keeps its embedding."""
+        with self.connection() as conn:
+            existing = {
+                int(row["part"]): row
+                for row in conn.execute(
+                    "SELECT * FROM search_docs WHERE guild_id = ? AND kind = ? AND ref_id = ?",
+                    (guild_id, kind, ref_id),
+                ).fetchall()
+            }
+            for doc in docs:
+                old = existing.pop(doc.part, None)
+                if old is None:
+                    conn.execute(
+                        """
+                        INSERT INTO search_docs (guild_id, kind, ref_id, part, session_id, start_ts, title, body, version)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (guild_id, kind, ref_id, doc.part, doc.session_id, doc.start_ts, doc.title, doc.body, version),
+                    )
+                elif old["title"] == doc.title and old["body"] == doc.body:
+                    conn.execute(
+                        "UPDATE search_docs SET version = ?, session_id = ?, start_ts = ? WHERE id = ?",
+                        (version, doc.session_id, doc.start_ts, old["id"]),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE search_docs
+                        SET title = ?, body = ?, version = ?, session_id = ?, start_ts = ?,
+                            embedding = NULL, embed_model = NULL, embed_dim = NULL
+                        WHERE id = ?
+                        """,
+                        (doc.title, doc.body, version, doc.session_id, doc.start_ts, old["id"]),
+                    )
+            for old in existing.values():
+                conn.execute("DELETE FROM search_docs WHERE id = ?", (old["id"],))
+
+    def delete_search_docs(self, guild_id: int, kind: str, ref_id: int) -> None:
+        with self.connection() as conn:
+            conn.execute(
+                "DELETE FROM search_docs WHERE guild_id = ? AND kind = ? AND ref_id = ?",
+                (guild_id, kind, ref_id),
+            )
+
+    def clear_search_index(self, guild_id: int) -> None:
+        """Drop every search document of a guild (they are rebuilt from pages and sessions)."""
+        with self.connection() as conn:
+            conn.execute("DELETE FROM search_docs WHERE guild_id = ?", (guild_id,))
+
+    def docs_needing_embedding(self, guild_id: int, model: str, kinds: tuple[str, ...]) -> list[SearchDoc]:
+        """Documents without an embedding from `model` (new, changed, or embedded by another model)."""
+        placeholders = ",".join("?" for _ in kinds)
+        with self.connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM search_docs
+                WHERE guild_id = ? AND kind IN ({placeholders})
+                  AND (embedding IS NULL OR embed_model IS NOT ?)
+                ORDER BY id
+                """,
+                (guild_id, *kinds, model),
+            ).fetchall()
+        return [_search_doc_from_row(row) for row in rows]
+
+    def set_doc_embedding(self, doc_id: int, title: str, body: str, model: str, vector: bytes, dim: int) -> bool:
+        """Store an embedding unless the document changed while it was being computed."""
+        with self.connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE search_docs SET embedding = ?, embed_model = ?, embed_dim = ?
+                WHERE id = ? AND title = ? AND body = ?
+                """,
+                (vector, model, dim, doc_id, title, body),
+            )
+            return cursor.rowcount > 0
+
+    def doc_embeddings(self, guild_id: int, model: str, dim: int, kinds: tuple[str, ...]) -> list[tuple[int, bytes]]:
+        placeholders = ",".join("?" for _ in kinds)
+        with self.connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, embedding FROM search_docs
+                WHERE guild_id = ? AND kind IN ({placeholders}) AND embed_model = ? AND embed_dim = ?
+                  AND embedding IS NOT NULL
+                """,
+                (guild_id, *kinds, model, dim),
+            ).fetchall()
+        return [(int(row["id"]), bytes(row["embedding"])) for row in rows]
+
+    def keyword_search(self, guild_id: int, match: str, kinds: tuple[str, ...], limit: int) -> list[int]:
+        """Doc ids matching an FTS5 query, best BM25 first (titles weigh more than bodies)."""
+        placeholders = ",".join("?" for _ in kinds)
+        with self.connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT d.id
+                FROM search_fts
+                JOIN search_docs d ON d.id = search_fts.rowid
+                WHERE search_fts MATCH ? AND d.guild_id = ? AND d.kind IN ({placeholders})
+                ORDER BY bm25(search_fts, 4.0, 1.0)
+                LIMIT ?
+                """,
+                (match, guild_id, *kinds, limit),
+            ).fetchall()
+        return [int(row["id"]) for row in rows]
+
+    def get_search_docs(self, doc_ids: list[int]) -> dict[int, SearchDoc]:
+        if not doc_ids:
+            return {}
+        placeholders = ",".join("?" for _ in doc_ids)
+        with self.connection() as conn:
+            rows = conn.execute(f"SELECT * FROM search_docs WHERE id IN ({placeholders})", doc_ids).fetchall()
+        return {int(row["id"]): _search_doc_from_row(row) for row in rows}
+
+    def page_doc_ids(self, guild_id: int, entity_ids: list[int]) -> dict[int, int]:
+        """entity id -> search doc id of its page."""
+        if not entity_ids:
+            return {}
+        placeholders = ",".join("?" for _ in entity_ids)
+        with self.connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, ref_id FROM search_docs
+                WHERE guild_id = ? AND kind = 'page' AND ref_id IN ({placeholders})
+                """,
+                (guild_id, *entity_ids),
+            ).fetchall()
+        return {int(row["ref_id"]): int(row["id"]) for row in rows}
+
+    def count_unembedded_docs(self, guild_id: int, model: str, kinds: tuple[str, ...]) -> int:
+        return len(self.docs_needing_embedding(guild_id, model, kinds))
 
     def _insert_alias(self, conn: sqlite3.Connection, entity_id: int, canonical_name: str, alias: str) -> bool:
         alias = alias.strip()
@@ -968,6 +1131,20 @@ def _fact_from_row(row: sqlite3.Row) -> Fact:
     )
 
 
+def _search_doc_from_row(row: sqlite3.Row) -> SearchDoc:
+    return SearchDoc(
+        id=int(row["id"]),
+        guild_id=int(row["guild_id"]),
+        kind=row["kind"],
+        ref_id=int(row["ref_id"]),
+        part=int(row["part"]),
+        title=row["title"],
+        body=row["body"],
+        session_id=row["session_id"],
+        start_ts=row["start_ts"],
+    )
+
+
 def _page_from_row(row: sqlite3.Row) -> Page:
     return Page(
         entity_id=int(row["entity_id"]),
@@ -975,14 +1152,3 @@ def _page_from_row(row: sqlite3.Row) -> Page:
         source_fact_ids=json.loads(row["source_fact_ids_json"]),
         updated_at=row["updated_at"],
     )
-
-
-def cosine_similarity(a: list[float], b: list[float]) -> float:
-    if not a or not b:
-        return 0.0
-    numerator = sum(x * y for x, y in zip(a, b, strict=False))
-    denom_a = math.sqrt(sum(x * x for x in a))
-    denom_b = math.sqrt(sum(y * y for y in b))
-    if denom_a == 0 or denom_b == 0:
-        return 0.0
-    return numerator / (denom_a * denom_b)

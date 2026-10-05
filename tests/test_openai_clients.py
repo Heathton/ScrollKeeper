@@ -49,15 +49,6 @@ class OpenAIClientTests(unittest.TestCase):
         self.assertNotIn("response_format", kwargs["json"])
         self.assertEqual(kwargs["headers"], {})
 
-    def test_embed_reads_openai_embedding_shape(self) -> None:
-        service = LocalAIService(fake_settings())
-        reply = {"data": [{"embedding": [0.1, 0.2]}]}
-        with patch("scrollkeeper.llm.requests.post", return_value=fake_response(reply)) as post:
-            vector = service._embed_text_sync("hello")
-        self.assertEqual(vector, [0.1, 0.2])
-        self.assertEqual(post.call_args.args[0], "http://llm/v1/embeddings")
-        self.assertEqual(post.call_args.kwargs["json"], {"model": "test-embed", "input": "hello"})
-
     def test_transcribe_track_streams_a_multipart_upload_with_word_timestamps(self) -> None:
         service = LocalAIService(fake_settings())
         captured: dict = {}
@@ -152,20 +143,27 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("SCROLLKEEPER_LLM_BASE_URL", str(ctx.exception))
         self.assertIn("SCROLLKEEPER_LLM_MODEL", str(ctx.exception))
 
-    def test_load_reads_env_and_embed_url_defaults_to_llm_url(self) -> None:
+    def test_load_reads_env_and_defaults_to_the_bundled_embedding_model(self) -> None:
         env = {
             "DISCORD_BOT_TOKEN": "t",
             "SCROLLKEEPER_DATA_DIR": tempfile.mkdtemp(),
             "SCROLLKEEPER_STT_BASE_URL": "http://stt:9000/v1/",
             "SCROLLKEEPER_LLM_BASE_URL": "http://llm:8000/v1/",
             "SCROLLKEEPER_LLM_MODEL": "m",
-            "SCROLLKEEPER_EMBED_MODEL": "e",
         }
         with patch.dict("os.environ", env, clear=True), patch("scrollkeeper.config.load_dotenv"):
             settings = Settings.load()
         settings.validate()
         self.assertEqual(settings.stt_base_url, "http://stt:9000/v1")
-        self.assertEqual(settings.embed_base_url, "http://llm:8000/v1")
+        self.assertEqual(settings.embed_model, "embeddinggemma-300m")
+        self.assertIsNone(settings.embed_model_dir)
+        self.assertEqual(settings.embed_threads, 2)
+
+    def test_unknown_embedding_model_is_rejected(self) -> None:
+        settings = fake_settings(embed_model="qwen3-embedding:4b")
+        with self.assertRaises(RuntimeError) as ctx:
+            settings.validate()
+        self.assertIn("embeddinggemma-300m", str(ctx.exception))
         self.assertEqual(settings.llm_extra_body, {})
 
     def test_llm_extra_body_must_be_a_json_object(self) -> None:
