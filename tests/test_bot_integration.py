@@ -54,6 +54,9 @@ class FakeCampaignWiki:
     def __init__(self, *_args, **_kwargs) -> None:
         pass
 
+    async def ensure_player_characters(self, _guild_id: int) -> list[int]:
+        return []
+
 
 class FakeSessionManager:
     last_instance: "FakeSessionManager | None" = None

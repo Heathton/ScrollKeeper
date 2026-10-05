@@ -132,6 +132,7 @@ def build_bot(settings: Settings) -> commands.Bot:
             await ctx.reply("This command must be used in a server.")
             return
         storage.register_character(ctx.guild.id, ctx.author.id, character_name.strip())
+        await wiki.ensure_player_characters(ctx.guild.id)
         await ctx.reply(f"Registered character name: **{character_name.strip()}**")
 
     @bot.command(name="join")

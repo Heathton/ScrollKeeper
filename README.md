@@ -37,7 +37,15 @@ Entities are referred to by `#id`, name or alias. Put names with spaces in quote
 - `!correct-fact <fact-id> <text>`: replace a wrong fact with a pinned one (the old fact is kept as history)
 - `!retract-fact <fact-id> [reason]`: withdraw a wrong fact
 
-After each processed session the bot posts the new and updated entities and **possible duplicates** (same or similar names) so they can be merged.
+After each processed session the bot posts the new, updated and renamed entities and **possible duplicates** so they can be merged.
+
+How the bot decides whether someone or something is already known:
+
+- Fact extraction sees an index of every entity (id, type, names). Entities named in the transcript chunk, including near spellings such as "Varic" for "Varric", also show their one-line description.
+- Before a proposed entity is created, the bot looks for existing entities with the same name or alias, a similar spelling, a shared name word ("Lord Thane" / "Varric Thane"), or the name appearing in a description ("the harbour master"). If it finds any, a short LLM check decides `same`, `different` or `unsure`. `same` attaches the facts and learns the new name as an alias. `unsure` creates the entity and flags the pair in the change report.
+- A name that matches several entities is reported instead of being guessed silently.
+- When a described entity's real name is revealed ("the harbour master was Aldous Penn"), the entity is renamed and the old label becomes an alias.
+- Names registered with `!register-character` become Character entities, so player characters always exist.
 
 ## Prerequisites
 

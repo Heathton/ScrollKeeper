@@ -76,6 +76,16 @@ class LocalAIService:
             wait_message="Waking the inference box, this can take a few minutes...",
         )
 
+    async def match_entity(self, proposal: str, candidates: str, on_wait: WaitNotifier | None = None) -> dict[str, str]:
+        """Ask whether a proposed new entity is one of the given existing candidates."""
+        return await self._run_blocking(
+            self._match_entity_sync,
+            proposal,
+            candidates,
+            on_wait=on_wait,
+            wait_message="Waking the inference box, this can take a few minutes...",
+        )
+
     async def rewrite_page(
         self,
         entity_header: str,
@@ -305,7 +315,12 @@ Rules:
   entities involved, not as entities.
 - `timestamp` is the [HH:MM:SS] of the line the fact comes from.
 - Use `alias_updates` when the transcript calls a known entity by a new name or title.
-- Players speak as their characters; the speaker name is the character's name.
+- Use `name_reveals` when the transcript reveals the real name of a known entity that is listed
+  under a description or title (e.g. `#8 [Character] The Harbour Master` turns out to be called
+  Aldous Penn): give `#8` and the revealed name, attach the facts to `#8`, and do not propose a
+  new entity for that name.
+- Players speak as their characters; the speaker name is the character's name, and player
+  characters are in the index. The game master and the players themselves are not entities.
 - Keep claims, rumours and lies as claims: "Sela says the ledger names the killer", not "the
   ledger names the killer". Do not turn a guess or an accusation into a fact.
 - Do not give an entity a title or role that the transcript gives to someone else.
@@ -314,6 +329,30 @@ Rules:
         prompt = f"Known entities:\n{entity_index or '(none yet)'}\n\nTranscript part:\n{transcript_chunk}"
         payload = self._chat_schema_sync(instructions, prompt, "fact_extraction", FACT_EXTRACTION_SCHEMA)
         return normalize_extraction_payload(payload)
+
+    def _match_entity_sync(self, proposal: str, candidates: str) -> dict[str, str]:
+        instructions = """
+You maintain the entity list of a tabletop RPG campaign wiki. A new entity was proposed from a
+session transcript. Decide whether it is one of the existing candidate entities.
+
+- `same`: the evidence clearly refers to that candidate (another name, a title, a nickname, a
+  speech-to-text misspelling, or a description of the same person/place/thing). Set `entity` to
+  its `#<id>`.
+- `different`: it is clearly none of them, e.g. a different person who shares a first name or
+  title. Set `entity` to "".
+- `unsure`: the evidence is not enough to tell. Set `entity` to the most likely candidate's
+  `#<id>`, or "".
+Similar names alone are not enough for `same`; check that the facts fit together.
+`reason` is one short sentence.
+"""
+        prompt = f"Proposed entity:\n{proposal}\n\nCandidates:\n{candidates}"
+        payload = self._chat_schema_sync(instructions, prompt, "entity_match", ENTITY_MATCH_SCHEMA)
+        decision = str(payload.get("decision", "")).strip()
+        return {
+            "decision": decision if decision in {"same", "different", "unsure"} else "unsure",
+            "entity": str(payload.get("entity", "")).strip(),
+            "reason": str(payload.get("reason", "")).strip(),
+        }
 
     def _rewrite_page_sync(
         self,
@@ -442,7 +481,7 @@ Be concise but useful.
 FACT_EXTRACTION_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["new_entities", "facts", "alias_updates"],
+    "required": ["new_entities", "facts", "alias_updates", "name_reveals"],
     "properties": {
         "new_entities": {
             "type": "array",
@@ -483,6 +522,29 @@ FACT_EXTRACTION_SCHEMA: dict[str, Any] = {
                 },
             },
         },
+        "name_reveals": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["entity", "name"],
+                "properties": {
+                    "entity": {"type": "string"},
+                    "name": {"type": "string"},
+                },
+            },
+        },
+    },
+}
+
+ENTITY_MATCH_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["decision", "entity", "reason"],
+    "properties": {
+        "decision": {"type": "string", "enum": ["same", "different", "unsure"]},
+        "entity": {"type": "string"},
+        "reason": {"type": "string"},
     },
 }
 
@@ -531,7 +593,18 @@ def normalize_extraction_payload(payload: dict[str, Any]) -> dict[str, Any]:
         alias = str(item.get("alias", "")).strip()
         if entity and alias:
             alias_updates.append({"entity": entity, "alias": alias})
-    return {"new_entities": new_entities, "facts": facts, "alias_updates": alias_updates}
+    name_reveals = []
+    for item in items("name_reveals"):
+        entity = str(item.get("entity", "")).strip()
+        name = str(item.get("name", "")).strip()
+        if entity and name:
+            name_reveals.append({"entity": entity, "name": name})
+    return {
+        "new_entities": new_entities,
+        "facts": facts,
+        "alias_updates": alias_updates,
+        "name_reveals": name_reveals,
+    }
 
 
 def split_transcript_chunks(transcript_markdown: str, max_chars: int) -> list[str]:

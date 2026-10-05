@@ -14,6 +14,7 @@ import logging
 import re
 import shutil
 import threading
+from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -32,9 +33,29 @@ ProgressCallback = Callable[[str], None]
 # Facts per page-rewrite call are capped by size so a long history is folded in batches.
 PAGE_FACT_BATCH_CHARS = 12000
 DUPLICATE_SIMILARITY = 0.85
+# Looser thresholds for picking candidates the LLM then checks (a wrong candidate costs one call).
+CANDIDATE_SIMILARITY = 0.75
+MENTION_SIMILARITY = 0.85
+WORD_SIMILARITY = 0.7
+MAX_MATCH_CANDIDATES = 5
+# Words too common in names to suggest two names mean the same entity on their own.
+TITLE_WORDS = frozenset(
+    "lord lady sir dame captain king queen prince princess duke duchess baron master mistress "
+    "father mother brother sister young old elder great house city town the of".split()
+)
 TIMESTAMP_RE = re.compile(r"^\d{1,2}:\d{2}:\d{2}$")
 ENTITY_ID_RE = re.compile(r"^#?(\d+)$")
 CITATION_RE = re.compile(r"\[(F\d+(?:\s*,\s*F\d+)*)\]")
+
+
+@dataclass(slots=True)
+class ExtractionResult:
+    created: list[int] = field(default_factory=list)
+    touched: set[int] = field(default_factory=set)
+    facts_added: int = 0
+    flagged: list[DuplicateCandidate] = field(default_factory=list)
+    renamed: list[tuple[str, str]] = field(default_factory=list)
+    renamed_ids: set[int] = field(default_factory=set)
 
 
 class CampaignWiki:
@@ -61,107 +82,255 @@ class CampaignWiki:
         `!reprocess-llm` replaces rather than duplicates them.
         """
         report = WikiChangeReport()
+        await self.ensure_player_characters(guild_id)
         retracted, _ = await asyncio.to_thread(
             self.storage.retract_session_facts, guild_id, session_id, "session reprocessed"
         )
         report.facts_retracted = retracted
 
-        new_ids: list[int] = []
-        touched_ids: set[int] = set()
+        result = ExtractionResult()
         chunks = split_transcript_chunks(timed_transcript, self.settings.extract_chunk_chars)
         for index, chunk in enumerate(chunks, start=1):
             _progress(on_progress, f"Extracting campaign facts ({index}/{len(chunks)}).")
             entities = await asyncio.to_thread(self.storage.list_entities, guild_id)
-            payload = await self.llm.extract_facts(format_entity_index(entities, chunk), chunk, on_wait=on_wait)
-            created, touched, added = await asyncio.to_thread(
-                self._apply_extraction, guild_id, session_id, payload
-            )
-            new_ids.extend(created)
-            touched_ids |= touched
-            report.facts_added += added
+            index_text = await asyncio.to_thread(format_entity_index, entities, chunk)
+            payload = await self.llm.extract_facts(index_text, chunk, on_wait=on_wait)
+            await self._apply_extraction(guild_id, session_id, payload, chunk, result, on_wait=on_wait)
+        report.facts_added = result.facts_added
+        report.renamed = result.renamed
 
         report.page_failures = await self.refresh_stale_pages(guild_id, on_wait=on_wait, on_progress=on_progress)
+        for entity_id in result.renamed_ids:
+            try:
+                await self.reembed_page(guild_id, entity_id, on_wait=on_wait)
+            except Exception:
+                log.exception("Could not re-embed renamed entity %s", entity_id)
 
         entities = await asyncio.to_thread(self.storage.list_entities, guild_id)
         by_id = {entity.id: entity for entity in entities}
-        report.new_entities = [by_id[i] for i in new_ids if i in by_id]
-        report.updated_entities = [
-            by_id[i] for i in sorted(touched_ids) if i in by_id and i not in set(new_ids)
+        created = set(result.created)
+        report.new_entities = [by_id[i] for i in result.created if i in by_id]
+        report.updated_entities = [by_id[i] for i in sorted(result.touched) if i in by_id and i not in created]
+        flagged = [
+            DuplicateCandidate(by_id[c.first.id], by_id[c.second.id], c.reason)
+            for c in result.flagged
+            if c.first.id in by_id and c.second.id in by_id
         ]
-        report.possible_duplicates = find_possible_duplicates(entities, set(new_ids) | touched_ids)
+        report.possible_duplicates = _combine_candidates(
+            flagged, find_possible_duplicates(entities, created | result.touched)
+        )
         return report
 
-    def _apply_extraction(
+    async def ensure_player_characters(self, guild_id: int) -> list[int]:
+        """Create a Character entity for every `!register-character` name that has none yet."""
+
+        def ensure() -> list[int]:
+            created = []
+            for name in self.storage.list_registered_characters(guild_id):
+                if not self.storage.find_entities_by_name(guild_id, name):
+                    created.append(
+                        self.storage.create_entity(guild_id, "Character", name, short_description="Player character")
+                    )
+            return created
+
+        return await asyncio.to_thread(ensure)
+
+    async def _apply_extraction(
         self,
         guild_id: int,
         session_id: int | None,
         payload: dict[str, Any],
-    ) -> tuple[list[int], set[int], int]:
-        """Store one extraction result. Returns (created entity ids, touched entity ids, facts added).
+        chunk: str,
+        result: "ExtractionResult",
+        on_wait: WaitNotifier | None = None,
+    ) -> None:
+        """Store one extraction result, resolving every fact's entity reference.
 
-        Proposed entities are created only when a fact refers to them, and a proposal whose name
-        already matches a known entity is attached to that entity instead.
+        Name reveals are applied first, so a proposal under the revealed name finds the renamed
+        entity. Proposed entities are created only when a fact refers to them, and only after
+        checking existing entities (see `_resolve_reference`).
         """
-        proposals = {normalize_name(item["name"]): item for item in payload.get("new_entities", [])}
-        created: dict[str, int] = {}
-        created_ids: list[int] = []
-        touched: set[int] = set()
+        for reveal in payload.get("name_reveals", []):
+            await self._apply_name_reveal(guild_id, reveal, result)
 
-        def resolve(ref: str) -> int | None:
-            match = ENTITY_ID_RE.match(ref.strip())
-            if match:
-                entity = self.storage.get_entity(guild_id, int(match.group(1)))
-                return entity.id if entity else None
-            norm = normalize_name(ref)
-            if norm in created:
-                return created[norm]
-            matches = self.storage.find_entities_by_name(guild_id, ref)
-            if matches:
-                if len(matches) > 1:
-                    log.info("Fact target %r is ambiguous (%s); using #%s", ref, len(matches), matches[0].id)
-                for alias in proposals.get(norm, {}).get("aliases", []):
-                    self.storage.add_alias(matches[0].id, alias)
-                return matches[0].id
-            proposal = proposals.get(norm)
-            if proposal is None:
-                return None
-            entity_id = self.storage.create_entity(
-                guild_id,
-                proposal["type"],
-                proposal["name"],
-                aliases=proposal["aliases"],
-                short_description=proposal["short_description"],
-                created_session_id=session_id,
-            )
-            created_ids.append(entity_id)
-            for name in [proposal["name"], *proposal["aliases"]]:
-                created.setdefault(normalize_name(name), entity_id)
-            return entity_id
-
-        facts_added = 0
-        for fact in payload.get("facts", []):
-            entity_id = resolve(fact["entity"])
+        proposals: dict[str, dict[str, Any]] = {}
+        for item in payload.get("new_entities", []):
+            for name in [item["name"], *item["aliases"]]:
+                proposals.setdefault(normalize_name(name), item)
+        facts = payload.get("facts", [])
+        resolved: dict[str, int | None] = {}
+        for fact in facts:
+            ref = fact["entity"].strip()
+            key = ref if ENTITY_ID_RE.match(ref) else normalize_name(ref)
+            if key not in resolved:
+                proposal = proposals.get(normalize_name(ref))
+                names = {normalize_name(n) for n in ([proposal["name"], *proposal["aliases"]] if proposal else [ref])}
+                evidence = [f for f in facts if normalize_name(f["entity"]) in names]
+                resolved[key] = await self._resolve_reference(
+                    guild_id, session_id, ref, proposal, evidence, chunk, result, on_wait
+                )
+            entity_id = resolved[key]
             if entity_id is None:
-                log.info("Dropping fact for unknown entity %r: %s", fact["entity"], fact["text"])
+                log.info("Dropping fact for unknown entity %r: %s", ref, fact["text"])
                 continue
             timestamp = fact.get("timestamp", "")
-            self.storage.add_fact(
+            await asyncio.to_thread(
+                self.storage.add_fact,
                 guild_id,
                 entity_id,
                 fact["text"],
                 "observed",
-                session_id=session_id,
-                transcript_ts=timestamp if TIMESTAMP_RE.match(timestamp) else None,
+                session_id,
+                timestamp if TIMESTAMP_RE.match(timestamp) else None,
             )
-            touched.add(entity_id)
-            facts_added += 1
+            result.touched.add(entity_id)
+            result.facts_added += 1
 
         for update in payload.get("alias_updates", []):
             match = ENTITY_ID_RE.match(update["entity"])
-            entity = self.storage.get_entity(guild_id, int(match.group(1))) if match else None
+            entity = await asyncio.to_thread(self.storage.get_entity, guild_id, int(match.group(1))) if match else None
             if entity is not None:
-                self.storage.add_alias(entity.id, update["alias"])
-        return created_ids, touched, facts_added
+                await asyncio.to_thread(self.storage.add_alias, entity.id, update["alias"])
+
+    async def _resolve_reference(
+        self,
+        guild_id: int,
+        session_id: int | None,
+        ref: str,
+        proposal: dict[str, Any] | None,
+        evidence: list[dict[str, str]],
+        chunk: str,
+        result: "ExtractionResult",
+        on_wait: WaitNotifier | None,
+    ) -> int | None:
+        """Map a fact's entity reference to an entity id, creating the entity only when it is new.
+
+        1. `#id` references are trusted.
+        2. One existing entity with any of the proposed names: use it (and learn the new names).
+        3. Several exact matches, or fuzzy candidates (similar spelling, a shared name word, the
+           name appearing in a description): ask the LLM whether it is one of them.
+        4. Otherwise, or when the LLM says different/unsure, create the proposed entity; an
+           unsure or ambiguous outcome is flagged for review in the change report.
+        """
+        match = ENTITY_ID_RE.match(ref)
+        if match:
+            entity = await asyncio.to_thread(self.storage.get_entity, guild_id, int(match.group(1)))
+            return entity.id if entity else None
+
+        names = [proposal["name"], *proposal["aliases"]] if proposal else [ref]
+        exact = await asyncio.to_thread(self._find_by_any_name, guild_id, names)
+        if len(exact) == 1:
+            await asyncio.to_thread(self._add_aliases, exact[0].id, names)
+            return exact[0].id
+
+        if exact:
+            candidates = exact
+        else:
+            entities = await asyncio.to_thread(self.storage.list_entities, guild_id)
+            candidates = match_candidates(entities, names)
+        decision: dict[str, str] | None = None
+        chosen: Entity | None = None
+        if candidates:
+            decision = await self._adjudicate(names, proposal, evidence, chunk, candidates, on_wait)
+            chosen = next((c for c in candidates if f"#{c.id}" == decision["entity"].strip()), None)
+            if decision["decision"] == "same" and chosen is not None:
+                await asyncio.to_thread(self._add_aliases, chosen.id, names)
+                return chosen.id
+
+        if proposal is None:
+            if not exact:
+                return None
+            # A bare name shared by several entities, and the LLM couldn't tell which one is meant.
+            target = chosen or exact[0]
+            other = next(c for c in exact if c.id != target.id)
+            result.flagged.append(
+                _candidate(target, other, f"'{ref}' names both; facts were attached to #{target.id}, check them")
+            )
+            return target.id
+
+        entity_id = await asyncio.to_thread(
+            self.storage.create_entity,
+            guild_id,
+            proposal["type"],
+            proposal["name"],
+            proposal["aliases"],
+            proposal["short_description"],
+            session_id,
+        )
+        result.created.append(entity_id)
+        new_entity = await asyncio.to_thread(self.storage.get_entity, guild_id, entity_id)
+        if decision is not None and (decision["decision"] == "unsure" or exact):
+            other = chosen or candidates[0]
+            label = "possibly the same" if decision["decision"] == "unsure" else "shares a name"
+            result.flagged.append(_candidate(new_entity, other, f"{label}: {decision['reason'] or 'no reason given'}"))
+        return entity_id
+
+    async def _adjudicate(
+        self,
+        names: list[str],
+        proposal: dict[str, Any] | None,
+        evidence: list[dict[str, str]],
+        chunk: str,
+        candidates: list[Entity],
+        on_wait: WaitNotifier | None,
+    ) -> dict[str, str]:
+        lines = [f"Names: {', '.join(names)}"]
+        if proposal is not None:
+            lines.append(f"Type: {proposal['type']}")
+            if proposal["short_description"]:
+                lines.append(f"Description: {proposal['short_description']}")
+        lines.append("Facts from this session:")
+        lines.extend(f"- [{fact.get('timestamp', '')}] {fact['text']}" for fact in evidence)
+        excerpt = transcript_excerpt(chunk, [fact.get("timestamp", "") for fact in evidence])
+        if excerpt:
+            lines.extend(["Transcript lines:", excerpt])
+
+        blocks = []
+        for candidate in candidates:
+            facts = await asyncio.to_thread(self.storage.get_entity_facts, candidate.id)
+            block = f"#{candidate.id} {entity_header(candidate)}"
+            if candidate.short_description:
+                block += f": {candidate.short_description}"
+            block += "".join(f"\n  - {fact.text}" for fact in facts[-8:])
+            blocks.append(block)
+        try:
+            decision = await self.llm.match_entity("\n".join(lines), "\n\n".join(blocks), on_wait=on_wait)
+        except Exception as exc:
+            log.warning("Entity match check failed for %s: %s", names[0], exc)
+            return {"decision": "unsure", "entity": "", "reason": "the match check failed"}
+        log.info("Entity match for %r: %s %s (%s)", names[0], decision["decision"], decision["entity"], decision["reason"])
+        return decision
+
+    async def _apply_name_reveal(self, guild_id: int, reveal: dict[str, str], result: "ExtractionResult") -> None:
+        match = ENTITY_ID_RE.match(reveal["entity"])
+        entity = await asyncio.to_thread(self.storage.get_entity, guild_id, int(match.group(1))) if match else None
+        new_name = reveal["name"].strip()
+        if entity is None or normalize_name(new_name) == normalize_name(entity.canonical_name):
+            return
+        others = [
+            other
+            for other in await asyncio.to_thread(self.storage.find_entities_by_name, guild_id, new_name)
+            if other.id != entity.id
+        ]
+        if others:
+            result.flagged.append(
+                _candidate(entity, others[0], f"#{entity.id} was revealed to be '{new_name}', which is #{others[0].id}")
+            )
+            return
+        await asyncio.to_thread(self.storage.rename_entity, entity.id, new_name)
+        result.renamed.append((entity.canonical_name, new_name))
+        result.renamed_ids.add(entity.id)
+
+    def _find_by_any_name(self, guild_id: int, names: list[str]) -> list[Entity]:
+        found: dict[int, Entity] = {}
+        for name in names:
+            for entity in self.storage.find_entities_by_name(guild_id, name):
+                found.setdefault(entity.id, entity)
+        return list(found.values())
+
+    def _add_aliases(self, entity_id: int, names: list[str]) -> None:
+        for name in names:
+            self.storage.add_alias(entity_id, name)
 
     # --- Pages --------------------------------------------------------------------------
 
@@ -377,20 +546,120 @@ def format_entity_index(entities: list[Entity], text: str) -> str:
     """Entity index for the extraction prompt.
 
     Every entity is listed by id, type and names so the model can match misspellings; only those
-    whose name appears in `text` also carry their one-line description, to keep the prompt short.
+    whose name (or something spelled like it) appears in `text` also carry their one-line
+    description, to keep the prompt short.
     """
-    haystack = f" {' '.join(_NAME_TOKENS.sub(' ', text.casefold()).split())} "
+    mentioned = mentioned_entity_ids(entities, text)
     lines = []
     for entity in entities:
         line = f"#{entity.id} {entity_header(entity)}"
-        mentioned = any(f" {norm} " in haystack for norm in map(normalize_name, entity.names()) if norm)
-        if mentioned and entity.short_description:
+        if entity.id in mentioned and entity.short_description:
             line += f": {entity.short_description}"
         lines.append(line)
     return "\n".join(lines)
 
 
-_NAME_TOKENS = re.compile(r"[^\w\s]")
+def mentioned_entity_ids(entities: list[Entity], text: str) -> set[int]:
+    """Entities whose name or alias appears in `text`, exactly or with a near spelling
+    (speech-to-text misspellings such as "Varic" for "Varric")."""
+    tokens = normalize_name(text).split()
+    grams: dict[int, set[str]] = {
+        n: {" ".join(tokens[i : i + n]) for i in range(len(tokens) - n + 1)} for n in range(1, 5)
+    }
+    buckets: dict[tuple[int, str], list[str]] = {}
+    for n, values in grams.items():
+        for gram in values:
+            buckets.setdefault((n, gram[0]), []).append(gram)
+    joined = f" {' '.join(tokens)} "
+    mentioned: set[int] = set()
+    for entity in entities:
+        for name in {normalize_name(name) for name in entity.names()} - {""}:
+            size = len(name.split())
+            if f" {name} " in joined:
+                mentioned.add(entity.id)
+                break
+            # The whole name with a near spelling, or one distinctive word of a longer name
+            # ("Thalren" for "Thalrin Vey").
+            targets = [name] if size <= 4 and len(name) >= 4 else []
+            if size > 1:
+                targets += [word for word in _distinctive(name) if len(word) >= 5]
+            if any(_near_mention(target, buckets) for target in targets):
+                mentioned.add(entity.id)
+                break
+    return mentioned
+
+
+def _near_mention(target: str, buckets: dict[tuple[int, str], list[str]]) -> bool:
+    return any(
+        abs(len(gram) - len(target)) <= 2 and SequenceMatcher(None, target, gram).ratio() >= MENTION_SIMILARITY
+        for gram in buckets.get((len(target.split()), target[0]), [])
+    )
+
+
+def match_candidates(entities: list[Entity], names: list[str], limit: int = MAX_MATCH_CANDIDATES) -> list[Entity]:
+    """Existing entities that might be the same as something called `names`, best first.
+
+    Deliberately loose (the LLM makes the call): similar spelling of the name or of one of its
+    words, a shared distinctive name word ("Lord Thane" / "Varric Thane"), or all of the name's distinctive words appearing in an
+    entity's description ("the harbour master" / "former harbour master of Gullhaven").
+    """
+    wanted = {normalize_name(name) for name in names} - {""}
+    scored: list[tuple[float, int, Entity]] = []
+    for entity in entities:
+        score = 0.0
+        description = set(normalize_name(entity.short_description).split())
+        for a in wanted:
+            words_a = _distinctive(a)
+            if words_a and words_a <= description:
+                score = max(score, 0.6)
+            for b in {normalize_name(name) for name in entity.names()} - {""}:
+                if min(len(a), len(b)) >= 4:
+                    ratio = SequenceMatcher(None, a, b).ratio()
+                    if ratio >= CANDIDATE_SIMILARITY:
+                        score = max(score, ratio)
+                words_b = _distinctive(b)
+                shared = words_a & words_b
+                if shared:
+                    score = max(score, 0.7 + 0.05 * len(shared))
+                elif any(
+                    SequenceMatcher(None, x, y).ratio() >= WORD_SIMILARITY for x in words_a for y in words_b
+                ):
+                    score = max(score, 0.65)  # A misspelled name word: "Varik" / "Varric Thane".
+        if score > 0:
+            scored.append((score, -entity.id, entity))
+    scored.sort(reverse=True)
+    return [entity for _, _, entity in scored[:limit]]
+
+
+def _distinctive(name: str) -> set[str]:
+    return {word for word in name.split() if len(word) >= 4 and word not in TITLE_WORDS}
+
+
+def transcript_excerpt(chunk: str, timestamps: list[str], context: int = 1) -> str:
+    """Transcript lines at the given `[HH:MM:SS]` times, with `context` lines before each."""
+    lines = chunk.splitlines()
+    wanted = {f"[{ts}]" for ts in timestamps if TIMESTAMP_RE.match(ts)}
+    keep: set[int] = set()
+    for index, line in enumerate(lines):
+        if any(line.startswith(ts) for ts in wanted):
+            keep.update(range(max(0, index - context), index + 1))
+    return "\n".join(lines[i] for i in sorted(keep))
+
+
+def _candidate(first: Entity, second: Entity, reason: str) -> DuplicateCandidate:
+    return DuplicateCandidate(first, second, reason) if first.id < second.id else DuplicateCandidate(second, first, reason)
+
+
+def _combine_candidates(*groups: list[DuplicateCandidate]) -> list[DuplicateCandidate]:
+    combined: list[DuplicateCandidate] = []
+    seen: set[tuple[int, int]] = set()
+    for group in groups:
+        for candidate in group:
+            pair = (min(candidate.first.id, candidate.second.id), max(candidate.first.id, candidate.second.id))
+            if pair not in seen:
+                seen.add(pair)
+                combined.append(candidate)
+    return combined
 
 
 def find_possible_duplicates(entities: list[Entity], focus_ids: set[int]) -> list[DuplicateCandidate]:
@@ -435,6 +704,8 @@ def format_change_report(report: WikiChangeReport) -> str:
     if report.facts_retracted:
         summary += f" ({report.facts_retracted} from an earlier run of this session replaced)"
     lines.append(summary + ".")
+    if report.renamed:
+        lines.append("**Renamed:** " + ", ".join(f"{old} → {new}" for old, new in report.renamed))
     if report.new_entities:
         lines.append("**New:** " + ", ".join(f"#{e.id} {e.canonical_name} ({e.type})" for e in report.new_entities))
     if report.updated_entities:

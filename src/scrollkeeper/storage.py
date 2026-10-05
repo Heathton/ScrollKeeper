@@ -147,6 +147,14 @@ class Storage:
                 (guild_id, user_id, character_name, now),
             )
 
+    def list_registered_characters(self, guild_id: int) -> list[str]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT character_name FROM character_registry WHERE guild_id = ? ORDER BY character_name",
+                (guild_id,),
+            ).fetchall()
+        return [row["character_name"] for row in rows]
+
     def get_character_name(self, guild_id: int, user_id: int, fallback_name: str) -> str:
         with self.connection() as conn:
             row = conn.execute(

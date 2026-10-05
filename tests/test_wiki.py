@@ -11,6 +11,9 @@ from scrollkeeper.models import Entity, Fact, WikiChangeReport
 from scrollkeeper.storage import Storage
 from scrollkeeper.wiki import (
     CampaignWiki,
+    match_candidates,
+    mentioned_entity_ids,
+    transcript_excerpt,
     cited_fact_ids,
     duplicate_reason,
     format_change_report,
@@ -29,6 +32,14 @@ class FakeLLM:
         self.extractions = list(extractions or [])
         self.extract_calls: list[tuple[str, str]] = []
         self.rewrite_calls: list[dict[str, str]] = []
+        self.match_decisions: list[dict] = []
+        self.match_calls: list[tuple[str, str]] = []
+
+    async def match_entity(self, proposal: str, candidates: str, on_wait=None) -> dict:
+        self.match_calls.append((proposal, candidates))
+        if not self.match_decisions:
+            return {"decision": "unsure", "entity": "", "reason": "no scripted decision"}
+        return self.match_decisions.pop(0)
 
     async def extract_facts(self, entity_index: str, transcript_chunk: str, on_wait=None) -> dict:
         self.extract_calls.append((entity_index, transcript_chunk))
@@ -52,8 +63,17 @@ class FakeLLM:
         return note_context
 
 
-def extraction(new_entities=(), facts=(), alias_updates=()) -> dict:
-    return {"new_entities": list(new_entities), "facts": list(facts), "alias_updates": list(alias_updates)}
+def extraction(new_entities=(), facts=(), alias_updates=(), name_reveals=()) -> dict:
+    return {
+        "new_entities": list(new_entities),
+        "facts": list(facts),
+        "alias_updates": list(alias_updates),
+        "name_reveals": list(name_reveals),
+    }
+
+
+def proposal(name: str, entity_type: str = "Character", aliases=(), description: str = "") -> dict:
+    return {"name": name, "type": entity_type, "aliases": list(aliases), "short_description": description}
 
 
 class WikiTestCase(unittest.IsolatedAsyncioTestCase):
@@ -182,6 +202,122 @@ class SessionPipelineTests(WikiTestCase):
         self.assertIsNotNone(self.storage.get_page(entity_id))
 
 
+class EntityMatchingTests(WikiTestCase):
+    TRANSCRIPT = "# Transcript\n\n[00:01:00] Mira: Hi.\n[00:01:05] Game Master: Varic waves from the balcony.\n"
+
+    async def test_misspelled_proposal_is_checked_and_attached(self) -> None:
+        varric = self.storage.create_entity(1, "Character", "Varric Thane", short_description="Runs the harbour")
+        self.storage.add_fact(1, varric, "Varric sold the party a cursed compass.", "observed")
+        self.llm.match_decisions = [{"decision": "same", "entity": f"#{varric}", "reason": "misspelling"}]
+        self.llm.extractions = [
+            extraction(
+                new_entities=[proposal("Varic")],
+                facts=[{"entity": "Varic", "text": "Varic waves from the balcony.", "timestamp": "00:01:05"}],
+            )
+        ]
+        report = await self.wiki.process_session(1, self.session_id, self.TRANSCRIPT)
+
+        self.assertEqual(report.new_entities, [])
+        self.assertEqual([e.canonical_name for e in self.storage.list_entities(1)], ["Varric Thane"])
+        self.assertIn("Varic", self.storage.get_entity(1, varric).aliases)
+        self.assertEqual(len(self.storage.get_entity_facts(varric)), 2)
+        asked, candidates = self.llm.match_calls[0]
+        self.assertIn("[00:01:05] Varic waves from the balcony.", asked)
+        self.assertIn("[00:01:00] Mira: Hi.", asked, "the transcript excerpt includes the line before")
+        self.assertIn("cursed compass", candidates)
+
+    async def test_different_entity_sharing_a_name_word_is_created_without_a_flag(self) -> None:
+        self.storage.create_entity(1, "Character", "Mira Vance")
+        self.llm.match_decisions = [{"decision": "different", "entity": "", "reason": "different surname"}]
+        self.llm.extractions = [
+            extraction(new_entities=[proposal("Mira Stone")], facts=[{"entity": "Mira Stone", "text": "A smith.", "timestamp": ""}])
+        ]
+        report = await self.wiki.process_session(1, self.session_id, self.TRANSCRIPT)
+        self.assertEqual([e.canonical_name for e in report.new_entities], ["Mira Stone"])
+        self.assertEqual(len(self.llm.match_calls), 1)
+        self.assertEqual(report.possible_duplicates, [])
+
+    async def test_unsure_match_is_created_and_flagged(self) -> None:
+        sela = self.storage.create_entity(1, "Character", "Sela")
+        self.llm.match_decisions = [{"decision": "unsure", "entity": f"#{sela}", "reason": "could be Sela"}]
+        self.llm.extractions = [
+            extraction(
+                new_entities=[proposal("Selah")],
+                facts=[{"entity": "Selah", "text": "Selah wears a hood.", "timestamp": ""}],
+            )
+        ]
+        report = await self.wiki.process_session(1, self.session_id, self.TRANSCRIPT)
+        self.assertEqual([e.canonical_name for e in report.new_entities], ["Selah"])
+        self.assertEqual(len(report.possible_duplicates), 1)
+        self.assertIn("possibly the same: could be Sela", report.possible_duplicates[0].reason)
+
+    async def test_exact_alias_match_needs_no_llm_check(self) -> None:
+        varric = self.storage.create_entity(1, "Character", "Varric Thane", aliases=["Old Varric"])
+        self.llm.extractions = [
+            extraction(
+                new_entities=[proposal("Lord Thane", aliases=["Old Varric"])],
+                facts=[{"entity": "Lord Thane", "text": "Lord Thane is rich.", "timestamp": ""}],
+            )
+        ]
+        await self.wiki.process_session(1, self.session_id, self.TRANSCRIPT)
+        self.assertEqual(self.llm.match_calls, [])
+        self.assertIn("Lord Thane", self.storage.get_entity(1, varric).aliases)
+
+    async def test_unrelated_new_entity_needs_no_llm_check(self) -> None:
+        self.storage.create_entity(1, "Location", "Gullhaven")
+        self.llm.extractions = [
+            extraction(new_entities=[proposal("Captain Morrow")], facts=[{"entity": "Captain Morrow", "text": "A half-orc.", "timestamp": ""}])
+        ]
+        report = await self.wiki.process_session(1, self.session_id, self.TRANSCRIPT)
+        self.assertEqual(self.llm.match_calls, [])
+        self.assertEqual([e.canonical_name for e in report.new_entities], ["Captain Morrow"])
+
+    async def test_ambiguous_bare_name_is_attached_and_flagged(self) -> None:
+        first = self.storage.create_entity(1, "Character", "Varric")
+        second = self.storage.create_entity(1, "Faction", "Varric")
+        self.llm.match_decisions = [{"decision": "unsure", "entity": f"#{second}", "reason": "unclear"}]
+        self.llm.extractions = [extraction(facts=[{"entity": "Varric", "text": "Varric is feared.", "timestamp": ""}])]
+        report = await self.wiki.process_session(1, self.session_id, self.TRANSCRIPT)
+        self.assertEqual(len(self.storage.get_entity_facts(second)), 1)
+        self.assertEqual(self.storage.get_entity_facts(first), [])
+        self.assertIn("names both", report.possible_duplicates[0].reason)
+
+    async def test_name_reveal_renames_the_described_entity(self) -> None:
+        master = self.storage.create_entity(1, "Character", "The Harbour Master")
+        self.llm.extractions = [
+            extraction(
+                new_entities=[proposal("Aldous Penn")],
+                facts=[{"entity": "Aldous Penn", "text": "Aldous Penn was murdered.", "timestamp": ""}],
+                name_reveals=[{"entity": f"#{master}", "name": "Aldous Penn"}],
+            )
+        ]
+        report = await self.wiki.process_session(1, self.session_id, self.TRANSCRIPT)
+        entity = self.storage.get_entity(1, master)
+        self.assertEqual(entity.canonical_name, "Aldous Penn")
+        self.assertEqual(entity.aliases, ["The Harbour Master"])
+        self.assertEqual(len(self.storage.get_entity_facts(master)), 1)
+        self.assertEqual(report.renamed, [("The Harbour Master", "Aldous Penn")])
+        self.assertEqual(report.new_entities, [])
+        self.assertIn("**Renamed:** The Harbour Master → Aldous Penn", format_change_report(report))
+
+    async def test_name_reveal_onto_an_existing_name_is_flagged_not_applied(self) -> None:
+        master = self.storage.create_entity(1, "Character", "The Harbour Master")
+        self.storage.create_entity(1, "Character", "Aldous Penn")
+        self.llm.extractions = [extraction(name_reveals=[{"entity": f"#{master}", "name": "Aldous Penn"}])]
+        report = await self.wiki.process_session(1, self.session_id, self.TRANSCRIPT)
+        self.assertEqual(self.storage.get_entity(1, master).canonical_name, "The Harbour Master")
+        self.assertEqual(len(report.possible_duplicates), 1)
+
+    async def test_registered_player_characters_are_seeded(self) -> None:
+        self.storage.register_character(1, 55, "Brenna")
+        await self.wiki.process_session(1, self.session_id, self.TRANSCRIPT)
+        brenna = self.storage.find_entities_by_name(1, "Brenna")
+        self.assertEqual([(e.type, e.short_description) for e in brenna], [("Character", "Player character")])
+        self.assertIn("Brenna", self.llm.extract_calls[0][0])
+        await self.wiki.ensure_player_characters(1)
+        self.assertEqual(len(self.storage.find_entities_by_name(1, "Brenna")), 1)
+
+
 class ReviewCommandTests(WikiTestCase):
     async def _entity_with_page(self, name: str, *facts: str) -> Entity:
         entity_id = self.storage.create_entity(1, "Character", name)
@@ -263,6 +399,27 @@ class HelperTests(unittest.TestCase):
         self.assertIn("#1 [Character] Varric (aka Lord Varric): Dock boss", index)
         self.assertIn("#2 [Faction] The Black Hand", index)
         self.assertNotIn("Thieves", index)
+
+    def test_misspelled_mentions_bring_in_descriptions(self) -> None:
+        entities = [Entity(1, 1, "Character", "Varric", [], "Dock boss"), Entity(2, 1, "Character", "Sela", [], "Informant")]
+        self.assertEqual(mentioned_entity_ids(entities, "[00:00:01] GM: Varic grins."), {1})
+        self.assertIn("Varric: Dock boss", format_entity_index(entities, "Varic grins."))
+        thalrin = Entity(3, 1, "Character", "Thalrin Vey", [], "Alchemist")
+        self.assertEqual(mentioned_entity_ids([thalrin], "Let's see Thalren again."), {3})
+        self.assertEqual(mentioned_entity_ids([thalrin], "Let's see the alchemist."), set())
+
+    def test_match_candidates(self) -> None:
+        varric = Entity(1, 1, "Character", "Varric Thane", ["Old Varric"])
+        penn = Entity(2, 1, "Character", "Aldous Penn", [], "Former harbour master of Gullhaven")
+        lord_x = Entity(3, 1, "Character", "Lord Ashby")
+        self.assertEqual(match_candidates([varric, penn, lord_x], ["Lord Thane"]), [varric])
+        self.assertEqual(match_candidates([varric, penn, lord_x], ["The Harbour Master"]), [penn])
+        self.assertEqual(match_candidates([varric, penn, lord_x], ["Varik"]), [varric])
+        self.assertEqual(match_candidates([varric, penn, lord_x], ["Captain Morrow"]), [])
+
+    def test_transcript_excerpt(self) -> None:
+        chunk = "# Transcript\n\n[00:00:01] A: one\n[00:00:02] B: two\n[00:00:03] C: three\n"
+        self.assertEqual(transcript_excerpt(chunk, ["00:00:03", "bad"]), "[00:00:02] B: two\n[00:00:03] C: three")
 
     def test_duplicate_reasons(self) -> None:
         def entity(name: str, *aliases: str) -> Entity:
