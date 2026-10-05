@@ -4,13 +4,14 @@ import asyncio
 import json
 import logging
 import os
+import uuid
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import requests
 
 from .config import Settings
-from .models import ENTITY_TYPES, QUEST_STATUSES
+from .models import ENTITY_TYPES, QUEST_STATUSES, TimedText, TranscriptionResult
 
 
 log = logging.getLogger(__name__)
@@ -30,16 +31,16 @@ class LocalAIService:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
 
-    async def transcribe_audio_segment(self, audio_path: Path, on_wait: WaitNotifier | None = None) -> str:
+    async def transcribe_track(self, audio_path: Path) -> TranscriptionResult:
+        """Transcribe one whole speaker track (can be hours long; see SCROLLKEEPER_STT_TIMEOUT_SECONDS).
+
+        No wait notice: the speech-to-text service runs on CPU and doesn't cold-start; a long call
+        just means a long track. The session manager reports per-track progress instead.
+        """
         log.info("Submitting %s to the speech-to-text service", audio_path)
-        text = await self._run_blocking(
-            self._transcribe_audio_segment_sync,
-            audio_path,
-            on_wait=on_wait,
-            wait_message="Waiting on the speech-to-text service (it may be starting up)...",
-        )
-        log.info("Speech-to-text returned transcript for %s", audio_path)
-        return text
+        result = await asyncio.to_thread(self._transcribe_track_sync, audio_path)
+        log.info("Speech-to-text returned %s words for %s", len(result.words), audio_path)
+        return result
 
     async def embed_text(self, text: str, on_wait: WaitNotifier | None = None) -> list[float]:
         return await self._run_blocking(
@@ -135,21 +136,22 @@ class LocalAIService:
             return {"Authorization": f"Bearer {self.settings.llm_api_key}"}
         return {}
 
-    def _transcribe_audio_segment_sync(self, audio_path: Path) -> str:
-        with audio_path.open("rb") as handle:
+    def _transcribe_track_sync(self, audio_path: Path) -> TranscriptionResult:
+        fields = {
+            "model": self.settings.stt_model,
+            "response_format": "verbose_json",
+            "timestamp_granularities[]": "word",
+        }
+        # The body is streamed from disk: a multi-hour track should not be built in memory.
+        with MultipartFileBody(fields, "file", audio_path, "audio/flac") as body:
             response = requests.post(
                 f"{self.settings.stt_base_url}/audio/transcriptions",
-                files={"file": (audio_path.name, handle, "audio/wav")},
-                data={
-                    "model": self.settings.stt_model,
-                    "response_format": "verbose_json",
-                    "timestamp_granularities[]": "word",
-                },
+                data=body,
+                headers={"Content-Type": body.content_type},
                 timeout=self._timeout(self.settings.stt_timeout_seconds),
             )
         response.raise_for_status()
-        payload = response.json()
-        return str(payload.get("text", "")).strip()
+        return parse_transcription(response.json())
 
     def _embed_text_sync(self, text: str) -> list[float]:
         response = requests.post(
@@ -647,3 +649,85 @@ def split_transcript_chunks(transcript_markdown: str, max_chars: int) -> list[st
         chunk_text = "# Transcript\n\n" + "".join(current).strip() + "\n"
         chunks.append(chunk_text)
     return chunks
+
+
+def parse_transcription(payload: dict[str, Any]) -> TranscriptionResult:
+    """Read an OpenAI `verbose_json` transcription: text, plus words and segments with times if present."""
+
+    def timed(items: Any, key: str) -> list[TimedText]:
+        parsed = []
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                parsed.append(TimedText(str(item.get(key, "")).strip(), float(item["start"]), float(item["end"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+        return [entry for entry in parsed if entry.text]
+
+    return TranscriptionResult(
+        text=str(payload.get("text", "")).strip(),
+        words=timed(payload.get("words"), "word"),
+        segments=timed(payload.get("segments"), "text"),
+    )
+
+
+class MultipartFileBody:
+    """A multipart/form-data body that streams one file from disk, with a known Content-Length.
+
+    `requests` builds `files=` uploads in memory; passing this as `data=` sends the file in
+    blocks instead.
+    """
+
+    BLOCK_SIZE = 1 << 20
+
+    def __init__(self, fields: dict[str, str], file_field: str, path: Path, file_type: str) -> None:
+        boundary = uuid.uuid4().hex
+        self.content_type = f"multipart/form-data; boundary={boundary}"
+        head = bytearray()
+        for name, value in fields.items():
+            head += f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode()
+        head += (
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{file_field}"; filename="{path.name}"\r\n'
+            f"Content-Type: {file_type}\r\n\r\n"
+        ).encode()
+        self._head = bytes(head)
+        self._tail = f"\r\n--{boundary}--\r\n".encode()
+        self._file = path.open("rb")
+        self._length = len(self._head) + path.stat().st_size + len(self._tail)
+        self._stage = 0  # 0: head, 1: file, 2: tail, 3: done
+
+    def __len__(self) -> int:
+        return self._length
+
+    def __iter__(self):
+        while block := self.read(self.BLOCK_SIZE):
+            yield block
+
+    def read(self, size: int = -1) -> bytes:
+        if size is None or size < 0:
+            size = self._length
+        out = bytearray()
+        while len(out) < size and self._stage < 3:
+            if self._stage == 0:
+                out += self._head
+                self._stage = 1
+            elif self._stage == 1:
+                block = self._file.read(size - len(out))
+                if block:
+                    out += block
+                else:
+                    self._stage = 2
+            else:
+                out += self._tail
+                self._stage = 3
+        return bytes(out)
+
+    def close(self) -> None:
+        self._file.close()
+
+    def __enter__(self) -> "MultipartFileBody":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
