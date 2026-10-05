@@ -184,6 +184,38 @@ MIGRATIONS: list[str] = [
     ALTER TABLE search_docs RENAME COLUMN guild_id TO campaign_id;
     UPDATE search_docs SET campaign_id = (SELECT c.id FROM campaigns c WHERE c.guild_id = search_docs.campaign_id);
     """,
+    # 5: VTT journal import (#15). Dated session recaps become sessions with a summary and no
+    # audio (`journal_id` set). `journal_entries` maps each imported journal entry to what it
+    # became, with a hash of its content, so a re-import updates instead of duplicating.
+    # `journal_imports` is the import job queue, so an import resumes after a restart.
+    """
+    ALTER TABLE sessions ADD COLUMN journal_id TEXT;
+
+    CREATE TABLE journal_entries (
+        campaign_id INTEGER NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+        journal_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        folder TEXT NOT NULL,
+        action TEXT NOT NULL,
+        entity_id INTEGER REFERENCES entities(id),
+        session_id INTEGER REFERENCES sessions(id) ON DELETE SET NULL,
+        content_hash TEXT NOT NULL,
+        imported_at TEXT NOT NULL,
+        PRIMARY KEY (campaign_id, journal_id)
+    );
+
+    CREATE TABLE journal_imports (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        campaign_id INTEGER NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+        guild_id INTEGER NOT NULL,
+        text_channel_id INTEGER NOT NULL,
+        path TEXT NOT NULL,
+        status TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        finished_at TEXT
+    );
+    """,
 ]
 
 DEFAULT_CAMPAIGN = "Default"
@@ -559,12 +591,13 @@ class Storage:
         return row
 
     def get_latest_session(self, campaign_id: int) -> sqlite3.Row | None:
+        """The campaign's latest recorded session (imported journal recaps don't count)."""
         with self.connection() as conn:
             row = conn.execute(
                 """
                 SELECT *
                 FROM sessions
-                WHERE campaign_id = ?
+                WHERE campaign_id = ? AND journal_id IS NULL
                 ORDER BY id DESC
                 LIMIT 1
                 """,
@@ -960,6 +993,154 @@ class Storage:
                 [(now, reason, int(row["id"])) for row in rows],
             )
         return len(rows), {int(row["entity_id"]) for row in rows}
+
+    def retract_source_facts(self, campaign_id: int, source_ref: str, reason: str) -> tuple[int, set[int]]:
+        """Retract the active imported facts from one source (a journal entry, before re-import).
+
+        Pinned facts are never touched. Returns (retracted count, affected entity ids).
+        """
+        now = datetime.utcnow().isoformat()
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, entity_id
+                FROM facts
+                WHERE campaign_id = ? AND source_ref = ? AND kind = 'imported'
+                  AND superseded_by IS NULL AND retracted_at IS NULL
+                """,
+                (campaign_id, source_ref),
+            ).fetchall()
+            conn.executemany(
+                "UPDATE facts SET retracted_at = ?, retraction_reason = ? WHERE id = ?",
+                [(now, reason, int(row["id"])) for row in rows],
+            )
+        return len(rows), {int(row["entity_id"]) for row in rows}
+
+    def set_entity_type(self, entity_id: int, entity_type: str) -> None:
+        with self.connection() as conn:
+            conn.execute("UPDATE entities SET type = ? WHERE id = ?", (entity_type, entity_id))
+            self._touch_entity(conn, entity_id)
+
+    # --- VTT journal import (#15) -----------------------------------------------------------
+
+    def get_journal_entry(self, campaign_id: int, journal_id: str) -> sqlite3.Row | None:
+        with self.connection() as conn:
+            return conn.execute(
+                "SELECT * FROM journal_entries WHERE campaign_id = ? AND journal_id = ?",
+                (campaign_id, journal_id),
+            ).fetchone()
+
+    def record_journal_entry(
+        self,
+        campaign_id: int,
+        journal_id: str,
+        name: str,
+        folder: str,
+        action: str,
+        content_hash: str,
+        entity_id: int | None = None,
+        session_id: int | None = None,
+    ) -> None:
+        """Remember that a journal entry was imported (its content hash makes a re-import skip it)."""
+        with self.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO journal_entries (
+                    campaign_id, journal_id, name, folder, action, entity_id, session_id, content_hash, imported_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(campaign_id, journal_id) DO UPDATE SET
+                    name = excluded.name,
+                    folder = excluded.folder,
+                    action = excluded.action,
+                    entity_id = excluded.entity_id,
+                    session_id = excluded.session_id,
+                    content_hash = excluded.content_hash,
+                    imported_at = excluded.imported_at
+                """,
+                (
+                    campaign_id,
+                    journal_id,
+                    name,
+                    folder,
+                    action,
+                    entity_id,
+                    session_id,
+                    content_hash,
+                    datetime.utcnow().isoformat(),
+                ),
+            )
+
+    def upsert_journal_session(
+        self, campaign_id: int, journal_id: str, title: str, started_at: datetime, summary_markdown: str
+    ) -> int:
+        """Create or update the session that holds an imported recap, and write its summary file.
+
+        The session is 'completed' with a summary and no audio, so search indexes the recap like
+        any session summary. `ended_at` changes on every update, which re-indexes it.
+        """
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT id FROM sessions WHERE campaign_id = ? AND journal_id = ?", (campaign_id, journal_id)
+            ).fetchone()
+            if row is None:
+                guild = conn.execute("SELECT guild_id FROM campaigns WHERE id = ?", (campaign_id,)).fetchone()
+                cursor = conn.execute(
+                    """
+                    INSERT INTO sessions (
+                        guild_id, campaign_id, voice_channel_id, text_channel_id, title, started_at,
+                        status, journal_id
+                    )
+                    VALUES (?, ?, 0, 0, ?, ?, 'completed', ?)
+                    """,
+                    (int(guild["guild_id"]), campaign_id, title, started_at.isoformat(), journal_id),
+                )
+                session_id = int(cursor.lastrowid)
+            else:
+                session_id = int(row["id"])
+            summary_path = self.sessions_dir / str(session_id) / "summary.md"
+            summary_path.parent.mkdir(parents=True, exist_ok=True)
+            summary_path.write_text(summary_markdown, encoding="utf-8")
+            conn.execute(
+                """
+                UPDATE sessions
+                SET title = ?, started_at = ?, ended_at = ?, status = 'completed', summary_path = ?
+                WHERE id = ?
+                """,
+                (title, started_at.isoformat(), datetime.utcnow().isoformat(), str(summary_path), session_id),
+            )
+        return session_id
+
+    def create_journal_import(self, campaign_id: int, guild_id: int, text_channel_id: int, path: Path) -> int:
+        with self.connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO journal_imports (campaign_id, guild_id, text_channel_id, path, status, created_at)
+                VALUES (?, ?, ?, ?, 'running', ?)
+                """,
+                (campaign_id, guild_id, text_channel_id, str(path), datetime.utcnow().isoformat()),
+            )
+            return int(cursor.lastrowid)
+
+    def running_journal_imports(self) -> list[sqlite3.Row]:
+        with self.connection() as conn:
+            return list(
+                conn.execute("SELECT * FROM journal_imports WHERE status = 'running' ORDER BY id").fetchall()
+            )
+
+    def begin_journal_import_attempt(self, import_id: int) -> int:
+        """Count an attempt (so an import that crashes the bot isn't retried forever)."""
+        with self.connection() as conn:
+            conn.execute("UPDATE journal_imports SET attempts = attempts + 1 WHERE id = ?", (import_id,))
+            row = conn.execute("SELECT attempts FROM journal_imports WHERE id = ?", (import_id,)).fetchone()
+        return int(row["attempts"]) if row else 0
+
+    def finish_journal_import(self, import_id: int, status: str) -> None:
+        with self.connection() as conn:
+            conn.execute(
+                "UPDATE journal_imports SET status = ?, finished_at = ? WHERE id = ?",
+                (status, datetime.utcnow().isoformat(), import_id),
+            )
 
     def get_page(self, entity_id: int) -> Page | None:
         with self.connection() as conn:

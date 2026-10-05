@@ -28,6 +28,8 @@ ScrollKeeper is a Discord bot for tabletop campaigns. It can join a voice channe
 - `!session-status`: show the current session state
 - `!reprocess-session [session-id]`: rerun speech-to-text + summary/note generation from saved audio (also works for sessions recorded before per-speaker tracks; see [Recording](#recording))
 - `!reprocess-llm [session-id]`: rerun the summary and wiki update from existing transcript text (skips speech-to-text). The session's earlier extracted facts are retracted and replaced.
+- `!import-journal [preview]` with a journal export attached: import a VTT journal into the active campaign's wiki, or with `preview` show what it would import (needs the Manage Server permission; see [Importing a VTT journal](#importing-a-vtt-journal))
+- `!import-status`: show the progress of a running journal import
 
 ### Campaigns
 
@@ -77,6 +79,39 @@ How the bot decides whether someone or something is already known:
 - When a described entity's real name is revealed ("the harbour master was Aldous Penn"), the entity is renamed and the old label becomes an alias.
 - Names registered with `!register-character` become Character entities, so player characters always exist.
 
+## Importing a VTT journal
+
+A campaign that started before the bot can seed its wiki from the game master's VTT journal: a Roll20-style JSON export, one array of entries with `type` (`handout` or `character`), `id`, `name`, `folder` (slash-separated), `order`, `archived`, and HTML `notes` and `gmnotes`. Attach the file to `!import-journal preview` first: it lists what would be imported, what is skipped and why, and what needs review, without changing anything. Then attach it to `!import-journal`.
+
+Folder rules decide what each entry becomes. The first matching rule wins:
+
+| Action | What it does | Default folders |
+|---|---|---|
+| `session` | A dated session recap becomes a **session** with the recap as its summary and no audio. Its facts are extracted like a recorded session's and cite it; search finds it like any session summary. The date comes from the entry name (`09/13/2026`, `09-30-2024`), and the folder's year wins when they disagree. | `Session Notes` |
+| `entity` | One wiki entity named after the entry, of the rule's type. A short entry (up to 400 characters) is one fact as written; a longer one is split into facts by the LLM, which can also refine the type (a named ship filed under NPCs becomes an Item) and record facts about other entities it mentions. | `NPC` (Character), `Locations` (Location), `Magic Items` (Item), `Rifts` and `Monster Lairs` (PointOfInterest) |
+| `document` | Lore text (letters, legends, plot hooks): facts are extracted onto the entities it is about, with no entity of its own. | `Story Plothook` |
+| `name` | An entity with no facts: a name for the entity index and the speech-to-text spelling list. | `Creatures`, `Bosses and Avatars`, `Characters`, and character sheets at the top level |
+| `skip` | Not imported. | `Chapter …`, `Welcome to Eberron`, `Supplemental Material`, `Forgotten Relics Adventure`, `Descent into Avernus Rollable Tables Add-on`, `START HERE …`, `Player Art Handouts` (published setting, rules and adventure text, and image handouts) |
+
+Entries in folders no rule matches are skipped and listed in the report, so you can opt them in. Archived entries are skipped, and so are entries with no text after the HTML is removed, unless they are character sheets (which still name someone). `gmnotes` are imported like `notes`. Rules match a folder and everything inside it, case-insensitively, with `*` as a wildcard; `""` is the top level. Add your own rules, checked before the defaults, in `SCROLLKEEPER_JOURNAL_RULES`:
+
+```
+SCROLLKEEPER_JOURNAL_RULES=[{"folder": "Creatures & Monsters", "action": "name", "type": "Character"}, {"folder": "Magic Items", "action": "skip"}]
+```
+
+Each rule has `folder` and `action`, and optionally `type` (an entity type) and `entries` (`character` or `handout`, to apply the rule to one kind of entry only). Run `python -m scrollkeeper.journal export.json` to print the preview from a shell with the same rules.
+
+How entries become entities:
+
+- An entry whose name (or a quoted nickname, `Pip "Stormcrow" Hale`) matches an existing entity, such as a registered player character, joins it. Entries with the same name become one entity.
+- Character sheets named like a copy (`Mira-Old`, `Copy of X`, `X 2`, `X Image`, `Old X Sheet`) join the entity of the base name and are listed under **Needs review**.
+- Imported facts are `imported` facts that keep the journal entry id as their source (`!entity` shows them as `journal`).
+- Recaps run after the other entries, oldest first, so their extraction sees every imported name; documents run last.
+
+**Running it again** updates rather than duplicates. Each entry's id and a hash of its content are stored: unchanged entries are skipped, and a changed entry's earlier imported facts are retracted and replaced. An entry renamed in the journal renames its entity (the old name stays an alias). Pinned facts are never touched and still win on the page, and merges and corrections you made are kept.
+
+The import runs in the background, one per server, and posts progress and a report in the channel: counts, skipped folders, entries that failed (an LLM error; they are retried by the next import of the same file), entries needing review, and **possible duplicates** to merge with `!merge-entity`. It is stored in the database, so a restart resumes it (entries already imported are skipped). It can take hours: about a minute per long entry and per recap, then 15 to 40 seconds per page rewrite. Session processing can run during an import; the two take turns with the wiki. Imported recaps can't be reprocessed with `!reprocess-session` or `!reprocess-llm`; import the journal again instead.
+
 ## Campaign questions
 
 `!campaign-question` searches every wiki page and session summary three ways, and merges the three rankings with reciprocal rank fusion:
@@ -118,6 +153,7 @@ Optional:
 - `SCROLLKEEPER_SUMMARY_PROMPT_APPEND=` appends your own instructions to the summary system prompt.
 - `SCROLLKEEPER_EXTRACT_CHUNK_CHARS=24000` sets the transcript chunk size for campaign fact extraction (each chunk is sent with the entity index).
 - `SCROLLKEEPER_WIKI_EXPORT=1` writes the Obsidian-style export to `data/wiki/` after wiki changes (`0` disables).
+- `SCROLLKEEPER_JOURNAL_RULES=`: folder rules for `!import-journal`, checked before the defaults (a JSON array; see [Importing a VTT journal](#importing-a-vtt-journal)).
 - `SCROLLKEEPER_EMBED_MODEL=embeddinggemma-300m`: the in-process embedding model, `embeddinggemma-300m` or `qwen3-embedding-0.6b` (see [Embeddings](#embeddings-scrollkeeper_embed_model)). Changing it re-embeds everything at the next start.
 - `SCROLLKEEPER_EMBED_MODEL_DIR=`: where model files are kept. Empty (the default) means `data/models/`.
 - `SCROLLKEEPER_EMBED_THREADS=2`: ONNX Runtime threads for embeddings.
@@ -245,6 +281,7 @@ Pushing a `v*` tag runs `.github/workflows/images.yml`, which publishes `ghcr.io
 - `data/sessions/<session-id>/transcript.md`: finalized transcript
 - `data/sessions/<session-id>/summary.md`: session notes + cinematic summary
 - `data/models/`: downloaded embedding model files
+- `data/imports/<campaign-id>/`: an uploaded journal export while its import runs (deleted when it completes)
 - `data/wiki/<campaign-id>/<Type>/<Name>.md`: Obsidian-style wiki export, one file per entity with `aliases` frontmatter, `[[links]]` and session citations. It is regenerated from the database, so edits there are overwritten; use the commands above.
 
 ## Important implementation notes

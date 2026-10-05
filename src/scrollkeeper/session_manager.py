@@ -345,6 +345,10 @@ class SessionManager:
             raise RuntimeError("No saved session was found to reprocess in the active campaign.")
         if int(row["guild_id"]) != guild_id:
             raise RuntimeError("That session does not belong to this server.")
+        if row["journal_id"]:
+            raise RuntimeError(
+                f"Session #{row['id']} is a recap imported from the journal; run `!import-journal` again to update it."
+            )
         return row
 
     async def answer_campaign_question(

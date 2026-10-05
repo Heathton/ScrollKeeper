@@ -10,6 +10,7 @@ from discord.ext import voice_recv
 from .config import Settings
 from .llm import LocalAIService
 from .health import Heartbeat, start_health_server
+from .journal import MAX_UPLOAD_BYTES, JournalImporter, parse_rules
 from .models import ENTITY_TYPES, Entity
 from .embeddings import EMBEDDING_MODELS, LocalEmbedder
 from .search import SearchIndex
@@ -63,6 +64,7 @@ def build_bot(settings: Settings) -> commands.Bot:
     )
     search = SearchIndex(storage, llm, embedder)
     wiki = CampaignWiki(storage, llm, settings, search=search)
+    journal = JournalImporter(storage, wiki, parse_rules(settings.journal_rules))
     sessions = SessionManager(
         storage,
         llm,
@@ -136,12 +138,20 @@ def build_bot(settings: Settings) -> commands.Bot:
     sessions.set_completion_handler(on_session_processed)
     sessions.set_notice_handler(post_notice)
 
+    async def post_long_notice(text_channel_id: int, message: str) -> None:
+        for chunk in _split_long_message(message):
+            await post_notice(text_channel_id, chunk)
+
+    journal.set_notice_handler(post_long_notice)
+
     @bot.event
     async def on_ready() -> None:
         if bot.user:
             print(f"{bot.user} is ready.")
         # Picks up sessions a restart interrupted (runs once; on_ready also fires on reconnects).
         await sessions.start()
+        # Resumes a journal import a restart interrupted.
+        await journal.start()
         # Loads (first time: downloads) the embedding model and indexes anything new, in the background.
         search.start()
 
@@ -299,8 +309,7 @@ def build_bot(settings: Settings) -> commands.Bot:
         if ctx.guild is None:
             await ctx.reply("This command must be used in a server.")
             return
-        permissions = getattr(ctx.author, "guild_permissions", None)
-        if not getattr(permissions, "manage_guild", False):
+        if not _can_manage(ctx):
             await ctx.reply("Only members with the Manage Server permission can rebuild the search index.")
             return
         await ctx.reply("Rebuilding the search index: every wiki page and session summary is re-embedded on CPU.")
@@ -317,6 +326,10 @@ def build_bot(settings: Settings) -> commands.Bot:
                 "Name and keyword search still find them."
             )
         await ctx.send(message)
+
+    def _can_manage(ctx: commands.Context) -> bool:
+        permissions = getattr(ctx.author, "guild_permissions", None)
+        return bool(getattr(permissions, "manage_guild", False))
 
     async def _send_long(ctx: commands.Context, message: str) -> None:
         for chunk in _split_long_message(message):
@@ -491,6 +504,54 @@ def build_bot(settings: Settings) -> commands.Bot:
         if failures:
             message += f" Could not rebuild: {', '.join(failures)} (retried after the next processed session)."
         await ctx.send(message)
+
+    @bot.command(name="import-journal")
+    async def import_journal(ctx: commands.Context, *, options: str = "") -> None:
+        if ctx.guild is None:
+            await ctx.reply("This command must be used in a server.")
+            return
+        if not _can_manage(ctx):
+            await ctx.reply("Only members with the Manage Server permission can import a journal.")
+            return
+        option = options.strip().lower()
+        attachments = getattr(ctx.message, "attachments", [])
+        if not attachments or option not in {"", "preview"}:
+            await ctx.reply(
+                "Attach a journal export (JSON) to `!import-journal` to import it into the active campaign, "
+                "or to `!import-journal preview` to see what it would import first."
+            )
+            return
+        attachment = attachments[0]
+        if attachment.size > MAX_UPLOAD_BYTES:
+            await ctx.reply(f"That file is too large ({attachment.size // (1024 * 1024)} MB).")
+            return
+        raw = await attachment.read()
+        if option == "preview":
+            try:
+                preview = await asyncio.to_thread(journal.preview, raw)
+            except ValueError as exc:
+                await ctx.reply(str(exc))
+                return
+            await _send_long(ctx, preview)
+            return
+        campaign = await sessions.active_campaign(ctx.guild.id)
+        try:
+            plan = await journal.begin(ctx.guild.id, campaign.id, ctx.channel.id, raw)
+        except (ValueError, RuntimeError) as exc:
+            await ctx.reply(str(exc))
+            return
+        await ctx.reply(
+            f"Importing {len(plan.entries)} journal entries into campaign **{campaign.name}** in the background. "
+            "It makes an LLM call per long entry, recap and changed page, so a large journal takes hours. "
+            "`!import-status` shows progress; the report is posted here when it finishes."
+        )
+
+    @bot.command(name="import-status")
+    async def import_status(ctx: commands.Context) -> None:
+        if ctx.guild is None:
+            await ctx.reply("This command must be used in a server.")
+            return
+        await ctx.reply(journal.status(ctx.guild.id))
 
     @bot.command(name="session-status")
     async def session_status(ctx: commands.Context) -> None:

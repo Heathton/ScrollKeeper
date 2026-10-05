@@ -89,6 +89,27 @@ class LocalAIService:
             wait_message="Waking the inference box, this can take a few minutes...",
         )
 
+    async def extract_journal_facts(
+        self,
+        entity_index: str,
+        text: str,
+        source: str,
+        subject: str = "",
+        on_wait: WaitNotifier | None = None,
+    ) -> dict[str, Any]:
+        """Facts from game-master text. `source` says what it is ("a dated session recap");
+        `subject` is the `#<id> [Type] Name` the entry is about, if any. The result also has
+        `subject_type`, the type the model thinks fits the subject ("" without a subject)."""
+        return await self._run_blocking(
+            self._extract_journal_facts_sync,
+            entity_index,
+            text,
+            source,
+            subject,
+            on_wait=on_wait,
+            wait_message="Waking the inference box, this can take a few minutes...",
+        )
+
     async def match_entity(self, proposal: str, candidates: str, on_wait: WaitNotifier | None = None) -> dict[str, str]:
         """Ask whether a proposed new entity is one of the given existing candidates."""
         return await self._run_blocking(
@@ -321,19 +342,7 @@ Rules:
 - The transcript comes from speech-to-text, which often misspells names. When a word or phrase is
   likely a mis-transcription of a known entity's name or alias, treat it as that entity and use
   the index's spelling in fact text.
-- A new entity's `name` is the fullest proper name used (e.g. "Varric Thane"), not a nickname
-  or title; put nicknames and titles ("Old Varric", "Lord Thane") in `aliases`.
-- New entity `type` is one of: {", ".join(ENTITY_TYPES)}. Record plot events as facts on the
-  entities involved, not as entities.
-- A Quest is a task, job or goal the party is offered or takes on (e.g. "Recover Varric's
-  Ledger"); name it with a short imperative title. Record its giver, objective, reward and every
-  status change (offered, accepted, progress, completed, failed, abandoned) as facts on the Quest
-  only, naming every entity involved by its full name (e.g. "Varric Thane offered the party 200
-  gold to recover his ledger from the Black Tide"). Other pages link to the quest from those
-  names, so do not repeat quest progress on the other entities.
-- Any other fact that matters to several entities is recorded once for each of them, phrased from
-  that entity's side (a murder: "Varric Thane paid the Black Tide to murder Aldous Penn" on Varric,
-  "Aldous Penn was murdered on Varric Thane's orders" on Aldous Penn).
+{_ENTITY_RULES}
 - `timestamp` is the [HH:MM:SS] of the line the fact comes from.
 - Use `alias_updates` when the transcript calls a known entity by a new name or title.
 - Use `name_reveals` when the transcript reveals the real name of a known entity that is listed
@@ -350,6 +359,48 @@ Rules:
         prompt = f"Known entities:\n{entity_index or '(none yet)'}\n\nTranscript part:\n{transcript_chunk}"
         payload = self._chat_schema_sync(instructions, prompt, "fact_extraction", FACT_EXTRACTION_SCHEMA)
         return normalize_extraction_payload(payload)
+
+    def _extract_journal_facts_sync(self, entity_index: str, text: str, source: str, subject: str) -> dict[str, Any]:
+        """Facts from game-master-written text (a journal entry or a session recap); see #15."""
+        subject_rule = (
+            f"""
+- The entry is about {subject}. Attach facts about it to that `#<id>`, and set `subject_type` to
+  the type that fits it best (usually its current type; e.g. a named ship listed as a Character
+  is an Item)."""
+            if subject
+            else """
+- Set `subject_type` to ""."""
+        )
+        instructions = f"""
+You maintain a campaign wiki for a tabletop RPG. Extract durable facts from {source}, written by
+the game master. It is prose, not a transcript, and it is authoritative campaign material.
+
+Known entities are listed as `#<id> [<type>] <name> (aka <aliases>): <description>`.
+
+Rules:
+- A fact is one short, self-contained statement about one entity that should still matter later:
+  identity, role, appearance, relationships, allegiances, location, possessions, goals, secrets,
+  deaths, promises, and world-state changes. Skip blow-by-blow combat and game mechanics (stat
+  blocks, hit points, DCs, damage dice), except what a unique item or place does.
+- Set `entity` to the `#<id>` of a known entity whenever the fact is about it, even when the text
+  uses a nickname, title or first name. Only propose a new entity when nothing in the index
+  matches; then set `entity` to the new entity's exact `name`.
+{_ENTITY_RULES}
+- `timestamp` is always "".
+- Use `alias_updates` when the text calls a known entity by a new name or title.
+- Use `name_reveals` when the text reveals the real name of a known entity that is listed under a
+  description or title: give its `#<id>` and the revealed name, and attach the facts to that id.
+- Keep claims, rumours and lies as claims: "Sela says the ledger names the killer", not "the
+  ledger names the killer". Do not turn a guess or an accusation into a fact.
+- Do not give an entity a title or role that the text gives to someone else.
+- Do not invent facts. If unsure, leave it out. Empty arrays are fine.{subject_rule}
+"""
+        prompt = f"Known entities:\n{entity_index or '(none yet)'}\n\nText:\n{text}"
+        payload = self._chat_schema_sync(instructions, prompt, "journal_extraction", JOURNAL_EXTRACTION_SCHEMA)
+        result = normalize_extraction_payload(payload)
+        subject_type = str(payload.get("subject_type", "")).strip()
+        result["subject_type"] = subject_type if subject_type in ENTITY_TYPES else ""
+        return result
 
     def _match_entity_sync(self, proposal: str, candidates: str) -> dict[str, str]:
         instructions = """
@@ -497,6 +548,21 @@ Rules:
         raise RuntimeError(f"Could not get a valid {schema_name} response from the LLM.") from last_error
 
 
+# Entity rules shared by transcript and journal fact extraction.
+_ENTITY_RULES = f"""- A new entity's `name` is the fullest proper name used (e.g. "Varric Thane"), not a nickname
+  or title; put nicknames and titles ("Old Varric", "Lord Thane") in `aliases`.
+- New entity `type` is one of: {", ".join(ENTITY_TYPES)}. Record plot events as facts on the
+  entities involved, not as entities.
+- A Quest is a task, job or goal the party is offered or takes on (e.g. "Recover Varric's
+  Ledger"); name it with a short imperative title. Record its giver, objective, reward and every
+  status change (offered, accepted, progress, completed, failed, abandoned) as facts on the Quest
+  only, naming every entity involved by its full name (e.g. "Varric Thane offered the party 200
+  gold to recover his ledger from the Black Tide"). Other pages link to the quest from those
+  names, so do not repeat quest progress on the other entities.
+- Any other fact that matters to several entities is recorded once for each of them, phrased from
+  that entity's side (a murder: "Varric Thane paid the Black Tide to murder Aldous Penn" on Varric,
+  "Aldous Penn was murdered on Varric Thane's orders" on Aldous Penn)."""
+
 FACT_EXTRACTION_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
@@ -553,6 +619,16 @@ FACT_EXTRACTION_SCHEMA: dict[str, Any] = {
                 },
             },
         },
+    },
+}
+
+# Journal extraction also says which type fits the entry's own entity (#15).
+JOURNAL_EXTRACTION_SCHEMA: dict[str, Any] = {
+    **FACT_EXTRACTION_SCHEMA,
+    "required": [*FACT_EXTRACTION_SCHEMA["required"], "subject_type"],
+    "properties": {
+        **FACT_EXTRACTION_SCHEMA["properties"],
+        "subject_type": {"type": "string", "enum": ["", *ENTITY_TYPES]},
     },
 }
 
