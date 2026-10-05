@@ -44,13 +44,13 @@ Pages follow a fixed layout per type (`PAGE_LAYOUTS` in `src/scrollkeeper/wiki.p
 
 | Type | Sections |
 |---|---|
-| Character | Appearance & Personality, Relationships, History, Status, Open Questions |
+| Character | Appearance & Personality, Relationships, History, Status |
 | Player character (registered) | Relationships, History |
-| Faction | Members & Leadership, Allies & Enemies, Activities, Relationship with the Party, Open Questions |
-| Location | Notable Places, Notable People, History, Current State, Open Questions |
-| Item | Properties & Effects, Provenance, History, Open Questions |
+| Faction | Members & Leadership, Allies & Enemies, Activities, Relationship with the Party |
+| Location | Notable Places, Notable People, History, Current State |
+| Item | Properties & Effects, Provenance, History |
 | Mystery | Clues, Theories, Status |
-| PointOfInterest | Features, Dangers, History, Open Questions |
+| PointOfInterest | Features, Dangers, History |
 | Quest | Status, Progress, People & Places, Open Questions |
 
 Quests are entities too. Extraction records each quest's giver, objective, reward and status changes on the Quest only, naming the entities involved; the quest page holds all the details and its status (offered, active, completed, failed, abandoned). Any entity named in a quest's facts gets a **Quests** list (quest name and current status) added when its page is shown or exported. The list is built from current data, not written by the LLM, so it never goes stale.

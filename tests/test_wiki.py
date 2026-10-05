@@ -341,6 +341,8 @@ class PageLayoutTests(WikiTestCase):
         for entity_type, (_, sections) in PAGE_LAYOUTS.items():
             self.assertNotIn("Quests", [heading for heading, _ in sections], "quest lists are built in code")
         self.assertEqual(set(PAGE_LAYOUTS), set(ENTITY_TYPES))
+        with_questions = {t for t, (_, sections) in PAGE_LAYOUTS.items() if "Open Questions" in [h for h, _ in sections]}
+        self.assertEqual(with_questions, {"Quest"})
 
     async def test_linked_quests_are_listed_from_current_quest_data(self) -> None:
         varric = self.storage.create_entity(1, "Character", "Varric Thane", aliases=["Old Varric"])

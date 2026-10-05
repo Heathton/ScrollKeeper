@@ -599,7 +599,13 @@ class CampaignWiki:
 # they are next rewritten; `!rebuild-pages` applies it to every page at once.
 Layout = tuple[str, list[tuple[str, str]]]
 
-_OPEN_QUESTIONS = ("Open Questions", "unresolved questions raised by the facts")
+# Only Quest pages get Open Questions: a page sees only its own facts, so on other types the model
+# asked questions other pages already answer. Mystery pages are built around their question.
+_OPEN_QUESTIONS = (
+    "Open Questions",
+    "what is still unknown or left to do for this quest; not the party's own choices, and not "
+    "questions the facts already answer",
+)
 _STATUS_RULE = "only what the facts state; leave out anything unknown"
 
 PAGE_LAYOUTS: dict[str, Layout] = {
@@ -610,7 +616,6 @@ PAGE_LAYOUTS: dict[str, Layout] = {
             ("Relationships", "with other characters, factions and the party"),
             ("History", "what happened involving them, in session order"),
             ("Status", f"alive, dead or missing; current location; {_STATUS_RULE}"),
-            _OPEN_QUESTIONS,
         ],
     ),
     "Faction": (
@@ -620,7 +625,6 @@ PAGE_LAYOUTS: dict[str, Layout] = {
             ("Allies & Enemies", "other factions and characters"),
             ("Activities", "what they do and have done"),
             ("Relationship with the Party", "how they treat the party and why"),
-            _OPEN_QUESTIONS,
         ],
     ),
     "Location": (
@@ -630,7 +634,6 @@ PAGE_LAYOUTS: dict[str, Layout] = {
             ("Notable People", "who lives or works there"),
             ("History", "what happened there, in session order"),
             ("Current State", _STATUS_RULE),
-            _OPEN_QUESTIONS,
         ],
     ),
     "Item": (
@@ -639,7 +642,6 @@ PAGE_LAYOUTS: dict[str, Layout] = {
             ("Properties & Effects", "what it does, including curses"),
             ("Provenance", "where it came from and who held it before"),
             ("History", "what happened involving it, in session order"),
-            _OPEN_QUESTIONS,
         ],
     ),
     "Mystery": (
@@ -656,7 +658,6 @@ PAGE_LAYOUTS: dict[str, Layout] = {
             ("Features", "what is there"),
             ("Dangers", "threats and hazards"),
             ("History", "what happened there, in session order"),
-            _OPEN_QUESTIONS,
         ],
     ),
     "Quest": (
