@@ -50,10 +50,15 @@ class FakeLocalAIService:
         pass
 
 
+class FakeCampaignWiki:
+    def __init__(self, *_args, **_kwargs) -> None:
+        pass
+
+
 class FakeSessionManager:
     last_instance: "FakeSessionManager | None" = None
 
-    def __init__(self, _storage: FakeStorage, _llm: FakeLocalAIService) -> None:
+    def __init__(self, _storage: FakeStorage, _llm: FakeLocalAIService, _wiki: FakeCampaignWiki) -> None:
         self.completion_handler = None
         self.notice_handler = None
         self.end_session_calls: list[int] = []
@@ -121,6 +126,7 @@ class BotIntegrationHarnessTests(unittest.IsolatedAsyncioTestCase):
             patch("scrollkeeper.bot.Storage", FakeStorage),
             patch("scrollkeeper.bot.LocalAIService", FakeLocalAIService),
             patch("scrollkeeper.bot.SessionManager", FakeSessionManager),
+            patch("scrollkeeper.bot.CampaignWiki", FakeCampaignWiki),
             patch("scrollkeeper.bot.discord.TextChannel", FakeTextChannel),
         ):
             bot = build_bot(build_settings())
@@ -149,7 +155,6 @@ class BotIntegrationHarnessTests(unittest.IsolatedAsyncioTestCase):
                     transcript_markdown="# Transcript\n",
                     session_notes_markdown="Session notes body",
                     cinematic_summary_markdown="Cinematic body",
-                    note_updates=[{"note_type": "Events", "title": "A", "content": "B"}],
                     transcript_path=Path("/tmp/transcript.md"),
                     summary_path=Path("/tmp/summary.md"),
                 )
@@ -167,6 +172,7 @@ class BotIntegrationHarnessTests(unittest.IsolatedAsyncioTestCase):
             patch("scrollkeeper.bot.Storage", FakeStorage),
             patch("scrollkeeper.bot.LocalAIService", FakeLocalAIService),
             patch("scrollkeeper.bot.SessionManager", FakeSessionManager),
+            patch("scrollkeeper.bot.CampaignWiki", FakeCampaignWiki),
             patch("scrollkeeper.bot.discord.TextChannel", FakeTextChannel),
         ):
             bot = build_bot(build_settings())
@@ -183,7 +189,6 @@ class BotIntegrationHarnessTests(unittest.IsolatedAsyncioTestCase):
                     transcript_markdown="# Transcript\n",
                     session_notes_markdown=("Session note line.\n" * 300).strip(),
                     cinematic_summary_markdown=("Cinematic line.\n" * 300).strip(),
-                    note_updates=[],
                     transcript_path=Path("/tmp/transcript.md"),
                     summary_path=Path("/tmp/summary.md"),
                 )
@@ -200,6 +205,7 @@ class BotIntegrationHarnessTests(unittest.IsolatedAsyncioTestCase):
             patch("scrollkeeper.bot.Storage", FakeStorage),
             patch("scrollkeeper.bot.LocalAIService", FakeLocalAIService),
             patch("scrollkeeper.bot.SessionManager", FakeSessionManager),
+            patch("scrollkeeper.bot.CampaignWiki", FakeCampaignWiki),
             patch("scrollkeeper.bot.discord.TextChannel", FakeTextChannel),
         ):
             bot = build_bot(build_settings())
@@ -221,6 +227,7 @@ class BotIntegrationHarnessTests(unittest.IsolatedAsyncioTestCase):
             patch("scrollkeeper.bot.Storage", FakeStorage),
             patch("scrollkeeper.bot.LocalAIService", FakeLocalAIService),
             patch("scrollkeeper.bot.SessionManager", FakeSessionManager),
+            patch("scrollkeeper.bot.CampaignWiki", FakeCampaignWiki),
             patch("scrollkeeper.bot.discord.TextChannel", FakeTextChannel),
         ):
             bot = build_bot(build_settings())
@@ -245,6 +252,7 @@ class BotIntegrationHarnessTests(unittest.IsolatedAsyncioTestCase):
             patch("scrollkeeper.bot.Storage", FakeStorage),
             patch("scrollkeeper.bot.LocalAIService", FakeLocalAIService),
             patch("scrollkeeper.bot.SessionManager", FakeSessionManager),
+            patch("scrollkeeper.bot.CampaignWiki", FakeCampaignWiki),
             patch("scrollkeeper.bot.discord.TextChannel", FakeTextChannel),
         ):
             bot = build_bot(build_settings())
@@ -269,6 +277,7 @@ class BotIntegrationHarnessTests(unittest.IsolatedAsyncioTestCase):
             patch("scrollkeeper.bot.Storage", FakeStorage),
             patch("scrollkeeper.bot.LocalAIService", FakeLocalAIService),
             patch("scrollkeeper.bot.SessionManager", FakeSessionManager),
+            patch("scrollkeeper.bot.CampaignWiki", FakeCampaignWiki),
             patch("scrollkeeper.bot.discord.TextChannel", FakeTextChannel),
         ):
             bot = build_bot(build_settings())
@@ -287,6 +296,71 @@ class BotIntegrationHarnessTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(manager.reprocess_llm_calls, [(404, None)])
             finally:
                 await bot.close()
+
+
+class BrokenPageLLM:
+    """LLM stand-in whose page rewrites fail (e.g. the inference host is down)."""
+
+    def __init__(self, _settings: Settings) -> None:
+        pass
+
+    async def rewrite_page(self, *_args, **_kwargs) -> dict:
+        raise RuntimeError("inference host unreachable")
+
+    async def embed_text(self, *_args, **_kwargs) -> list[float]:
+        return [1.0]
+
+
+@unittest.skipUnless(build_bot is not None, f"discord dependency unavailable: {DISCORD_IMPORT_ERROR}")
+class WikiCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        import tempfile
+
+        from scrollkeeper.storage import Storage
+
+        self._tmp = tempfile.TemporaryDirectory()
+        settings = build_settings()
+        settings.data_dir = Path(self._tmp.name)
+        self.storage = Storage(settings.data_dir)
+        self._patches = [
+            patch("scrollkeeper.bot.LocalAIService", BrokenPageLLM),
+            patch("scrollkeeper.bot.SessionManager", FakeSessionManager),
+        ]
+        for item in self._patches:
+            item.start()
+        self.bot = build_bot(settings)
+        self.guild = types.SimpleNamespace(id=1)
+
+    async def asyncTearDown(self) -> None:
+        await self.bot.close()
+        for item in self._patches:
+            item.stop()
+        self._tmp.cleanup()
+
+    async def test_ambiguous_name_asks_for_an_id(self) -> None:
+        self.storage.create_entity(1, "Character", "Varric")
+        self.storage.create_entity(1, "Faction", "Varric")
+        ctx = FakeCtx(guild=self.guild)
+        await self.bot.get_command("entity").callback(ctx, ref="varric")
+        self.assertIn("matches several entities", ctx.replies[0])
+
+    async def test_pin_fact_is_saved_even_when_the_page_cannot_be_rewritten(self) -> None:
+        entity_id = self.storage.create_entity(1, "Character", "Varric")
+        ctx = FakeCtx(guild=self.guild)
+        ctx.author = types.SimpleNamespace(id=55)
+        await self.bot.get_command("pin-fact").callback(ctx, "Varric", text="Varric is a dwarf.")
+
+        self.assertIn("The change was saved", ctx.replies[0])
+        facts = self.storage.get_entity_facts(entity_id)
+        self.assertEqual([(f.kind, f.text) for f in facts], [("pinned", "Varric is a dwarf.")])
+
+    async def test_merge_entity_by_quoted_name(self) -> None:
+        source = self.storage.create_entity(1, "Character", "Lord Varric")
+        target = self.storage.create_entity(1, "Character", "Varric")
+        ctx = FakeCtx(guild=self.guild)
+        await self.bot.get_command("merge-entity").callback(ctx, "Lord Varric", f"#{target}")
+        self.assertEqual(self.storage.get_entity(1, source).id, target)
+        self.assertIn("Merged.", ctx.sent[-1])
 
 
 if __name__ == "__main__":

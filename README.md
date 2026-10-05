@@ -1,14 +1,15 @@
 # ScrollKeeper
 
-ScrollKeeper is a Discord bot for tabletop campaigns. It can join a voice channel, record speaker-separated audio, transcribe the session with in-character names, produce narrative/session summaries, update campaign notes, and answer lore questions from Discord.
+ScrollKeeper is a Discord bot for tabletop campaigns. It can join a voice channel, record speaker-separated audio, transcribe the session with in-character names, produce narrative/session summaries, maintain a campaign wiki built from sourced facts, and answer lore questions from Discord.
 
 ## What this MVP includes
 
 - Text commands to join a voice channel, start/end a session, register character names, and ask campaign questions
 - Voice receive pipeline built for `discord-ext-voice-recv`
-- Persistent SQLite storage for sessions, transcripts, character mappings, notes, and embeddings
-- File archives for audio segments, transcripts, summaries, and generated notes
-- Retrieval-backed campaign Q&A over saved notes
+- Persistent SQLite storage for sessions, transcripts, character mappings, the campaign wiki, and embeddings
+- File archives for audio segments, transcripts, summaries, and an Obsidian-style wiki export
+- A campaign wiki: entities with aliases, an append-only log of facts with their source (session and transcript time), and pages rewritten from those facts
+- Retrieval-backed campaign Q&A over wiki pages
 - Speech-to-text through an OpenAI-compatible `/v1/audio/transcriptions` endpoint (a CPU faster-whisper service is included)
 - Summaries, embeddings, and campaign Q&A through any OpenAI-compatible LLM endpoint (`/v1/chat/completions`, `/v1/embeddings`)
 
@@ -17,13 +18,26 @@ ScrollKeeper is a Discord bot for tabletop campaigns. It can join a voice channe
 - `!register-character <character name>`: map your Discord user to an in-game character
 - `!join`: bot joins your current voice channel
 - `!start-session [title]`: begin recording/transcription for the active voice channel
-- `!end-session`: stop recording, finalize transcript, generate summaries/notes, and post the result
-- `!campaign-question <question>`: ask about campaign notes
-- `!list-notes`: list recent campaign notes with IDs
-- `!correct-note <note-id> <corrected content>`: manually fix an incorrect campaign note
+- `!end-session`: stop recording, finalize transcript, write the summary, update the campaign wiki, and post the result with a wiki change report
+- `!campaign-question <question>`: ask about the campaign (answers come from wiki pages)
 - `!session-status`: show the current session state
 - `!reprocess-session [session-id]`: rerun speech-to-text + summary/note generation from saved audio
-- `!reprocess-llm [session-id]`: rerun summary/note generation only from existing transcript text (skips speech-to-text)
+- `!reprocess-llm [session-id]`: rerun the summary and wiki update from existing transcript text (skips speech-to-text). The session's earlier extracted facts are retracted and replaced.
+
+### Campaign wiki
+
+Entities are referred to by `#id`, name or alias. Put names with spaces in quotes when another argument follows (`!merge-entity "Lord Varric" Varric`).
+
+- `!entities [type]`: list entities (types: Character, Faction, Location, Item, Mystery, PointOfInterest) with fact counts
+- `!entity <name>`: show an entity's page and the facts it cites (fact ids `F12`, with session and transcript time)
+- `!merge-entity <from> <into>`: merge a duplicate; its facts move over and its names become aliases
+- `!rename-entity <entity> <new name>`: change the canonical name (the old name stays as an alias)
+- `!add-alias <entity> <alias>`: add another name, nickname or common mis-transcription
+- `!pin-fact <entity> <text>`: add an authoritative fact; pinned facts override anything that conflicts
+- `!correct-fact <fact-id> <text>`: replace a wrong fact with a pinned one (the old fact is kept as history)
+- `!retract-fact <fact-id> [reason]`: withdraw a wrong fact
+
+After each processed session the bot posts the new and updated entities and **possible duplicates** (same or similar names) so they can be merged.
 
 ## Prerequisites
 
@@ -47,7 +61,11 @@ Optional:
 - `SCROLLKEEPER_HEALTH_PORT=8080`: serves `GET /healthz` for Kubernetes liveness probes (`0` disables). It returns 503 if the bot's event loop has stalled for over a minute.
 - `SCROLLKEEPER_SUMMARY_SINGLE_PASS_MAX_CHARS=90000` sets when the bot switches from single-pass summary generation to chunked summarization.
 - `SCROLLKEEPER_SUMMARY_CHUNK_CHARS=45000` sets chunk size used when transcripts are too long for single-pass summarization.
-- `SCROLLKEEPER_SUMMARY_PROMPT_APPEND=` appends your own instructions to the summary/note-generation system prompt.
+- `SCROLLKEEPER_SUMMARY_PROMPT_APPEND=` appends your own instructions to the summary system prompt.
+- `SCROLLKEEPER_EXTRACT_CHUNK_CHARS=24000` sets the transcript chunk size for campaign fact extraction (each chunk is sent with the entity index).
+- `SCROLLKEEPER_WIKI_EXPORT=1` writes the Obsidian-style export to `data/wiki/` after wiki changes (`0` disables).
+
+Fact extraction and page rewrites request schema-enforced JSON (`response_format: {"type": "json_schema"}`), which vLLM and other OpenAI-compatible servers support.
 
 Logs go to stdout. The bot never starts other containers and does not need the Docker socket.
 
@@ -73,7 +91,7 @@ Pushing a `v*` tag runs `.github/workflows/images.yml`, which publishes `ghcr.io
 - `data/sessions/<session-id>/audio`: recorded WAV segments
 - `data/sessions/<session-id>/transcript.md`: finalized transcript
 - `data/sessions/<session-id>/summary.md`: session notes + cinematic summary
-- `data/notes`: exported campaign note snapshots
+- `data/wiki/<guild-id>/<Type>/<Name>.md`: Obsidian-style wiki export, one file per entity with `aliases` frontmatter, `[[links]]` and session citations. It is regenerated from the database, so edits there are overwritten; use the commands above.
 
 ## Important implementation notes
 
@@ -81,7 +99,9 @@ Pushing a `v*` tag runs `.github/workflows/images.yml`, which publishes `ghcr.io
 - The bot records speaker-specific WAV segments and transcribes them after the session ends. This is simpler and more reliable than trying to stream partial text live.
 - Transcript markdown is saved in speaker-only format (`**Speaker:** line`) without timestamp prefixes to reduce context-token overhead in summarization.
 - Session summaries are generated from the current session transcript only, so prior campaign notes are not used as summary source material.
-- Notes are indexed with embeddings stored in SQLite. Transcript text is archived but intentionally excluded from retrieval, matching your requirement.
+- Wiki pages are indexed with embeddings stored in SQLite. Transcript text is archived but intentionally excluded from retrieval.
+- The wiki pipeline after each session: (1) summary from the transcript only; (2) fact extraction per timestamped transcript chunk, given the entity index, attaching facts to existing entities or proposing new ones; (3) rewrite of every page whose facts changed. Pinned facts are authoritative. Retracting or superseding a fact rebuilds the page from the remaining facts.
+- Campaign notes from earlier versions (`campaign_notes` table) are left in the database but no longer used. Run `!reprocess-llm <session-id>` on saved sessions to build the wiki from their transcripts.
 - If the voice connection drops mid-session, the bot will try to reconnect to the same channel and continue the session.
 - `discord-ext-voice-recv` is pinned to a commit SHA in `pyproject.toml`; change it deliberately, in its own PR. If Python voice receive keeps breaking, the fallback is a small Node `@discordjs/voice` recorder feeding this pipeline.
 - The bot calls the configured speech-to-text endpoint per speaker segment after the session ends.

@@ -14,8 +14,9 @@ import discord
 from discord.ext import voice_recv
 
 from .llm import LocalAIService
-from .models import CampaignNote, SessionArtifacts, SpeakerSegment
+from .models import SessionArtifacts, SpeakerSegment, WikiChangeReport
 from .storage import Storage
+from .wiki import CampaignWiki
 
 
 log = logging.getLogger(__name__)
@@ -121,9 +122,10 @@ class SessionAudioSink(voice_recv.AudioSink):
 
 
 class SessionManager:
-    def __init__(self, storage: Storage, llm: LocalAIService) -> None:
+    def __init__(self, storage: Storage, llm: LocalAIService, wiki: CampaignWiki) -> None:
         self.storage = storage
         self.llm = llm
+        self.wiki = wiki
         self.active_sessions: dict[int, ActiveSession] = {}
         self.processing_tasks: dict[int, asyncio.Task] = {}
         self.statuses: dict[int, SessionStatus] = {}
@@ -291,14 +293,7 @@ class SessionManager:
         question: str,
         on_wait: Callable[[str], Awaitable[None]] | None = None,
     ) -> str:
-        query_embedding = await self.llm.embed_text(question, on_wait=on_wait)
-        results = self.storage.semantic_search_notes(guild_id, query_embedding, limit=8)
-        if not results:
-            return "I do not have any campaign notes saved yet."
-        context_chunks = []
-        for row in results:
-            context_chunks.append(f"[{row['note_type']}] {row['title']}\n{row['content']}")
-        return await self.llm.answer_question(question, "\n\n".join(context_chunks), on_wait=on_wait)
+        return await self.wiki.answer_question(guild_id, question, on_wait=on_wait)
 
     def session_status(self, guild_id: int) -> str:
         status = self.statuses.get(guild_id)
@@ -410,16 +405,11 @@ class SessionManager:
             )
 
         transcript_markdown = self._build_transcript_markdown(session.session_id)
-        existing_notes_context = self._format_existing_notes_context(guild_id)
-        log.info("Generating summary and notes for session %s", session.session_id)
-        summary_payload = await self.llm.summarize_session(
-            transcript_markdown,
-            existing_notes_context,
-            on_wait=notify,
-        )
+        log.info("Generating summary for session %s", session.session_id)
+        self._set_status(guild_id, "processing", session.session_id, "Writing the session summary.")
+        summary_payload = await self.llm.summarize_session(transcript_markdown, on_wait=notify)
         session_notes = summary_payload["session_notes_markdown"].strip()
         cinematic = summary_payload["cinematic_summary_markdown"].strip()
-        note_updates = summary_payload["note_updates"]
 
         transcript_path = session.base_dir / "transcript.md"
         summary_path = session.base_dir / "summary.md"
@@ -432,27 +422,23 @@ class SessionManager:
         )
         summary_path.write_text(summary_markdown, encoding="utf-8")
 
-        for update in note_updates:
-            content = str(update["content"]).strip()
-            title = str(update["title"]).strip()
-            note_type = str(update["note_type"]).strip()
-            if not content or not title or not note_type:
-                continue
-            note = CampaignNote(
-                guild_id=guild_id,
-                note_type=note_type,
-                title=title,
-                content=content,
-                source_session_id=session.session_id,
-                metadata=update.get("metadata", {}),
+        # The summary is saved already; a wiki failure is reported but doesn't fail the session.
+        log.info("Updating the campaign wiki from session %s", session.session_id)
+        try:
+            timed_transcript = await asyncio.to_thread(
+                self._build_timed_transcript, session.session_id, session.started_at
             )
-            embedding = await self.llm.embed_text(
-                f"{note.note_type}\n{note.title}\n{note.content}",
+            wiki_report = await self.wiki.process_session(
+                guild_id,
+                session.session_id,
+                timed_transcript,
                 on_wait=notify,
+                on_progress=lambda message: self._set_status(guild_id, "processing", session.session_id, message),
             )
-            self.storage.upsert_campaign_note(note, embedding)
+        except Exception as exc:
+            log.exception("Campaign wiki update failed for session %s", session.session_id)
+            wiki_report = WikiChangeReport(error=str(exc))
 
-        exported_notes_path = self._export_notes_snapshot(guild_id, session.base_dir)
         self.storage.finalize_session(
             session.session_id,
             str(transcript_path),
@@ -463,10 +449,9 @@ class SessionManager:
             transcript_markdown=transcript_markdown,
             session_notes_markdown=session_notes,
             cinematic_summary_markdown=cinematic,
-            note_updates=note_updates,
             transcript_path=transcript_path,
             summary_path=summary_path,
-            exported_notes_path=exported_notes_path,
+            wiki_report=wiki_report,
         )
 
     async def _stop_recording_session(self, session: ActiveSession) -> None:
@@ -693,23 +678,20 @@ class SessionManager:
             lines.append("")
         return "\n".join(lines).strip() + "\n"
 
-    def _format_existing_notes_context(self, guild_id: int) -> str:
-        notes = self.storage.get_recent_notes(guild_id)
-        if not notes:
-            return "No prior campaign notes."
-        rendered = []
-        for note in notes:
-            rendered.append(f"[{note['note_type']}] {note['title']}\n{note['content']}")
-        return "\n\n".join(rendered)
+    def _build_timed_transcript(self, session_id: int, session_started_at: datetime) -> str:
+        """Transcript with `[HH:MM:SS]` offsets from the session start, so facts can cite a time."""
+        rows = self.storage.get_session_segments(session_id)
+        lines = ["# Transcript", ""]
+        for row in rows:
+            transcript_text = (row["transcript_text"] or "").strip()
+            if not transcript_text:
+                continue
+            speaker = row["character_name"] or row["display_name"]
+            offset = datetime.fromisoformat(row["started_at"]) - session_started_at
+            lines.append(f"[{format_offset(offset)}] {speaker}: {transcript_text}")
+        return "\n".join(lines).strip() + "\n"
 
-    def _export_notes_snapshot(self, guild_id: int, base_dir: Path) -> Path:
-        notes = self.storage.get_recent_notes(guild_id)
-        export_path = base_dir / "campaign_notes.md"
-        lines = ["# Campaign Notes Snapshot", ""]
-        for note in notes:
-            lines.append(f"## [{note['note_type']}] {note['title']}")
-            lines.append("")
-            lines.append(note["content"])
-            lines.append("")
-        export_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
-        return export_path
+
+def format_offset(offset: timedelta) -> str:
+    seconds = max(0, int(offset.total_seconds()))
+    return f"{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"

@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+
+
+ENTITY_TYPES = ("Character", "Faction", "Location", "Item", "Mystery", "PointOfInterest")
+FACT_KINDS = ("observed", "pinned", "imported")
 
 
 @dataclass(slots=True)
@@ -17,22 +22,94 @@ class SpeakerSegment:
 
 
 @dataclass(slots=True)
+class Entity:
+    id: int
+    guild_id: int
+    type: str
+    canonical_name: str
+    aliases: list[str] = field(default_factory=list)
+    short_description: str = ""
+    merged_into: int | None = None
+
+    def names(self) -> list[str]:
+        return [self.canonical_name, *self.aliases]
+
+
+@dataclass(slots=True)
+class Fact:
+    id: int
+    guild_id: int
+    entity_id: int
+    kind: str
+    text: str
+    session_id: int | None = None
+    transcript_ts: str | None = None
+    source_ref: str | None = None
+    created_at: str = ""
+    superseded_by: int | None = None
+    retracted_at: str | None = None
+
+    @property
+    def active(self) -> bool:
+        return self.superseded_by is None and self.retracted_at is None
+
+    def source_label(self) -> str:
+        """Short human-readable provenance, e.g. `session 12 @ 01:23:45`, `pinned`, `journal:abc`."""
+        if self.kind == "pinned":
+            return "pinned"
+        if self.session_id is not None:
+            label = f"session {self.session_id}"
+            if self.transcript_ts:
+                label += f" @ {self.transcript_ts}"
+            return label
+        if self.source_ref:
+            return self.source_ref
+        return self.kind
+
+
+@dataclass(slots=True)
+class Page:
+    entity_id: int
+    markdown: str
+    source_fact_ids: list[int]
+    updated_at: str
+
+
+@dataclass(slots=True)
+class DuplicateCandidate:
+    first: Entity
+    second: Entity
+    reason: str
+
+
+@dataclass(slots=True)
+class WikiChangeReport:
+    new_entities: list[Entity] = field(default_factory=list)
+    updated_entities: list[Entity] = field(default_factory=list)
+    facts_added: int = 0
+    facts_retracted: int = 0
+    possible_duplicates: list[DuplicateCandidate] = field(default_factory=list)
+    page_failures: list[str] = field(default_factory=list)
+    error: str | None = None
+
+
+@dataclass(slots=True)
 class SessionArtifacts:
     session_id: int
     transcript_markdown: str
     session_notes_markdown: str
     cinematic_summary_markdown: str
-    note_updates: list[dict]
     transcript_path: Path
     summary_path: Path
-    exported_notes_path: Path | None = None
+    wiki_report: WikiChangeReport | None = None
 
 
-@dataclass(slots=True)
-class CampaignNote:
-    guild_id: int
-    note_type: str
-    title: str
-    content: str
-    source_session_id: int | None = None
-    metadata: dict = field(default_factory=dict)
+_ARTICLE_PREFIX = re.compile(r"^(the|a|an)\s+")
+_NON_WORD = re.compile(r"[^\w\s]")
+
+
+def normalize_name(name: str) -> str:
+    """Lower-case, drop punctuation and a leading article, collapse whitespace (for alias matching)."""
+    text = _NON_WORD.sub(" ", name.casefold())
+    text = " ".join(text.split())
+    return _ARTICLE_PREFIX.sub("", text)

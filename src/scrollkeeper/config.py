@@ -28,6 +28,8 @@ class Settings:
     embed_model: str
     wait_notice_seconds: int
     health_port: int
+    extract_chunk_chars: int = 24000
+    wiki_export: bool = True
 
     @classmethod
     def load(cls) -> "Settings":
@@ -52,6 +54,8 @@ class Settings:
             embed_model=_optional_env("SCROLLKEEPER_EMBED_MODEL"),
             wait_notice_seconds=int(os.getenv("SCROLLKEEPER_WAIT_NOTICE_SECONDS", "20")),
             health_port=int(os.getenv("SCROLLKEEPER_HEALTH_PORT", "8080")),
+            extract_chunk_chars=int(os.getenv("SCROLLKEEPER_EXTRACT_CHUNK_CHARS", "24000")),
+            wiki_export=os.getenv("SCROLLKEEPER_WIKI_EXPORT", "1").strip().lower() not in {"0", "false", "no", "off"},
         )
 
     def validate(self) -> None:
