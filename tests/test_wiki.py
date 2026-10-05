@@ -387,6 +387,27 @@ class PageLayoutTests(WikiTestCase):
         self.assertIn("A port town.", self.llm.rewrite_calls[-1]["new"])
 
 
+class EmbeddingFailureTests(WikiTestCase):
+    async def test_pages_are_saved_when_embedding_fails_and_retried_later(self) -> None:
+        entity_id = self.storage.create_entity(1, "Location", "Gullhaven")
+        self.llm.extractions = [extraction(facts=[{"entity": f"#{entity_id}", "text": "A port town.", "timestamp": ""}])]
+        working_embed = self.llm.embed_text
+
+        async def broken_embed(*_args, **_kwargs):
+            raise RuntimeError("no embedding model")
+
+        self.llm.embed_text = broken_embed
+        report = await self.wiki.process_session(1, self.session_id, "# Transcript\n\nx\n")
+        self.assertEqual(report.page_failures, [])
+        self.assertIsNotNone(self.storage.get_page(entity_id), "the rewritten page is kept")
+        self.assertEqual(report.pages_without_embedding, 1)
+        self.assertIn("not searchable yet", format_change_report(report))
+
+        self.llm.embed_text = working_embed
+        self.assertEqual(await self.wiki.embed_missing_pages(1), 0)
+        self.assertEqual(self.storage.page_ids_without_embedding(1), [])
+
+
 class ReviewCommandTests(WikiTestCase):
     async def _entity_with_page(self, name: str, *facts: str) -> Entity:
         entity_id = self.storage.create_entity(1, "Character", name)

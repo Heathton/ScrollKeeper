@@ -100,6 +100,9 @@ class CampaignWiki:
         report.renamed = result.renamed
 
         report.page_failures = await self.refresh_stale_pages(guild_id, on_wait=on_wait, on_progress=on_progress)
+        report.pages_without_embedding = len(
+            await asyncio.to_thread(self.storage.page_ids_without_embedding, guild_id)
+        )
         for entity_id in result.renamed_ids:
             try:
                 await self.reembed_page(guild_id, entity_id, on_wait=on_wait)
@@ -360,6 +363,7 @@ class CampaignWiki:
                 log.exception("Could not rewrite the wiki page for entity %s", entity_id)
                 entity = await asyncio.to_thread(self.storage.get_entity, guild_id, entity_id)
                 failures.append(entity.canonical_name if entity else f"#{entity_id}")
+        await self.embed_missing_pages(guild_id, on_wait=on_wait)
         if self.settings.wiki_export:
             await asyncio.to_thread(self.export, guild_id)
         return failures
@@ -416,7 +420,7 @@ class CampaignWiki:
             status = result.get("status", "") if entity.type == "Quest" else ""
             short_description = _strip_citations(result["short_description"]) or short_description
 
-        embedding = await self.llm.embed_text(page_embedding_text(entity, markdown), on_wait=on_wait)
+        embedding = await self._try_embed(entity, markdown, on_wait)
         await asyncio.to_thread(self.storage.save_page, entity.id, markdown, sorted(active_ids), embedding)
         if short_description != entity.short_description:
             await asyncio.to_thread(self.storage.set_entity_short_description, entity.id, short_description)
@@ -470,8 +474,24 @@ class CampaignWiki:
         page = await asyncio.to_thread(self.storage.get_page, entity_id)
         if entity is None or page is None:
             return
-        embedding = await self.llm.embed_text(page_embedding_text(entity, page.markdown), on_wait=on_wait)
-        await asyncio.to_thread(self.storage.update_page_embedding, entity_id, embedding)
+        embedding = await self._try_embed(entity, page.markdown, on_wait)
+        if embedding:
+            await asyncio.to_thread(self.storage.update_page_embedding, entity_id, embedding)
+
+    async def _try_embed(self, entity: Entity, markdown: str, on_wait: WaitNotifier | None) -> list[float] | None:
+        """Embed a page for search. A failure leaves the page unsearchable until the next run
+        retries it, rather than losing the rewritten page."""
+        try:
+            return await self.llm.embed_text(page_embedding_text(entity, markdown), on_wait=on_wait) or None
+        except Exception as exc:
+            log.warning("Could not embed the wiki page for %s: %s", entity.canonical_name, exc)
+            return None
+
+    async def embed_missing_pages(self, guild_id: int, on_wait: WaitNotifier | None = None) -> int:
+        """Retry embeddings for pages saved without one. Returns how many are still missing."""
+        for entity_id in await asyncio.to_thread(self.storage.page_ids_without_embedding, guild_id):
+            await self.reembed_page(guild_id, entity_id, on_wait=on_wait)
+        return len(await asyncio.to_thread(self.storage.page_ids_without_embedding, guild_id))
 
     # --- Review commands ----------------------------------------------------------------
 
@@ -925,6 +945,11 @@ def format_change_report(report: WikiChangeReport) -> str:
     if report.page_failures:
         lines.append(
             "**Pages not updated** (retried on the next run): " + ", ".join(report.page_failures)
+        )
+    if report.pages_without_embedding:
+        lines.append(
+            f"**{report.pages_without_embedding} page(s) not searchable yet**: the embedding endpoint "
+            "failed, so `!campaign-question` can't find them. Retried on the next run."
         )
     return "\n".join(lines)
 

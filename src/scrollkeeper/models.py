@@ -92,6 +92,7 @@ class WikiChangeReport:
     facts_retracted: int = 0
     possible_duplicates: list[DuplicateCandidate] = field(default_factory=list)
     page_failures: list[str] = field(default_factory=list)
+    pages_without_embedding: int = 0
     renamed: list[tuple[str, str]] = field(default_factory=list)
     error: str | None = None
 

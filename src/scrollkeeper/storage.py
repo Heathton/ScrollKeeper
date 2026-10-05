@@ -675,6 +675,20 @@ class Storage:
                 (json.dumps(embedding, ensure_ascii=True), entity_id),
             )
 
+    def page_ids_without_embedding(self, guild_id: int) -> list[int]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT p.entity_id
+                FROM pages p
+                JOIN entities e ON e.id = p.entity_id
+                WHERE e.guild_id = ? AND e.merged_into IS NULL AND p.embedding_json IS NULL
+                ORDER BY p.entity_id
+                """,
+                (guild_id,),
+            ).fetchall()
+        return [int(row["entity_id"]) for row in rows]
+
     def delete_page(self, entity_id: int) -> None:
         with self.connection() as conn:
             conn.execute("DELETE FROM pages WHERE entity_id = ?", (entity_id,))
