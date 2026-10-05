@@ -88,8 +88,9 @@ class FakeSessionManager:
         self.status_map[guild.id] = "Session #42 status: processing. Transcribing and generating notes."
         return 42
 
-    async def answer_campaign_question(self, guild_id: int, question: str, on_wait=None) -> str:
+    async def answer_campaign_question(self, guild_id: int, question: str, on_wait=None, deep: bool = False) -> str:
         self.answer_calls.append((guild_id, question))
+        self.deep_calls = getattr(self, "deep_calls", []) + [deep]
         return "Campaign answer from notes."
 
     async def reprocess_session(self, guild_id: int, session_id: int | None = None) -> int:
@@ -121,8 +122,6 @@ def build_settings() -> Settings:
         llm_model="test-model",
         llm_api_key="",
         llm_timeout_seconds=900,
-        embed_base_url="http://llm/v1",
-        embed_model="test-embed",
         wait_notice_seconds=20,
         health_port=0,
     )
@@ -316,8 +315,16 @@ class BrokenPageLLM:
     async def rewrite_page(self, *_args, **_kwargs) -> dict:
         raise RuntimeError("inference host unreachable")
 
-    async def embed_text(self, *_args, **_kwargs) -> list[float]:
-        return [1.0]
+
+class UnavailableEmbedder:
+    """Embedder stand-in whose model can't be loaded (tests never download models)."""
+
+    def __init__(self, spec, *_args, **_kwargs) -> None:
+        self.spec = spec
+        self.ready = False
+
+    def load(self) -> None:
+        raise RuntimeError("no model in tests")
 
 
 @unittest.skipUnless(build_bot is not None, f"discord dependency unavailable: {DISCORD_IMPORT_ERROR}")
@@ -334,6 +341,7 @@ class WikiCommandTests(unittest.IsolatedAsyncioTestCase):
         self._patches = [
             patch("scrollkeeper.bot.LocalAIService", BrokenPageLLM),
             patch("scrollkeeper.bot.SessionManager", FakeSessionManager),
+            patch("scrollkeeper.bot.LocalEmbedder", UnavailableEmbedder),
         ]
         for item in self._patches:
             item.start()
@@ -370,6 +378,28 @@ class WikiCommandTests(unittest.IsolatedAsyncioTestCase):
         await self.bot.get_command("merge-entity").callback(ctx, "Lord Varric", f"#{target}")
         self.assertEqual(self.storage.get_entity(1, source).id, target)
         self.assertIn("Merged.", ctx.sent[-1])
+
+    async def test_reindex_needs_manage_server(self) -> None:
+        ctx = FakeCtx(guild=self.guild)
+        ctx.author = types.SimpleNamespace(id=55, guild_permissions=types.SimpleNamespace(manage_guild=False))
+        await self.bot.get_command("reindex").callback(ctx)
+        self.assertIn("Manage Server", ctx.replies[0])
+
+    async def test_reindex_reports_documents_without_embedding(self) -> None:
+        entity_id = self.storage.create_entity(1, "Character", "Varric")
+        self.storage.add_fact(1, entity_id, "Runs the docks.", "observed")
+        self.storage.save_page(entity_id, "Runs the docks. [F1]", [1])
+        ctx = FakeCtx(guild=self.guild)
+        ctx.author = types.SimpleNamespace(id=55, guild_permissions=types.SimpleNamespace(manage_guild=True))
+        await self.bot.get_command("reindex").callback(ctx)
+        self.assertIn("Indexed 1 document(s). 1 could not be embedded", ctx.sent[-1])
+
+    async def test_deep_question_searches_transcripts(self) -> None:
+        ctx = FakeCtx(guild=self.guild)
+        await self.bot.get_command("deep-question").callback(ctx, question="Who said it?")
+        manager = FakeSessionManager.last_instance
+        self.assertEqual(manager.deep_calls[-1], True)
+        self.assertEqual(ctx.sent[-1], "Campaign answer from notes.")
 
 
 if __name__ == "__main__":

@@ -19,10 +19,12 @@ log = logging.getLogger(__name__)
 WaitNotifier = Callable[[str], Awaitable[None]]
 
 CONNECT_TIMEOUT_SECONDS = 60
+NOT_IN_NOTES_REPLY = "That's not in the notes."
 
 
 class LocalAIService:
-    """Client for OpenAI-compatible speech-to-text, chat, and embedding endpoints.
+    """Client for OpenAI-compatible speech-to-text and chat endpoints (embeddings run in-process,
+    see `embeddings.py`).
 
     The LLM host may cold-start for minutes, so reads use long timeouts and callers can pass
     `on_wait` to tell the Discord channel when a request is taking unusually long.
@@ -41,14 +43,6 @@ class LocalAIService:
         result = await asyncio.to_thread(self._transcribe_track_sync, audio_path)
         log.info("Speech-to-text returned %s words for %s", len(result.words), audio_path)
         return result
-
-    async def embed_text(self, text: str, on_wait: WaitNotifier | None = None) -> list[float]:
-        return await self._run_blocking(
-            self._embed_text_sync,
-            text,
-            on_wait=on_wait,
-            wait_message="Waking the inference box, this can take a few minutes...",
-        )
 
     async def summarize_session(
         self,
@@ -107,11 +101,11 @@ class LocalAIService:
             wait_message="Waking the inference box, this can take a few minutes...",
         )
 
-    async def answer_question(self, question: str, note_context: str, on_wait: WaitNotifier | None = None) -> str:
+    async def answer_question(self, question: str, sources: str, on_wait: WaitNotifier | None = None) -> str:
         return await self._run_blocking(
             self._answer_question_sync,
             question,
-            note_context,
+            sources,
             on_wait=on_wait,
             wait_message="Waking the inference box, this can take a few minutes...",
         )
@@ -152,17 +146,6 @@ class LocalAIService:
             )
         response.raise_for_status()
         return parse_transcription(response.json())
-
-    def _embed_text_sync(self, text: str) -> list[float]:
-        response = requests.post(
-            f"{self.settings.embed_base_url}/embeddings",
-            json={"model": self.settings.embed_model, "input": text},
-            headers=self._headers(),
-            timeout=self._timeout(self.settings.llm_timeout_seconds),
-        )
-        response.raise_for_status()
-        data = response.json().get("data", [])
-        return list(data[0].get("embedding", [])) if data else []
 
     def _summarize_session_sync(self, transcript_markdown: str) -> dict[str, Any]:
         single_pass_max_chars = int(os.getenv("SCROLLKEEPER_SUMMARY_SINGLE_PASS_MAX_CHARS", "90000"))
@@ -408,19 +391,24 @@ Rules:
             "status": str(payload.get("status", "")).strip().lower(),
         }
 
-    def _answer_question_sync(self, question: str, note_context: str) -> str:
-        instructions = """
-You answer questions about a tabletop campaign using only the retrieved note context.
-If the answer is uncertain or absent, say that clearly.
-Be concise but useful.
+    def _answer_question_sync(self, question: str, sources: str) -> str:
+        instructions = f"""
+You answer questions about a tabletop RPG campaign for its players, using only the numbered
+sources given (wiki pages, session summaries and transcript excerpts, each tagged like [S1]).
+
+Rules:
+- Use only the sources. Do not add outside knowledge, and do not guess.
+- Cite every statement. Wiki pages carry citations in parentheses such as
+  (session 12 @ 01:43:10); copy the one that supports the statement. Otherwise cite the
+  source's tag, such as [S2] or [S1, S3].
+- When sources disagree, prefer the later session and say what changed.
+- If the sources do not answer the question, reply exactly: {NOT_IN_NOTES_REPLY}
+- Be concise: a few sentences or a short list.
 """
         return self._chat_sync(
             [
                 {"role": "system", "content": instructions},
-                {
-                    "role": "user",
-                    "content": f"Question: {question}\n\nRelevant campaign notes:\n{note_context}",
-                },
+                {"role": "user", "content": f"Question: {question}\n\nSources:\n{sources}"},
             ],
         )
 

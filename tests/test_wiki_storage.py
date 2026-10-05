@@ -86,7 +86,7 @@ class EntityStorageTests(StorageTestCase):
         source = self.storage.create_entity(1, "Character", "Lord Varric", aliases=["The Old Lord"])
         target = self.storage.create_entity(1, "Character", "Varric")
         fact_id = self.storage.add_fact(1, source, "Owns a tower.", "observed")
-        self.storage.save_page(source, "page", [fact_id], [1.0])
+        self.storage.save_page(source, "page", [fact_id])
 
         self.storage.merge_entities(source, target)
 
@@ -128,14 +128,6 @@ class FactStorageTests(StorageTestCase):
         entity_id = self.storage.create_entity(1, "Item", "Sword")
         with self.assertRaises(ValueError):
             self.storage.add_fact(1, entity_id, "text", "rumour")
-
-    def test_semantic_search_returns_closest_pages(self) -> None:
-        near = self.storage.create_entity(1, "Location", "Sharn")
-        far = self.storage.create_entity(1, "Location", "Stormreach")
-        self.storage.save_page(near, "City of towers.", [], [1.0, 0.0])
-        self.storage.save_page(far, "Port city.", [], [0.0, 1.0])
-        results = self.storage.semantic_search_pages(1, [0.9, 0.1], limit=1)
-        self.assertEqual([entity.canonical_name for entity, _ in results], ["Sharn"])
 
 
 if __name__ == "__main__":

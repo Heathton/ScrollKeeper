@@ -21,6 +21,7 @@ from .models import SessionArtifacts, SpeakerSegment, WikiChangeReport
 from .recorder import Speaker, TrackRecorder
 from .storage import PROCESS_LLM_ONLY, PROCESS_TRANSCRIBE, Storage
 from .transcript import format_offset, merge_lines, render_compact, render_timed, split_utterances
+from .search import SearchIndex
 from .wiki import CampaignWiki
 
 
@@ -123,10 +124,12 @@ class SessionManager:
         wiki: CampaignWiki,
         spool_dir: Path | None = None,
         audio_retention_days: int = 0,
+        search: SearchIndex | None = None,
     ) -> None:
         self.storage = storage
         self.llm = llm
         self.wiki = wiki
+        self.search = search
         self.spool_dir = spool_dir
         self.audio_retention_days = audio_retention_days
         self.active_sessions: dict[int, ActiveSession] = {}
@@ -323,8 +326,11 @@ class SessionManager:
         guild_id: int,
         question: str,
         on_wait: Callable[[str], Awaitable[None]] | None = None,
+        deep: bool = False,
     ) -> str:
-        return await self.wiki.answer_question(guild_id, question, on_wait=on_wait)
+        if self.search is None:
+            raise RuntimeError("Campaign search is not configured.")
+        return await self.search.answer(guild_id, question, deep=deep, on_wait=on_wait)
 
     def session_status(self, guild_id: int) -> str:
         status = self.statuses.get(guild_id)
@@ -466,6 +472,12 @@ class SessionManager:
             str(transcript_path),
             str(summary_path),
         )
+        # Index the new summary and transcript; a failure only delays it to the next change.
+        if self.search is not None:
+            try:
+                await self.search.refresh(guild_id)
+            except Exception:
+                log.exception("Could not index session %s for search", session.session_id)
         return SessionArtifacts(
             session_id=session.session_id,
             transcript_markdown=transcript_markdown,

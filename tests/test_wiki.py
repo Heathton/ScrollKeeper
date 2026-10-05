@@ -61,9 +61,6 @@ class FakeLLM:
         status = "active" if entity_header.startswith("[Quest]") else ""
         return {"short_description": f"About {entity_header} [F1]", "markdown": "\n".join(dict.fromkeys(lines)), "status": status}
 
-    async def embed_text(self, text: str, on_wait=None) -> list[float]:
-        return [float(len(text) % 7 + 1), 1.0]
-
     async def answer_question(self, question: str, note_context: str, on_wait=None) -> str:
         return note_context
 
@@ -387,27 +384,6 @@ class PageLayoutTests(WikiTestCase):
         self.assertIn("A port town.", self.llm.rewrite_calls[-1]["new"])
 
 
-class EmbeddingFailureTests(WikiTestCase):
-    async def test_pages_are_saved_when_embedding_fails_and_retried_later(self) -> None:
-        entity_id = self.storage.create_entity(1, "Location", "Gullhaven")
-        self.llm.extractions = [extraction(facts=[{"entity": f"#{entity_id}", "text": "A port town.", "timestamp": ""}])]
-        working_embed = self.llm.embed_text
-
-        async def broken_embed(*_args, **_kwargs):
-            raise RuntimeError("no embedding model")
-
-        self.llm.embed_text = broken_embed
-        report = await self.wiki.process_session(1, self.session_id, "# Transcript\n\nx\n")
-        self.assertEqual(report.page_failures, [])
-        self.assertIsNotNone(self.storage.get_page(entity_id), "the rewritten page is kept")
-        self.assertEqual(report.pages_without_embedding, 1)
-        self.assertIn("not searchable yet", format_change_report(report))
-
-        self.llm.embed_text = working_embed
-        self.assertEqual(await self.wiki.embed_missing_pages(1), 0)
-        self.assertEqual(self.storage.page_ids_without_embedding(1), [])
-
-
 class ReviewCommandTests(WikiTestCase):
     async def _entity_with_page(self, name: str, *facts: str) -> Entity:
         entity_id = self.storage.create_entity(1, "Character", name)
@@ -458,12 +434,6 @@ class ReviewCommandTests(WikiTestCase):
         rendered = await self.wiki.render_entity(1, entity)
         fact = self.storage.get_entity_facts(entity.id)[0]
         self.assertIn(f"- F{fact.id} (session {self.session_id} @ 00:01:00): Runs the docks.", rendered)
-
-    async def test_answer_question_renders_citations_as_sources(self) -> None:
-        await self._entity_with_page("Varric", "Runs the docks.")
-        context = await self.wiki.answer_question(1, "Who runs the docks?")
-        self.assertIn(f"(session {self.session_id} @ 00:01:00)", context)
-        self.assertNotIn("[F", context)
 
     async def test_export_writes_linked_markdown_files(self) -> None:
         await self._entity_with_page("Varric", "Varric trusts Mira.")

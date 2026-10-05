@@ -97,6 +97,22 @@ class Page:
 
 
 @dataclass(slots=True)
+class SearchDoc:
+    """One searchable document: a wiki page (`ref_id` = entity id), a session summary or a
+    transcript chunk (`ref_id` = session id; `part` numbers a session's chunks)."""
+
+    kind: str
+    ref_id: int
+    title: str
+    body: str
+    part: int = 0
+    session_id: int | None = None
+    start_ts: str | None = None
+    id: int = 0
+    guild_id: int = 0
+
+
+@dataclass(slots=True)
 class DuplicateCandidate:
     first: Entity
     second: Entity
