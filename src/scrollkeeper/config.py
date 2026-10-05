@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -9,6 +10,16 @@ from dotenv import load_dotenv
 
 def _optional_env(name: str) -> str:
     return os.getenv(name, "").strip()
+
+
+def _json_object_env(name: str) -> dict:
+    raw = _optional_env(name)
+    if not raw:
+        return {}
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise RuntimeError(f"{name} must be a JSON object")
+    return value
 
 
 @dataclass(slots=True)
@@ -30,6 +41,7 @@ class Settings:
     health_port: int
     extract_chunk_chars: int = 24000
     wiki_export: bool = True
+    llm_extra_body: dict = field(default_factory=dict)
 
     @classmethod
     def load(cls) -> "Settings":
@@ -56,6 +68,7 @@ class Settings:
             health_port=int(os.getenv("SCROLLKEEPER_HEALTH_PORT", "8080")),
             extract_chunk_chars=int(os.getenv("SCROLLKEEPER_EXTRACT_CHUNK_CHARS", "24000")),
             wiki_export=os.getenv("SCROLLKEEPER_WIKI_EXPORT", "1").strip().lower() not in {"0", "false", "no", "off"},
+            llm_extra_body=_json_object_env("SCROLLKEEPER_LLM_EXTRA_BODY"),
         )
 
     def validate(self) -> None:

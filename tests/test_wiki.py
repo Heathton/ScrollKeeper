@@ -43,7 +43,7 @@ class FakeLLM:
             for line in block.splitlines():
                 fact_id, _, rest = line.partition(" ")
                 lines.append(f"- {rest.split(') ', 1)[-1]} {fact_id}")
-        return {"short_description": f"About {entity_header}", "markdown": "\n".join(dict.fromkeys(lines))}
+        return {"short_description": f"About {entity_header} [F1]", "markdown": "\n".join(dict.fromkeys(lines))}
 
     async def embed_text(self, text: str, on_wait=None) -> list[float]:
         return [float(len(text) % 7 + 1), 1.0]
@@ -273,6 +273,7 @@ class HelperTests(unittest.TestCase):
         self.assertIsNotNone(duplicate_reason(entity("A", "The Hand"), entity("hand")))
         self.assertIsNone(duplicate_reason(entity("Varric"), entity("Mira")))
         self.assertIsNone(duplicate_reason(entity("Al"), entity("Al Bundy")), "short tokens are too common")
+        self.assertIsNone(duplicate_reason(entity("Varric"), entity("Varric's Ledger")), "possessives are not names")
 
     def test_citations(self) -> None:
         facts = {
@@ -329,6 +330,17 @@ class SchemaRequestTests(unittest.TestCase):
         self.assertTrue(body["response_format"]["json_schema"]["strict"])
         self.assertEqual([e["name"] for e in payload["new_entities"]], ["Mira"])
         self.assertEqual(len(payload["facts"]), 1)
+
+    def test_extra_body_is_merged_into_chat_requests(self) -> None:
+        extra = {"chat_template_kwargs": {"enable_thinking": False}, "model": "ignored"}
+        service = LocalAIService(fake_settings(llm_extra_body=extra))
+        content = '{"short_description": "s", "markdown": "m"}'
+        with patch("scrollkeeper.llm.requests.post", return_value=self._response(content)) as post:
+            service._rewrite_page_sync("[Character] A", "", "", "")
+        body = post.call_args.kwargs["json"]
+        self.assertEqual(body["chat_template_kwargs"], {"enable_thinking": False})
+        self.assertEqual(body["model"], "test-model")
+        self.assertEqual(body["response_format"]["type"], "json_schema")
 
     def test_invalid_json_is_retried_once(self) -> None:
         service = LocalAIService(fake_settings())

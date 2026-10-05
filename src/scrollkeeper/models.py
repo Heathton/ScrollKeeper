@@ -105,11 +105,16 @@ class SessionArtifacts:
 
 
 _ARTICLE_PREFIX = re.compile(r"^(the|a|an)\s+")
+_APOSTROPHES = re.compile(r"['\u2019]")
 _NON_WORD = re.compile(r"[^\w\s]")
 
 
 def normalize_name(name: str) -> str:
-    """Lower-case, drop punctuation and a leading article, collapse whitespace (for alias matching)."""
-    text = _NON_WORD.sub(" ", name.casefold())
+    """Lower-case, drop punctuation and a leading article, collapse whitespace (for alias matching).
+
+    Apostrophes are removed rather than split on, so "Varric's Ledger" becomes "varrics ledger" and
+    does not contain the name "varric".
+    """
+    text = _NON_WORD.sub(" ", _APOSTROPHES.sub("", name.casefold()))
     text = " ".join(text.split())
     return _ARTICLE_PREFIX.sub("", text)

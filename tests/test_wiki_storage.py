@@ -8,7 +8,7 @@ from pathlib import Path
 from scrollkeeper.storage import MIGRATIONS, Storage
 
 
-LEGACY_SCHEMA = """
+UNVERSIONED_SCHEMA = """
 CREATE TABLE sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     guild_id INTEGER NOT NULL,
@@ -21,21 +21,8 @@ CREATE TABLE sessions (
     transcript_path TEXT,
     summary_path TEXT
 );
-CREATE TABLE campaign_notes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    guild_id INTEGER NOT NULL,
-    note_type TEXT NOT NULL,
-    title TEXT NOT NULL,
-    content TEXT NOT NULL,
-    source_session_id INTEGER,
-    metadata_json TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
 INSERT INTO sessions (guild_id, voice_channel_id, text_channel_id, started_at, status)
 VALUES (1, 2, 3, '2026-01-01T00:00:00', 'completed');
-INSERT INTO campaign_notes (guild_id, note_type, title, content, metadata_json, created_at, updated_at)
-VALUES (1, 'Character', 'Old', 'legacy', '{}', 'x', 'x');
 """
 
 
@@ -56,10 +43,10 @@ class MigrationTests(unittest.TestCase):
             with storage.connection() as conn:
                 self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], len(MIGRATIONS))
 
-    def test_legacy_database_is_migrated_without_losing_data(self) -> None:
+    def test_unversioned_database_is_migrated_without_losing_sessions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             conn = sqlite3.connect(Path(tmp) / "scrollkeeper.db")
-            conn.executescript(LEGACY_SCHEMA)
+            conn.executescript(UNVERSIONED_SCHEMA)
             conn.close()
 
             storage = Storage(Path(tmp))
@@ -67,7 +54,6 @@ class MigrationTests(unittest.TestCase):
 
             with storage.connection() as conn:
                 self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], len(MIGRATIONS))
-                self.assertEqual(conn.execute("SELECT content FROM campaign_notes").fetchone()[0], "legacy")
             self.assertIsNotNone(storage.get_session(1))
             entity_id = storage.create_entity(1, "Character", "Varric")
             storage.add_fact(1, entity_id, "Runs the docks.", "observed", session_id=1, transcript_ts="00:01:02")
@@ -80,6 +66,8 @@ class EntityStorageTests(StorageTestCase):
         self.assertEqual([e.id for e in self.storage.find_entities_by_name(1, "black hand")], [entity_id])
         self.assertEqual([e.id for e in self.storage.find_entities_by_name(1, "HAND OF SHADOWS!")], [entity_id])
         self.assertEqual(self.storage.find_entities_by_name(2, "black hand"), [])
+        ledger = self.storage.create_entity(1, "Item", "Varric’s Ledger")
+        self.assertEqual([e.id for e in self.storage.find_entities_by_name(1, "varrics ledger")], [ledger])
 
     def test_alias_equal_to_name_is_ignored(self) -> None:
         entity_id = self.storage.create_entity(1, "Character", "Varric", aliases=["varric", "Lord Varric"])

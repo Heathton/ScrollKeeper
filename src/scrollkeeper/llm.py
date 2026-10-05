@@ -299,11 +299,16 @@ Rules:
 - Set `entity` to the `#<id>` of a known entity whenever the fact is about it, even when the
   transcript uses a nickname, title or misspelling. Only propose a new entity when nothing in the
   index matches; then set `entity` to the new entity's exact `name`.
+- A new entity's `name` is the fullest proper name used (e.g. "Varric Thane"), not a nickname
+  or title; put nicknames and titles ("Old Varric", "Lord Thane") in `aliases`.
 - New entity `type` is one of: {", ".join(ENTITY_TYPES)}. Record plot events as facts on the
   entities involved, not as entities.
 - `timestamp` is the [HH:MM:SS] of the line the fact comes from.
 - Use `alias_updates` when the transcript calls a known entity by a new name or title.
 - Players speak as their characters; the speaker name is the character's name.
+- Keep claims, rumours and lies as claims: "Sela says the ledger names the killer", not "the
+  ledger names the killer". Do not turn a guess or an accusation into a fact.
+- Do not give an entity a title or role that the transcript gives to someone else.
 - Do not invent facts. If unsure, leave it out. Empty arrays are fine.
 """
         prompt = f"Known entities:\n{entity_index or '(none yet)'}\n\nTranscript part:\n{transcript_chunk}"
@@ -368,6 +373,9 @@ Be concise but useful.
         response_format: dict[str, Any] | None = None,
     ) -> str:
         body: dict[str, Any] = {
+            # Server-specific options first (e.g. disabling a reasoning model's thinking phase);
+            # the fields below always win.
+            **getattr(self.settings, "llm_extra_body", {}),
             "model": self.settings.llm_model,
             "stream": False,
             "messages": messages,

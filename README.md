@@ -57,6 +57,7 @@ All configuration comes from environment variables (a `.env` file is optional an
 Optional:
 
 - `SCROLLKEEPER_LLM_TIMEOUT_SECONDS=900` / `SCROLLKEEPER_STT_TIMEOUT_SECONDS=600`: read timeouts. They are long on purpose because the LLM host may cold-start for several minutes.
+- `SCROLLKEEPER_LLM_EXTRA_BODY=`: a JSON object merged into every chat request for server-specific options. Reasoning models can spend minutes thinking before answering (one fact-extraction call took about 4 minutes of thinking with a Qwen3 model on vLLM, and about 20 seconds without), and a proxy in front of the LLM may cut long requests. For Qwen3 on vLLM use `{"chat_template_kwargs": {"enable_thinking": false}}`.
 - `SCROLLKEEPER_WAIT_NOTICE_SECONDS=20`: if a request takes longer than this, the bot posts a "waking the inference box" notice in the Discord channel.
 - `SCROLLKEEPER_HEALTH_PORT=8080`: serves `GET /healthz` for Kubernetes liveness probes (`0` disables). It returns 503 if the bot's event loop has stalled for over a minute.
 - `SCROLLKEEPER_SUMMARY_SINGLE_PASS_MAX_CHARS=90000` sets when the bot switches from single-pass summary generation to chunked summarization.
@@ -101,7 +102,6 @@ Pushing a `v*` tag runs `.github/workflows/images.yml`, which publishes `ghcr.io
 - Session summaries are generated from the current session transcript only, so prior campaign notes are not used as summary source material.
 - Wiki pages are indexed with embeddings stored in SQLite. Transcript text is archived but intentionally excluded from retrieval.
 - The wiki pipeline after each session: (1) summary from the transcript only; (2) fact extraction per timestamped transcript chunk, given the entity index, attaching facts to existing entities or proposing new ones; (3) rewrite of every page whose facts changed. Pinned facts are authoritative. Retracting or superseding a fact rebuilds the page from the remaining facts.
-- Campaign notes from earlier versions (`campaign_notes` table) are left in the database but no longer used. Run `!reprocess-llm <session-id>` on saved sessions to build the wiki from their transcripts.
 - If the voice connection drops mid-session, the bot will try to reconnect to the same channel and continue the session.
 - `discord-ext-voice-recv` is pinned to a commit SHA in `pyproject.toml`; change it deliberately, in its own PR. If Python voice receive keeps breaking, the fallback is a small Node `@discordjs/voice` recorder feeding this pipeline.
 - The bot calls the configured speech-to-text endpoint per speaker segment after the session ends.

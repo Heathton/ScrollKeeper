@@ -12,8 +12,8 @@ from .models import FACT_KINDS, Entity, Fact, Page, SpeakerSegment, normalize_na
 
 
 # Forward-only schema migrations, applied in order; `PRAGMA user_version` records how many ran.
-# The pre-versioned tables (sessions, transcripts, legacy campaign_notes) are created above with
-# IF NOT EXISTS and count as version 0. Legacy campaign_notes are kept but no longer used (#7, #15).
+# The base tables (characters, sessions, transcript segments) are created in `_init_db` with
+# IF NOT EXISTS and count as version 0.
 MIGRATIONS: list[str] = [
     # 1: campaign wiki (entities, aliases, append-only facts, pages rebuilt from facts).
     """
@@ -127,22 +127,6 @@ class Storage:
                     transcript_text TEXT
                 );
 
-                CREATE TABLE IF NOT EXISTS campaign_notes (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    guild_id INTEGER NOT NULL,
-                    note_type TEXT NOT NULL,
-                    title TEXT NOT NULL,
-                    content TEXT NOT NULL,
-                    source_session_id INTEGER,
-                    metadata_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS note_embeddings (
-                    note_id INTEGER PRIMARY KEY REFERENCES campaign_notes(id) ON DELETE CASCADE,
-                    embedding_json TEXT NOT NULL
-                );
                 """
             )
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])

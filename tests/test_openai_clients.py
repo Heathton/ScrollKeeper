@@ -125,6 +125,19 @@ class ConfigTests(unittest.TestCase):
         settings.validate()
         self.assertEqual(settings.stt_base_url, "http://stt:9000/v1")
         self.assertEqual(settings.embed_base_url, "http://llm:8000/v1")
+        self.assertEqual(settings.llm_extra_body, {})
+
+    def test_llm_extra_body_must_be_a_json_object(self) -> None:
+        base = {"SCROLLKEEPER_DATA_DIR": tempfile.mkdtemp()}
+        good = {**base, "SCROLLKEEPER_LLM_EXTRA_BODY": '{"chat_template_kwargs": {"enable_thinking": false}}'}
+        with patch.dict("os.environ", good, clear=True), patch("scrollkeeper.config.load_dotenv"):
+            self.assertEqual(
+                Settings.load().llm_extra_body, {"chat_template_kwargs": {"enable_thinking": False}}
+            )
+        bad = {**base, "SCROLLKEEPER_LLM_EXTRA_BODY": "[1]"}
+        with patch.dict("os.environ", bad, clear=True), patch("scrollkeeper.config.load_dotenv"):
+            with self.assertRaises(RuntimeError):
+                Settings.load()
 
 
 class HealthTests(unittest.TestCase):

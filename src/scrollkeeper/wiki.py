@@ -231,7 +231,7 @@ class CampaignWiki:
             if not result["markdown"]:
                 raise RuntimeError(f"The LLM returned an empty page for {entity.canonical_name}.")
             markdown = result["markdown"]
-            short_description = result["short_description"] or short_description
+            short_description = _strip_citations(result["short_description"]) or short_description
 
         embedding = await self.llm.embed_text(page_embedding_text(entity, markdown), on_wait=on_wait)
         await asyncio.to_thread(self.storage.save_page, entity.id, markdown, sorted(active_ids), embedding)
@@ -514,6 +514,10 @@ def _unique_file_names(entities: list[Entity]) -> dict[int, str]:
         used.add(name.casefold())
         names[entity.id] = name
     return names
+
+
+def _strip_citations(text: str) -> str:
+    return re.sub(r"\s*" + CITATION_RE.pattern, "", text).strip()
 
 
 def _yaml_escape(text: str) -> str:
