@@ -25,6 +25,12 @@ ScrollKeeper is a Discord bot for tabletop campaigns. It can join a voice channe
 - `!reprocess-session [session-id]`: rerun speech-to-text + summary/note generation from saved audio
 - `!reprocess-llm [session-id]`: rerun summary/note generation only from existing transcript text (skips speech-to-text)
 
+## Prerequisites
+
+- Python 3.11+ (`pip install -e .`) for running tests and the bot directly; `ffmpeg` and `libopus` if you run it outside a container.
+- Docker with the compose plugin for building images and the local stack.
+- An OpenAI-compatible LLM endpoint (see Configuration).
+
 ## Configuration
 
 All configuration comes from environment variables (a `.env` file is optional and only for local development). Copy `.env.example` for the full list. Required:
