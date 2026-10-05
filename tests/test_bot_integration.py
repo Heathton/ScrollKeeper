@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import types
 import unittest
 from pathlib import Path
@@ -390,6 +391,21 @@ class WikiCommandTests(unittest.IsolatedAsyncioTestCase):
         ctx.author = types.SimpleNamespace(id=55, guild_permissions=types.SimpleNamespace(manage_guild=False))
         await self.bot.get_command("reindex").callback(ctx)
         self.assertIn("Manage Server", ctx.replies[0])
+
+    async def test_any_member_can_preview_a_journal_import(self) -> None:
+        raw = json.dumps([{"type": "handout", "id": "n1", "name": "Varric", "folder": "NPC", "notes": "<p>Runs the docks.</p>"}])
+
+        class Attachment:
+            size = len(raw)
+
+            async def read(self) -> bytes:
+                return raw.encode()
+
+        ctx = FakeCtx(guild=self.guild)
+        ctx.author = types.SimpleNamespace(id=55, guild_permissions=types.SimpleNamespace(manage_guild=False))
+        ctx.message = types.SimpleNamespace(attachments=[Attachment()])
+        await self.bot.get_command("import-journal").callback(ctx, options="preview")
+        self.assertIn("Journal import preview", ctx.sent[0])
 
     async def test_reindex_reports_documents_without_embedding(self) -> None:
         entity_id = self.storage.create_entity(1, "Character", "Varric")
