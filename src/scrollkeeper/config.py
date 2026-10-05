@@ -22,6 +22,16 @@ def _optional_env(name: str) -> str:
     return os.getenv(name, "").strip()
 
 
+def _json_list_env(name: str) -> list:
+    raw = _optional_env(name)
+    if not raw:
+        return []
+    value = json.loads(raw)
+    if not isinstance(value, list):
+        raise RuntimeError(f"{name} must be a JSON array")
+    return value
+
+
 def _json_object_env(name: str) -> dict:
     raw = _optional_env(name)
     if not raw:
@@ -59,6 +69,8 @@ class Settings:
     embed_threads: int = 2
     # The chat model's context length in tokens; 0 asks the server (vLLM's `max_model_len`).
     llm_context_tokens: int = 0
+    # Journal import folder rules checked before the defaults (`journal.parse_rules` reads them).
+    journal_rules: list = field(default_factory=list)
 
     @classmethod
     def load(cls) -> "Settings":
@@ -91,6 +103,7 @@ class Settings:
             embed_model_dir=Path(path).resolve() if (path := _optional_env("SCROLLKEEPER_EMBED_MODEL_DIR")) else None,
             embed_threads=int(os.getenv("SCROLLKEEPER_EMBED_THREADS", "2")),
             llm_context_tokens=int(os.getenv("SCROLLKEEPER_LLM_CONTEXT_TOKENS", "0") or 0),
+            journal_rules=_json_list_env("SCROLLKEEPER_JOURNAL_RULES"),
         )
 
     def validate(self) -> None:

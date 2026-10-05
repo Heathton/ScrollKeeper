@@ -9,6 +9,8 @@ from pathlib import Path
 ENTITY_TYPES = ("Character", "Faction", "Location", "Item", "Mystery", "PointOfInterest", "Quest")
 FACT_KINDS = ("observed", "pinned", "imported")
 QUEST_STATUSES = ("offered", "active", "completed", "failed", "abandoned")
+# `facts.source_ref` of facts imported from a VTT journal entry: this prefix plus the entry's id.
+JOURNAL_SOURCE_PREFIX = "journal:"
 
 
 @dataclass(slots=True)
@@ -83,7 +85,7 @@ class Fact:
         return self.superseded_by is None and self.retracted_at is None
 
     def source_label(self) -> str:
-        """Short human-readable provenance, e.g. `session 12 @ 01:23:45`, `pinned`, `journal:abc`."""
+        """Short human-readable provenance, e.g. `session 12 @ 01:23:45`, `pinned`, `journal`."""
         if self.kind == "pinned":
             return "pinned"
         if self.session_id is not None:
@@ -91,6 +93,8 @@ class Fact:
             if self.transcript_ts:
                 label += f" @ {self.transcript_ts}"
             return label
+        if self.source_ref and self.source_ref.startswith(JOURNAL_SOURCE_PREFIX):
+            return "journal"  # The entry id itself (`journal:<VTT id>`) means nothing to a reader.
         if self.source_ref:
             return self.source_ref
         return self.kind

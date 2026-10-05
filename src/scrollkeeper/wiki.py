@@ -10,6 +10,7 @@ the page was built from is retracted or superseded, the page is rebuilt from scr
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import re
 import shutil
@@ -77,6 +78,12 @@ class CampaignWiki:
         self.search = search
         self.export_root = storage.data_dir / "wiki"
         self._export_lock = threading.Lock()
+        self._campaign_locks: dict[int, asyncio.Lock] = {}
+
+    def campaign_lock(self, campaign_id: int) -> asyncio.Lock:
+        """Held while facts are applied, so session processing and a journal import (which
+        takes it per entry and per page) don't interleave their changes to one campaign."""
+        return self._campaign_locks.setdefault(campaign_id, asyncio.Lock())
 
     # --- Session pipeline ---------------------------------------------------------------
 
@@ -93,6 +100,17 @@ class CampaignWiki:
         Re-running for the same session retracts that session's earlier observed facts first, so
         `!reprocess-llm` replaces rather than duplicates them.
         """
+        async with self.campaign_lock(campaign_id):
+            return await self._process_session(campaign_id, session_id, timed_transcript, on_wait, on_progress)
+
+    async def _process_session(
+        self,
+        campaign_id: int,
+        session_id: int,
+        timed_transcript: str,
+        on_wait: WaitNotifier | None,
+        on_progress: ProgressCallback | None,
+    ) -> WikiChangeReport:
         report = WikiChangeReport()
         await self.ensure_player_characters(campaign_id)
         retracted, _ = await asyncio.to_thread(
@@ -107,7 +125,7 @@ class CampaignWiki:
             entities = await asyncio.to_thread(self.storage.list_entities, campaign_id)
             index_text = await asyncio.to_thread(format_entity_index, entities, chunk)
             payload = await self.llm.extract_facts(index_text, chunk, on_wait=on_wait)
-            await self._apply_extraction(campaign_id, session_id, payload, chunk, result, on_wait=on_wait)
+            await self.apply_extraction(campaign_id, session_id, payload, chunk, result, on_wait=on_wait)
         report.facts_added = result.facts_added
         report.renamed = result.renamed
 
@@ -151,7 +169,7 @@ class CampaignWiki:
             self.storage.list_entities(campaign_id), self.storage.list_registered_characters(campaign_id)
         )
 
-    async def _apply_extraction(
+    async def apply_extraction(
         self,
         campaign_id: int,
         session_id: int | None,
@@ -159,8 +177,13 @@ class CampaignWiki:
         chunk: str,
         result: "ExtractionResult",
         on_wait: WaitNotifier | None = None,
+        kind: str = "observed",
+        source_ref: str | None = None,
     ) -> None:
         """Store one extraction result, resolving every fact's entity reference.
+
+        Facts are stored as `kind` (`imported` for journal text, with `source_ref` naming the
+        journal entry).
 
         Name reveals are applied first, so a proposal under the revealed name finds the renamed
         entity. Proposed entities are created only when a fact refers to them, and only after
@@ -195,9 +218,10 @@ class CampaignWiki:
                 campaign_id,
                 entity_id,
                 fact["text"],
-                "observed",
+                kind,
                 session_id,
                 timestamp if TIMESTAMP_RE.match(timestamp) else None,
+                source_ref,
             )
             result.touched.add(entity_id)
             result.facts_added += 1
@@ -363,14 +387,20 @@ class CampaignWiki:
         campaign_id: int,
         on_wait: WaitNotifier | None = None,
         on_progress: ProgressCallback | None = None,
+        lock: asyncio.Lock | None = None,
     ) -> list[str]:
-        """Rewrite every page whose facts changed. Returns names of entities whose rewrite failed."""
+        """Rewrite every page whose facts changed. Returns names of entities whose rewrite failed.
+
+        With `lock`, each page is rewritten while holding it (a long import lets a session's
+        wiki update run between pages).
+        """
         stale = await asyncio.to_thread(self.stale_entity_ids, campaign_id)
         failures: list[str] = []
         for index, entity_id in enumerate(stale, start=1):
             _progress(on_progress, f"Rewriting wiki pages ({index}/{len(stale)}).")
             try:
-                await self.refresh_page(campaign_id, entity_id, on_wait=on_wait)
+                async with lock or contextlib.nullcontext():
+                    await self.refresh_page(campaign_id, entity_id, on_wait=on_wait)
             except Exception:
                 log.exception("Could not rewrite the wiki page for entity %s", entity_id)
                 entity = await asyncio.to_thread(self.storage.get_entity, campaign_id, entity_id)
