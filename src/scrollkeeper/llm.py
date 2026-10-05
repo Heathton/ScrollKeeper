@@ -10,7 +10,7 @@ from typing import Any, Awaitable, Callable
 import requests
 
 from .config import Settings
-from .models import ENTITY_TYPES
+from .models import ENTITY_TYPES, QUEST_STATUSES
 
 
 log = logging.getLogger(__name__)
@@ -317,11 +317,12 @@ Rules:
   entities involved, not as entities.
 - A Quest is a task, job or goal the party is offered or takes on (e.g. "Recover Varric's
   Ledger"); name it with a short imperative title. Record its giver, objective, reward and every
-  status change (offered, accepted, progress, completed, failed, abandoned) as facts on the Quest.
-  Also record the link on each entity involved (e.g. on the giver: "Varric Thane gave the party
-  the quest to recover his ledger").
-- A fact that matters to several entities is recorded once for each of them, phrased from that
-  entity's side (a murder: "Varric Thane paid the Black Tide to murder Aldous Penn" on Varric,
+  status change (offered, accepted, progress, completed, failed, abandoned) as facts on the Quest
+  only, naming every entity involved by its full name (e.g. "Varric Thane offered the party 200
+  gold to recover his ledger from the Black Tide"). Other pages link to the quest from those
+  names, so do not repeat quest progress on the other entities.
+- Any other fact that matters to several entities is recorded once for each of them, phrased from
+  that entity's side (a murder: "Varric Thane paid the Black Tide to murder Aldous Penn" on Varric,
   "Aldous Penn was murdered on Varric Thane's orders" on Aldous Penn).
 - `timestamp` is the [HH:MM:SS] of the line the fact comes from.
 - Use `alias_updates` when the transcript calls a known entity by a new name or title.
@@ -388,6 +389,8 @@ Rules:
   layout (no heading), then use exactly the layout's `##` headings, in that order. Leave out a
   section when no fact supports it; never write empty sections or add headings of your own.
 - `short_description` is one line (under 100 characters) saying what the entity is.
+- `status`: for a Quest, its current status (offered, active, completed, failed or abandoned);
+  for any other entity, an empty string.
 """
         instructions += f"\nPage layout:\n{template}\n" if template else ""
         prompt = (
@@ -400,6 +403,7 @@ Rules:
         return {
             "short_description": str(payload.get("short_description", "")).strip(),
             "markdown": str(payload.get("markdown", "")).strip(),
+            "status": str(payload.get("status", "")).strip().lower(),
         }
 
     def _answer_question_sync(self, question: str, note_context: str) -> str:
@@ -564,10 +568,11 @@ ENTITY_MATCH_SCHEMA: dict[str, Any] = {
 PAGE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["short_description", "markdown"],
+    "required": ["short_description", "markdown", "status"],
     "properties": {
         "short_description": {"type": "string"},
         "markdown": {"type": "string"},
+        "status": {"type": "string", "enum": ["", *QUEST_STATUSES]},
     },
 }
 

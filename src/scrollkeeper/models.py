@@ -8,6 +8,7 @@ from pathlib import Path
 
 ENTITY_TYPES = ("Character", "Faction", "Location", "Item", "Mystery", "PointOfInterest", "Quest")
 FACT_KINDS = ("observed", "pinned", "imported")
+QUEST_STATUSES = ("offered", "active", "completed", "failed", "abandoned")
 
 
 @dataclass(slots=True)
@@ -30,6 +31,7 @@ class Entity:
     aliases: list[str] = field(default_factory=list)
     short_description: str = ""
     merged_into: int | None = None
+    status: str = ""  # Quests only: offered, active, completed, failed or abandoned.
 
     def names(self) -> list[str]:
         return [self.canonical_name, *self.aliases]

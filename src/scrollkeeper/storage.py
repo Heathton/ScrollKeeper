@@ -24,6 +24,7 @@ MIGRATIONS: list[str] = [
         canonical_name TEXT NOT NULL,
         name_norm TEXT NOT NULL,
         short_description TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT '',
         created_session_id INTEGER REFERENCES sessions(id) ON DELETE SET NULL,
         merged_into INTEGER REFERENCES entities(id),
         created_at TEXT NOT NULL,
@@ -436,6 +437,29 @@ class Storage:
             self._insert_alias(conn, entity_id, new_name, old_name)
             self._touch_entity(conn, entity_id)
 
+    def set_entity_status(self, entity_id: int, status: str) -> None:
+        with self.connection() as conn:
+            conn.execute("UPDATE entities SET status = ? WHERE id = ?", (status, entity_id))
+
+    def active_facts_by_type(self, guild_id: int, entity_type: str) -> dict[int, list[str]]:
+        """Active fact texts of every live entity of one type, keyed by entity id."""
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT f.entity_id, f.text
+                FROM facts f
+                JOIN entities e ON e.id = f.entity_id
+                WHERE e.guild_id = ? AND e.type = ? AND e.merged_into IS NULL
+                  AND f.superseded_by IS NULL AND f.retracted_at IS NULL
+                ORDER BY f.id
+                """,
+                (guild_id, entity_type),
+            ).fetchall()
+        result: dict[int, list[str]] = {}
+        for row in rows:
+            result.setdefault(int(row["entity_id"]), []).append(row["text"])
+        return result
+
     def set_entity_short_description(self, entity_id: int, short_description: str) -> None:
         with self.connection() as conn:
             conn.execute(
@@ -748,6 +772,7 @@ class Storage:
             aliases=[alias["alias"] for alias in aliases],
             short_description=row["short_description"] or "",
             merged_into=row["merged_into"],
+            status=row["status"] or "",
         )
 
 

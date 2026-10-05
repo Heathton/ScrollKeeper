@@ -58,7 +58,8 @@ class FakeLLM:
             for line in block.splitlines():
                 fact_id, _, rest = line.partition(" ")
                 lines.append(f"- {rest.split(') ', 1)[-1]} {fact_id}")
-        return {"short_description": f"About {entity_header} [F1]", "markdown": "\n".join(dict.fromkeys(lines))}
+        status = "active" if entity_header.startswith("[Quest]") else ""
+        return {"short_description": f"About {entity_header} [F1]", "markdown": "\n".join(dict.fromkeys(lines)), "status": status}
 
     async def embed_text(self, text: str, on_wait=None) -> list[float]:
         return [float(len(text) % 7 + 1), 1.0]
@@ -337,9 +338,31 @@ class PageLayoutTests(WikiTestCase):
         expected = [PAGE_LAYOUTS["Quest"], PAGE_LAYOUTS["Character"], PLAYER_CHARACTER_LAYOUT]
         self.assertEqual(layouts, [render_layout(layout) for layout in expected])
         self.assertIn("- `## Progress`: steps taken, in session order.", layouts[0])
-        for entity_type in ("Character", "Faction", "Location", "Item", "PointOfInterest"):
-            self.assertIn("Quests", [heading for heading, _ in PAGE_LAYOUTS[entity_type][1]])
+        for entity_type, (_, sections) in PAGE_LAYOUTS.items():
+            self.assertNotIn("Quests", [heading for heading, _ in sections], "quest lists are built in code")
         self.assertEqual(set(PAGE_LAYOUTS), set(ENTITY_TYPES))
+
+    async def test_linked_quests_are_listed_from_current_quest_data(self) -> None:
+        varric = self.storage.create_entity(1, "Character", "Varric Thane", aliases=["Old Varric"])
+        sela = self.storage.create_entity(1, "Character", "Sela")
+        quest = self.storage.create_entity(1, "Quest", "Recover the Ledger")
+        self.storage.add_fact(1, varric, "Varric Thane runs the docks.", "observed", session_id=self.session_id)
+        self.storage.add_fact(1, quest, "Old Varric offered 200 gold for the ledger.", "observed", session_id=self.session_id)
+        await self.wiki.refresh_page(1, varric)
+        await self.wiki.refresh_page(1, quest)
+        self.assertEqual(self.storage.get_entity(1, quest).status, "active", "status comes from the quest page rewrite")
+        self.assertEqual(self.wiki.linked_quests(1), {varric: [self.storage.get_entity(1, quest)]})
+
+        rendered = await self.wiki.render_entity(1, self.storage.get_entity(1, varric))
+        self.assertIn(f"## Quests\n- Recover the Ledger (#{quest}): active", rendered)
+        self.assertNotIn("## Quests", await self.wiki.render_entity(1, self.storage.get_entity(1, sela)))
+
+        # A status change shows on Varric's page at once, without rewriting it.
+        self.storage.set_entity_status(quest, "abandoned")
+        rendered = await self.wiki.render_entity(1, self.storage.get_entity(1, varric))
+        self.assertIn(f"- Recover the Ledger (#{quest}): abandoned", rendered)
+        exported = (self.wiki.export(1) / "Character" / "Varric Thane.md").read_text(encoding="utf-8")
+        self.assertIn(f"- [[Recover the Ledger|Recover the Ledger]] (#{quest}): abandoned", exported)
 
     def test_copied_guidance_is_trimmed_from_headings(self) -> None:
         markdown = "Intro.\n## Status: alive, dead or missing\n## Relationships (with others)\n## Status Quo Ante\n## Other"
@@ -451,6 +474,8 @@ class HelperTests(unittest.TestCase):
         thalrin = Entity(3, 1, "Character", "Thalrin Vey", [], "Alchemist")
         self.assertEqual(mentioned_entity_ids([thalrin], "Let's see Thalren again."), {3})
         self.assertEqual(mentioned_entity_ids([thalrin], "Let's see the alchemist."), set())
+        penn = Entity(4, 1, "Character", "Aldous Penn")
+        self.assertEqual(mentioned_entity_ids([penn], "Sela, Aldous Penn's daughter.", fuzzy=False), {4})
 
     def test_match_candidates(self) -> None:
         varric = Entity(1, 1, "Character", "Varric Thane", ["Old Varric"])
@@ -557,7 +582,7 @@ class SchemaRequestTests(unittest.TestCase):
         responses = [self._response("{not json"), self._response('{"short_description": "s", "markdown": "m"}')]
         with patch("scrollkeeper.llm.requests.post", side_effect=responses) as post:
             page = service._rewrite_page_sync("[Character] A", "", "", "[F1] (pinned) x")
-        self.assertEqual(page, {"short_description": "s", "markdown": "m"})
+        self.assertEqual(page, {"short_description": "s", "markdown": "m", "status": ""})
         self.assertEqual(post.call_count, 2)
 
         with patch("scrollkeeper.llm.requests.post", side_effect=[self._response("{"), self._response("[")]):

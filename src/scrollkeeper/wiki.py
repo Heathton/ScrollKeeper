@@ -400,6 +400,7 @@ class CampaignWiki:
         layout = page_layout(entity, await asyncio.to_thread(self._is_player_character, guild_id, entity))
         markdown = page.markdown if page else ""
         short_description = entity.short_description
+        status = entity.status
         for batch in _batch_facts([fact for fact in new_facts if fact.kind != "pinned"] or [None]):
             result = await self.llm.rewrite_page(
                 entity_header(entity),
@@ -412,13 +413,29 @@ class CampaignWiki:
             if not result["markdown"]:
                 raise RuntimeError(f"The LLM returned an empty page for {entity.canonical_name}.")
             markdown = normalize_headings(result["markdown"], layout)
+            status = result.get("status", "") if entity.type == "Quest" else ""
             short_description = _strip_citations(result["short_description"]) or short_description
 
         embedding = await self.llm.embed_text(page_embedding_text(entity, markdown), on_wait=on_wait)
         await asyncio.to_thread(self.storage.save_page, entity.id, markdown, sorted(active_ids), embedding)
         if short_description != entity.short_description:
             await asyncio.to_thread(self.storage.set_entity_short_description, entity.id, short_description)
+        if status and status != entity.status:
+            await asyncio.to_thread(self.storage.set_entity_status, entity.id, status)
         return True
+
+    def linked_quests(self, guild_id: int) -> dict[int, list[Entity]]:
+        """Quests each entity is involved in: those whose active facts name it (name or alias)."""
+        entities = self.storage.list_entities(guild_id)
+        quests = {entity.id: entity for entity in entities if entity.type == "Quest"}
+        links: dict[int, list[Entity]] = {}
+        for quest_id, texts in self.storage.active_facts_by_type(guild_id, "Quest").items():
+            if quest_id not in quests:
+                continue
+            for entity_id in sorted(mentioned_entity_ids(entities, "\n".join(texts), fuzzy=False)):
+                if entity_id != quest_id:
+                    links.setdefault(entity_id, []).append(quests[quest_id])
+        return links
 
     async def rebuild_all_pages(
         self,
@@ -507,6 +524,9 @@ class CampaignWiki:
         else:
             lines.append("_No facts recorded._")
             cited = []
+        quests = (await asyncio.to_thread(self.linked_quests, guild_id)).get(entity.id, [])
+        if quests:
+            lines.extend(["", *quest_list(quests)])
         by_id = {fact.id: fact for fact in facts}
         sources = [by_id[fact_id] for fact_id in cited if fact_id in by_id]
         if sources:
@@ -521,8 +541,12 @@ class CampaignWiki:
             return "I do not have any campaign wiki pages yet."
         fact_ids = sorted({fact_id for _, page in results for fact_id in cited_fact_ids(page.markdown)})
         facts = await asyncio.to_thread(self.storage.get_facts, guild_id, fact_ids)
+        links = await asyncio.to_thread(self.linked_quests, guild_id)
         context = "\n\n".join(
-            f"{entity_header(entity)}\n{render_citations(page.markdown, facts)}" for entity, page in results
+            "\n".join(
+                [entity_header(entity), render_citations(page.markdown, facts), *quest_list(links.get(entity.id, []))]
+            )
+            for entity, page in results
         )
         return await self.llm.answer_question(question, context, on_wait=on_wait)
 
@@ -543,12 +567,16 @@ class CampaignWiki:
         facts = self.storage.get_facts(guild_id, fact_ids)
         entities = [entity for entity, _ in pages]
         file_names = _unique_file_names(entities)
+        links = self.linked_quests(guild_id)
         if target.exists():
             shutil.rmtree(target)
         for entity, page in pages:
             folder = target / entity.type
             folder.mkdir(parents=True, exist_ok=True)
             body = link_entity_names(render_citations(page.markdown, facts), entity, entities, file_names)
+            quests = quest_list(links.get(entity.id, []), file_names)
+            if quests:
+                body = body.rstrip() + "\n\n" + "\n".join(quests)
             frontmatter = ["---", f"type: {entity.type}", f"id: {entity.id}"]
             if entity.aliases:
                 frontmatter.append("aliases:")
@@ -566,15 +594,11 @@ class CampaignWiki:
 # --- Page layouts ----------------------------------------------------------------------------
 
 # One layout per entity type: what the opening paragraph covers, then `##` sections (heading,
-# guidance) in order, each written only when facts support it. Changing a layout affects pages as
+# guidance) in order, each written only when facts support it. Quest details live on the Quest
+# page; other pages get a "Quests" list built from current data when shown (`linked_quests`). Changing a layout affects pages as
 # they are next rewritten; `!rebuild-pages` applies it to every page at once.
 Layout = tuple[str, list[tuple[str, str]]]
 
-_QUESTS = (
-    "Quests",
-    "only Quest entities the facts name, that this entity gave, is the target of, or is involved in; "
-    "one bullet each with the quest name and its status. Do not turn other plot threads into quests",
-)
 _OPEN_QUESTIONS = ("Open Questions", "unresolved questions raised by the facts")
 _STATUS_RULE = "only what the facts state; leave out anything unknown"
 
@@ -584,7 +608,6 @@ PAGE_LAYOUTS: dict[str, Layout] = {
         [
             ("Appearance & Personality", "how they look and behave"),
             ("Relationships", "with other characters, factions and the party"),
-            _QUESTS,
             ("History", "what happened involving them, in session order"),
             ("Status", f"alive, dead or missing; current location; {_STATUS_RULE}"),
             _OPEN_QUESTIONS,
@@ -597,7 +620,6 @@ PAGE_LAYOUTS: dict[str, Layout] = {
             ("Allies & Enemies", "other factions and characters"),
             ("Activities", "what they do and have done"),
             ("Relationship with the Party", "how they treat the party and why"),
-            _QUESTS,
             _OPEN_QUESTIONS,
         ],
     ),
@@ -606,7 +628,6 @@ PAGE_LAYOUTS: dict[str, Layout] = {
         [
             ("Notable Places", "buildings and sites within it"),
             ("Notable People", "who lives or works there"),
-            _QUESTS,
             ("History", "what happened there, in session order"),
             ("Current State", _STATUS_RULE),
             _OPEN_QUESTIONS,
@@ -617,7 +638,6 @@ PAGE_LAYOUTS: dict[str, Layout] = {
         [
             ("Properties & Effects", "what it does, including curses"),
             ("Provenance", "where it came from and who held it before"),
-            _QUESTS,
             ("History", "what happened involving it, in session order"),
             _OPEN_QUESTIONS,
         ],
@@ -635,7 +655,6 @@ PAGE_LAYOUTS: dict[str, Layout] = {
         [
             ("Features", "what is there"),
             ("Dangers", "threats and hazards"),
-            _QUESTS,
             ("History", "what happened there, in session order"),
             _OPEN_QUESTIONS,
         ],
@@ -654,7 +673,6 @@ PLAYER_CHARACTER_LAYOUT: Layout = (
     "who this player character is in the story so far",
     [
         ("Relationships", "with other characters, factions and the party"),
-        _QUESTS,
         ("History", "what happened involving them, in session order"),
     ],
 )
@@ -730,9 +748,22 @@ def format_entity_index(entities: list[Entity], text: str) -> str:
     return "\n".join(lines)
 
 
-def mentioned_entity_ids(entities: list[Entity], text: str) -> set[int]:
-    """Entities whose name or alias appears in `text`, exactly or with a near spelling
-    (speech-to-text misspellings such as "Varic" for "Varric")."""
+def quest_list(quests: list[Entity], file_names: dict[int, str] | None = None) -> list[str]:
+    """`## Quests` section listing linked quests and their current status (Obsidian links if given)."""
+    if not quests:
+        return []
+    lines = ["## Quests"]
+    for quest in quests:
+        name = quest.canonical_name
+        if file_names and quest.id in file_names:
+            name = f"[[{file_names[quest.id]}|{name}]]"
+        lines.append(f"- {name} (#{quest.id}): {quest.status or 'status unknown'}")
+    return lines
+
+
+def mentioned_entity_ids(entities: list[Entity], text: str, fuzzy: bool = True) -> set[int]:
+    """Entities whose name or alias appears in `text`, exactly or (with `fuzzy`) with a near
+    spelling (speech-to-text misspellings such as "Varic" for "Varric")."""
     tokens = normalize_name(text).split()
     grams: dict[int, set[str]] = {
         n: {" ".join(tokens[i : i + n]) for i in range(len(tokens) - n + 1)} for n in range(1, 5)
@@ -746,9 +777,11 @@ def mentioned_entity_ids(entities: list[Entity], text: str) -> set[int]:
     for entity in entities:
         for name in {normalize_name(name) for name in entity.names()} - {""}:
             size = len(name.split())
-            if f" {name} " in joined:
+            if f" {name} " in joined or f" {name}s " in joined:  # also the possessive ("Penn's" -> "penns")
                 mentioned.add(entity.id)
                 break
+            if not fuzzy:
+                continue
             # The whole name with a near spelling, or one distinctive word of a longer name
             # ("Thalren" for "Thalrin Vey").
             targets = [name] if size <= 4 and len(name) >= 4 else []
