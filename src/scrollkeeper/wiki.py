@@ -49,6 +49,9 @@ TITLE_WORDS = frozenset(
 TIMESTAMP_RE = re.compile(r"^\d{1,2}:\d{2}:\d{2}$")
 ENTITY_ID_RE = re.compile(r"^#?(\d+)$")
 CITATION_RE = re.compile(r"\[(F\d+(?:\s*,\s*F\d+)*)\]")
+# Entity types whose names are descriptive titles ("Recover Varric's Ledger"), not words spoken at
+# the table, so they are left out of the spelling glossary.
+UNSPOKEN_NAME_TYPES = frozenset({"Quest", "Mystery"})
 
 
 @dataclass(slots=True)
@@ -140,6 +143,13 @@ class CampaignWiki:
             return created
 
         return await asyncio.to_thread(ensure)
+
+    def spelling_glossary(self, guild_id: int) -> list[str]:
+        """Names (blocking) the summarizer should spell correctly. Names only, no descriptions or
+        facts, so a summary still comes from its own transcript alone."""
+        return spelling_glossary(
+            self.storage.list_entities(guild_id), self.storage.list_registered_characters(guild_id)
+        )
 
     async def _apply_extraction(
         self,
@@ -717,6 +727,20 @@ def page_embedding_text(entity: Entity, markdown: str) -> str:
 
 def format_fact(fact: Fact) -> str:
     return f"[F{fact.id}] ({fact.source_label()}) {fact.text}"
+
+
+def spelling_glossary(entities: list[Entity], registered_characters: list[str]) -> list[str]:
+    """Registered character names plus entity names and aliases, deduplicated, sorted."""
+    names: dict[str, str] = {}
+    for name in registered_characters:
+        names.setdefault(normalize_name(name), name.strip())
+    for entity in entities:
+        if entity.type in UNSPOKEN_NAME_TYPES:
+            continue
+        for name in entity.names():
+            names.setdefault(normalize_name(name), name.strip())
+    names.pop("", None)
+    return sorted(names.values(), key=str.casefold)
 
 
 def format_entity_index(entities: list[Entity], text: str) -> str:

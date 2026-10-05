@@ -7,7 +7,7 @@ from pathlib import Path
 
 from scrollkeeper.models import SpeakerSegment, TimedText, TranscriptionResult
 from scrollkeeper.storage import Storage
-from scrollkeeper.transcript import merge_lines, render_compact, render_timed, split_utterances
+from scrollkeeper.transcript import TranscriptLine, compact_line, merge_lines, render_compact, render_timed, split_at_pauses, split_utterances
 
 
 def words(*items: tuple[str, float, float]) -> list[TimedText]:
@@ -86,6 +86,9 @@ class MergeLinesTests(unittest.TestCase):
             ],
         )
         self.assertEqual(
+            [(line.ended_at - self.start).total_seconds() for line in lines], [3.5, 6.0, 11.0, 71.0, 121.0]
+        )
+        self.assertEqual(
             render_timed(lines[:2], self.start),
             "# Transcript\n\n[00:00:01] Mira: Who goes there? Show yourself.\n[00:00:04] Varric: A friend. Mostly.\n",
         )
@@ -99,6 +102,51 @@ class MergeLinesTests(unittest.TestCase):
         self.assertEqual([line.text for line in merge_lines(self.storage.get_session_segments(self.session_id))], ["Old clip text."])
         self.add("Mira", 1.0, 2.0, "New track text.")
         self.assertEqual([line.text for line in merge_lines(self.storage.get_session_segments(self.session_id))], ["New track text."])
+
+
+def timeline(*gaps: float, text: str = "x" * 98) -> list[TranscriptLine]:
+    """Lines of 100 rendered chars (`A: ` + text... + blank line), each `gap` seconds after the last ended."""
+    lines, at = [], datetime(2026, 1, 1, 20, 0, 0)
+    for gap in gaps:
+        at += timedelta(seconds=gap)
+        lines.append(TranscriptLine("A", at, text[: len(text) - 3], at + timedelta(seconds=5)))
+        at += timedelta(seconds=5)
+    return lines
+
+
+class SplitAtPausesTests(unittest.TestCase):
+    def test_short_transcript_is_one_part(self) -> None:
+        lines = timeline(0, 1, 1)
+        self.assertEqual(split_at_pauses(lines, 1000), [lines])
+        self.assertEqual(split_at_pauses([], 1000), [])
+
+    def test_cuts_at_the_longest_pause_near_the_balanced_cut(self) -> None:
+        # 10 lines of 100 chars, at most 600 per part: two parts of about 500. Cuts may fall
+        # between 375 and 600 chars, i.e. before line 4, 5 or 6; the long pause is before line 6.
+        gaps = [0, 1, 1, 1, 1, 1, 90, 1, 1, 1]
+        gaps[2] = 500  # outside the window: ignored
+        lines = timeline(*gaps)
+        self.assertEqual(len(compact_line(lines[0])) + 2, 100)
+        parts = split_at_pauses(lines, 600)
+        self.assertEqual([len(part) for part in parts], [6, 4])
+        self.assertEqual(sum(parts, []), lines)
+
+    def test_without_pauses_the_cut_is_balanced(self) -> None:
+        parts = split_at_pauses(timeline(*[1] * 10), 600)
+        self.assertEqual([len(part) for part in parts], [5, 5])
+
+    def test_parts_never_exceed_the_limit(self) -> None:
+        lines = timeline(*([1, 1, 1, 200] * 12))
+        for limit in (250, 450, 1000, 2000):
+            parts = split_at_pauses(lines, limit)
+            self.assertEqual(sum(parts, []), lines)
+            self.assertTrue(all(sum(len(compact_line(line)) + 2 for line in part) <= limit for part in parts), limit)
+
+    def test_a_line_longer_than_the_limit_is_a_part_of_its_own(self) -> None:
+        lines = timeline(0, 1, 1)
+        lines[1].text = "y" * 1000
+        parts = split_at_pauses(lines, 300)
+        self.assertEqual([len(part) for part in parts], [1, 1, 1])
 
 
 if __name__ == "__main__":

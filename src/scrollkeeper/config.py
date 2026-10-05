@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -9,6 +10,13 @@ from dotenv import load_dotenv
 
 from .embeddings import DEFAULT_EMBED_MODEL, EMBEDDING_MODELS
 
+
+log = logging.getLogger(__name__)
+# Settings that no longer have an effect, and what replaced them.
+RETIRED_SETTINGS = {
+    "SCROLLKEEPER_SUMMARY_SINGLE_PASS_MAX_CHARS": "SCROLLKEEPER_LLM_CONTEXT_TOKENS",
+    "SCROLLKEEPER_SUMMARY_CHUNK_CHARS": "SCROLLKEEPER_LLM_CONTEXT_TOKENS",
+}
 
 def _optional_env(name: str) -> str:
     return os.getenv(name, "").strip()
@@ -49,6 +57,8 @@ class Settings:
     embed_model: str = DEFAULT_EMBED_MODEL
     embed_model_dir: Path | None = None
     embed_threads: int = 2
+    # The chat model's context length in tokens; 0 asks the server (vLLM's `max_model_len`).
+    llm_context_tokens: int = 0
 
     @classmethod
     def load(cls) -> "Settings":
@@ -80,9 +90,13 @@ class Settings:
             embed_model=_optional_env("SCROLLKEEPER_EMBED_MODEL") or DEFAULT_EMBED_MODEL,
             embed_model_dir=Path(path).resolve() if (path := _optional_env("SCROLLKEEPER_EMBED_MODEL_DIR")) else None,
             embed_threads=int(os.getenv("SCROLLKEEPER_EMBED_THREADS", "2")),
+            llm_context_tokens=int(os.getenv("SCROLLKEEPER_LLM_CONTEXT_TOKENS", "0") or 0),
         )
 
     def validate(self) -> None:
+        for name, replacement in RETIRED_SETTINGS.items():
+            if _optional_env(name):
+                log.warning("%s is no longer used (see %s); remove it", name, replacement)
         required = {
             "DISCORD_BOT_TOKEN": self.discord_bot_token,
             "SCROLLKEEPER_STT_BASE_URL": self.stt_base_url,

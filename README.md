@@ -102,8 +102,7 @@ Optional:
 - `SCROLLKEEPER_LLM_EXTRA_BODY=`: a JSON object merged into every chat request for server-specific options, such as a reasoning model's effort level. See [Recommended models and settings](#recommended-models-and-settings).
 - `SCROLLKEEPER_WAIT_NOTICE_SECONDS=20`: if a request takes longer than this, the bot posts a "waking the inference box" notice in the Discord channel.
 - `SCROLLKEEPER_HEALTH_PORT=8080`: serves `GET /healthz` for Kubernetes liveness probes (`0` disables). It returns 503 if the bot's event loop has stalled for over a minute.
-- `SCROLLKEEPER_SUMMARY_SINGLE_PASS_MAX_CHARS=90000` sets when the bot switches from single-pass summary generation to chunked summarization.
-- `SCROLLKEEPER_SUMMARY_CHUNK_CHARS=45000` sets chunk size used when transcripts are too long for single-pass summarization.
+- `SCROLLKEEPER_LLM_CONTEXT_TOKENS=`: the chat model's context length in tokens. Empty (the default) reads it from the server (`max_model_len` on vLLM's `GET /v1/models`), else assumes 32,768. The summary is written in one pass when the transcript fits (a quarter of the context, at least 8k tokens, stays free for the reply). A longer transcript is split into equal-sized parts, each cut at the longest pause near its target size so scenes stay whole; the parts are summarized and then combined. This replaces `SCROLLKEEPER_SUMMARY_SINGLE_PASS_MAX_CHARS` and `SCROLLKEEPER_SUMMARY_CHUNK_CHARS`, which are ignored now.
 - `SCROLLKEEPER_SUMMARY_PROMPT_APPEND=` appends your own instructions to the summary system prompt.
 - `SCROLLKEEPER_EXTRACT_CHUNK_CHARS=24000` sets the transcript chunk size for campaign fact extraction (each chunk is sent with the entity index).
 - `SCROLLKEEPER_WIKI_EXPORT=1` writes the Obsidian-style export to `data/wiki/` after wiki changes (`0` disables).
@@ -111,7 +110,9 @@ Optional:
 - `SCROLLKEEPER_EMBED_MODEL_DIR=`: where model files are kept. Empty (the default) means `data/models/`.
 - `SCROLLKEEPER_EMBED_THREADS=2`: ONNX Runtime threads for embeddings.
 
-Fact extraction and page rewrites request schema-enforced JSON (`response_format: {"type": "json_schema"}`), which vLLM and other OpenAI-compatible servers support.
+Summaries, fact extraction and page rewrites request schema-enforced JSON (`response_format: {"type": "json_schema"}`), which vLLM and other OpenAI-compatible servers support. A failed request (a transport error or unparseable reply) is retried once.
+
+Speech-to-text often misspells campaign names. The summary prompt carries a spelling list (registered character names, plus wiki entity names and aliases; quest and mystery titles are left out) and asks the model to correct likely mis-transcriptions to those spellings. It holds names only, so summaries still come from the session's transcript alone. Fact extraction already sees the same names in its entity index and gets the same instruction.
 
 Logs go to stdout. The bot never starts other containers and does not need the Docker socket.
 
@@ -123,8 +124,8 @@ This is what has been tested.
 
 Requirements:
 
-- An OpenAI-compatible `POST /v1/chat/completions` that supports **`response_format: {"type": "json_schema"}`** (vLLM does). Fact extraction, entity-match checks and page rewrites depend on it.
-- A context window of **at least 32k tokens**. A single-pass summary sends up to `SCROLLKEEPER_SUMMARY_SINGLE_PASS_MAX_CHARS` (90,000 characters, about 25k tokens) plus the reply.
+- An OpenAI-compatible `POST /v1/chat/completions` that supports **`response_format: {"type": "json_schema"}`** (vLLM does). Summaries, fact extraction, entity-match checks and page rewrites depend on it.
+- A context window of **at least 32k tokens**. Larger is better: a session that fits is summarized in one pass (a 32k context holds roughly 70,000 characters of transcript). Set `SCROLLKEEPER_LLM_CONTEXT_TOKENS` if the server doesn't report `max_model_len`.
 
 Tested: a **Qwen3-family 27B reasoning model, 4-bit (W4A16), on vLLM** with a 150k-token context. On synthetic sessions it:
 

@@ -26,16 +26,20 @@ def fake_response(payload: dict) -> MagicMock:
 
 
 class OpenAIClientTests(unittest.TestCase):
-    def test_chat_json_uses_chat_completions_with_json_mode_and_auth(self) -> None:
+    def test_chat_schema_uses_chat_completions_with_json_schema_and_auth(self) -> None:
         service = LocalAIService(fake_settings(llm_api_key="secret"))
         reply = {"choices": [{"message": {"content": '{"a": 1}'}}]}
+        schema = {"type": "object", "properties": {"a": {"type": "integer"}}}
         with patch("scrollkeeper.llm.requests.post", return_value=fake_response(reply)) as post:
-            result = service._chat_json_sync("system", "user")
+            result = service._chat_schema_sync("system", "user", "thing", schema)
         self.assertEqual(result, {"a": 1})
         args, kwargs = post.call_args
         self.assertEqual(args[0], "http://llm/v1/chat/completions")
         self.assertEqual(kwargs["json"]["model"], "test-model")
-        self.assertEqual(kwargs["json"]["response_format"], {"type": "json_object"})
+        self.assertEqual(
+            kwargs["json"]["response_format"],
+            {"type": "json_schema", "json_schema": {"name": "thing", "strict": True, "schema": schema}},
+        )
         self.assertEqual(kwargs["headers"], {"Authorization": "Bearer secret"})
         self.assertEqual(kwargs["timeout"], (60, 900))
 

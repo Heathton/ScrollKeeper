@@ -20,7 +20,7 @@ from .llm import LocalAIService
 from .models import SessionArtifacts, SpeakerSegment, WikiChangeReport
 from .recorder import Speaker, TrackRecorder
 from .storage import PROCESS_LLM_ONLY, PROCESS_TRANSCRIBE, Storage
-from .transcript import format_offset, merge_lines, render_compact, render_timed, split_utterances
+from .transcript import TranscriptLine, format_offset, merge_lines, render_compact, render_timed, split_utterances
 from .search import SearchIndex
 from .wiki import CampaignWiki
 
@@ -434,10 +434,13 @@ class SessionManager:
                 transcribed_segments,
             )
 
-        transcript_markdown = await asyncio.to_thread(self._build_transcript_markdown, session)
-        log.info("Generating summary for session %s", session.session_id)
+        lines = await asyncio.to_thread(self._transcript_lines, session)
+        note = self._interruption_note(session)
+        transcript_markdown = render_compact(lines, note)
+        glossary = await asyncio.to_thread(self.wiki.spelling_glossary, guild_id)
+        log.info("Generating summary for session %s (%s names in the spelling glossary)", session.session_id, len(glossary))
         self._set_status(guild_id, "processing", session.session_id, "Writing the session summary.")
-        summary_payload = await self.llm.summarize_session(transcript_markdown, on_wait=notify)
+        summary_payload = await self.llm.summarize_session(lines, note, glossary, on_wait=notify)
         session_notes = summary_payload["session_notes_markdown"].strip()
         cinematic = summary_payload["cinematic_summary_markdown"].strip()
 
@@ -635,9 +638,8 @@ class SessionManager:
         offset = format_offset(session.interrupted_at - session.started_at)
         return f"The recording was interrupted by a bot restart at {offset}; later audio was not captured."
 
-    def _build_transcript_markdown(self, session: ActiveSession) -> str:
-        lines = merge_lines(self.storage.get_session_segments(session.session_id))
-        return render_compact(lines, self._interruption_note(session))
+    def _transcript_lines(self, session: ActiveSession) -> list[TranscriptLine]:
+        return merge_lines(self.storage.get_session_segments(session.session_id))
 
     def _build_timed_transcript(self, session: ActiveSession) -> str:
         """Transcript with `[HH:MM:SS]` offsets from the session start, so facts can cite a time."""

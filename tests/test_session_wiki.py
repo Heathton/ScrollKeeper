@@ -7,6 +7,7 @@ from pathlib import Path
 
 from scrollkeeper.models import SpeakerSegment
 from scrollkeeper.storage import Storage
+from scrollkeeper.transcript import render_compact
 from scrollkeeper.wiki import CampaignWiki
 
 from test_llm_summary import fake_settings
@@ -21,8 +22,9 @@ except ModuleNotFoundError as exc:
 
 
 class SummaryLLM(FakeLLM):
-    async def summarize_session(self, transcript_markdown: str, on_wait=None) -> dict:
-        self.summary_input = transcript_markdown
+    async def summarize_session(self, lines, note="", glossary=(), on_wait=None) -> dict:
+        self.summary_input = render_compact(lines, note)
+        self.summary_glossary = list(glossary)
         return {"session_notes_markdown": "Notes.", "cinematic_summary_markdown": "Recap."}
 
 
@@ -74,6 +76,16 @@ class SessionWikiPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[01:02:05] Varric: I do.", chunk)
         self.assertEqual([e.canonical_name for e in artifacts.wiki_report.new_entities], ["Varric"])
         self.assertEqual(self.storage.get_session(self.session_id)["status"], "completed")
+
+    async def test_summary_gets_a_names_only_spelling_glossary(self) -> None:
+        self.storage.register_character(1, 42, "Mira Vale")
+        thane = self.storage.create_entity(1, "Character", "Varric Thane", ["Old Varric"], "Owes the party money")
+        self.storage.add_fact(1, thane, "Varric Thane hides a ledger.", "observed", None, None)
+        self.storage.create_entity(1, "Quest", "Recover Varric's Ledger")
+        await self.manager._process_closed_session(1, self.session, transcribe_audio=False)
+
+        self.assertEqual(self.llm.summary_glossary, ["Mira Vale", "Old Varric", "Varric Thane"])
+        self.assertTrue((self.session.base_dir / "transcript.md").read_text().startswith("# Transcript"))
 
     async def test_processed_session_is_indexed_for_questions(self) -> None:
         from scrollkeeper.search import SearchIndex

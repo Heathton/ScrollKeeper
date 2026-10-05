@@ -6,12 +6,13 @@ import logging
 import os
 import uuid
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Sequence
 
 import requests
 
 from .config import Settings
 from .models import ENTITY_TYPES, QUEST_STATUSES, TimedText, TranscriptionResult
+from .transcript import TranscriptLine, render_compact, split_at_pauses
 
 
 log = logging.getLogger(__name__)
@@ -20,6 +21,14 @@ WaitNotifier = Callable[[str], Awaitable[None]]
 
 CONNECT_TIMEOUT_SECONDS = 60
 NOT_IN_NOTES_REPLY = "That's not in the notes."
+# Context length assumed when neither the setting nor the server gives one.
+DEFAULT_CONTEXT_TOKENS = 32768
+# Tokens kept free for the summary reply (and a reasoning model's thinking): this, or a quarter
+# of the context if that is more.
+SUMMARY_REPLY_TOKENS = 8192
+# Characters per token for estimating prompt size without the model's tokenizer. English chat
+# is about 4; 3 leaves room for names, punctuation and other languages.
+CHARS_PER_TOKEN = 3.0
 
 
 class LocalAIService:
@@ -32,6 +41,7 @@ class LocalAIService:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self._context_tokens: int | None = None
 
     async def transcribe_track(self, audio_path: Path) -> TranscriptionResult:
         """Transcribe one whole speaker track (can be hours long; see SCROLLKEEPER_STT_TIMEOUT_SECONDS).
@@ -46,13 +56,21 @@ class LocalAIService:
 
     async def summarize_session(
         self,
-        transcript_markdown: str,
+        lines: list[TranscriptLine],
+        note: str = "",
+        glossary: Sequence[str] = (),
         on_wait: WaitNotifier | None = None,
     ) -> dict[str, Any]:
-        """Session notes + cinematic recap, from the transcript only (no prior notes, see #7)."""
+        """Session notes + cinematic recap, from the transcript only (no prior notes, see #7).
+
+        `glossary` is a list of campaign names, used only to correct their spelling. A transcript
+        too long for the model's context is summarized in parts cut at pauses, then combined.
+        """
         return await self._run_blocking(
             self._summarize_session_sync,
-            transcript_markdown,
+            lines,
+            note,
+            glossary,
             on_wait=on_wait,
             wait_message="Waking the inference box, this can take a few minutes...",
         )
@@ -147,109 +165,118 @@ class LocalAIService:
         response.raise_for_status()
         return parse_transcription(response.json())
 
-    def _summarize_session_sync(self, transcript_markdown: str) -> dict[str, Any]:
-        single_pass_max_chars = int(os.getenv("SCROLLKEEPER_SUMMARY_SINGLE_PASS_MAX_CHARS", "90000"))
-        chunk_chars = int(os.getenv("SCROLLKEEPER_SUMMARY_CHUNK_CHARS", "45000"))
-        if len(transcript_markdown) <= single_pass_max_chars:
-            return self._summarize_with_retry(
-                transcript_markdown,
-                min_content_chars=80,
-            )
-
-        chunks = self._split_transcript_chunks(transcript_markdown, max_chars=chunk_chars)
-        log.warning(
-            "Transcript is %s chars; using chunked summarization (%s chunks, chunk size %s chars)",
-            len(transcript_markdown),
-            len(chunks),
-            chunk_chars,
-        )
-        chunk_payloads: list[dict[str, Any]] = []
-        for index, chunk in enumerate(chunks, start=1):
-            chunk_payload = self._summarize_with_retry(
-                chunk,
-                min_content_chars=40,
-                stage_label=f"chunk {index}/{len(chunks)}",
-            )
-            chunk_payloads.append(chunk_payload)
-
-        chunked_recap_sections = ["# Transcript", ""]
-        for payload in chunk_payloads:
-            chunked_recap_sections.extend(
-                [
-                    str(payload["session_notes_markdown"]).strip(),
-                    "",
-                    str(payload["cinematic_summary_markdown"]).strip(),
-                    "",
-                ]
-            )
-        combined_chunked_recap = "\n".join(chunked_recap_sections).strip() + "\n"
-        return self._summarize_with_retry(
-            combined_chunked_recap,
-            min_content_chars=80,
-            stage_label="final-from-chunks",
-        )
-
-    def _summarize_with_retry(
+    def _summarize_session_sync(
         self,
-        transcript_markdown: str,
-        min_content_chars: int,
-        stage_label: str = "single-pass",
+        lines: list[TranscriptLine],
+        note: str = "",
+        glossary: Sequence[str] = (),
     ) -> dict[str, Any]:
-        instructions = self._build_summary_instructions()
-        prompt = f"""
-Session transcript:
-{transcript_markdown}
-"""
-        last_error: Exception | None = None
-        for attempt in range(1, 4):
-            attempt_instructions = instructions
-            if attempt > 1:
-                attempt_instructions += """
-Additional retry requirements:
-- The previous response was invalid or too empty.
-- Provide substantive markdown in both summary fields.
-- Ensure each field has concrete details grounded in the transcript.
-"""
-            if stage_label == "final-from-chunks":
-                attempt_instructions += """
+        instructions = self._build_summary_instructions(glossary)
+        transcript = render_compact(lines, note)
+        budget = self._summary_budget_chars(instructions)
+        if len(transcript) <= budget:
+            return self._summarize_part(instructions, transcript, "single-pass")
+
+        header = len(render_compact([], note))
+        parts = split_at_pauses(lines, max(1000, budget - header))
+        log.warning(
+            "Transcript is %s chars (budget %s); summarizing it in %s parts cut at pauses",
+            len(transcript),
+            budget,
+            len(parts),
+        )
+        part_payloads = [
+            self._summarize_part(instructions, render_compact(part, note), f"part {index}/{len(parts)}")
+            for index, part in enumerate(parts, start=1)
+        ]
+        sections = ["# Transcript", ""]
+        for payload in part_payloads:
+            sections.extend(
+                [payload["session_notes_markdown"], "", payload["cinematic_summary_markdown"], ""]
+            )
+        combined = "\n".join(sections).strip() + "\n"
+        final_instructions = instructions + """
 Final synthesis requirements:
-- The source may be chunk-level recap text from the same session.
+- The source is recap text written from consecutive parts of the same session, in order.
 - Return one cohesive session-notes section and one cohesive cinematic summary.
 - Do not structure output by phase/chunk/part/pass labels unless the players explicitly used those terms in-session.
 """
-            try:
-                payload = self._chat_json_sync(attempt_instructions, prompt)
-                normalized = self._normalize_summary_payload(payload)
-                if self._summary_has_content(normalized, min_content_chars=min_content_chars):
-                    return normalized
-                log.warning(
-                    "Summary %s attempt %s returned low-content output; retrying",
-                    stage_label,
-                    attempt,
-                )
-            except Exception as exc:  # pragma: no cover - network/model failures are expected runtime paths
-                last_error = exc
-                log.warning("Summary %s attempt %s failed: %s", stage_label, attempt, exc)
-        if last_error is not None:
-            raise RuntimeError(f"Could not generate summary for {stage_label} after retries.") from last_error
-        raise RuntimeError(f"Could not generate non-empty summary for {stage_label} after retries.")
+        return self._summarize_part(final_instructions, combined, "final-from-parts")
 
-    def _build_summary_instructions(self) -> str:
+    def _summarize_part(self, instructions: str, transcript_markdown: str, stage_label: str) -> dict[str, Any]:
+        payload = self._chat_schema_sync(
+            instructions, f"Session transcript:\n{transcript_markdown}", "session_summary", SUMMARY_SCHEMA
+        )
+        normalized = self._normalize_summary_payload(payload)
+        if not self._summary_has_content(normalized):
+            raise RuntimeError(f"The LLM returned an empty summary ({stage_label}).")
+        return normalized
+
+    def _summary_budget_chars(self, instructions: str) -> int:
+        """Transcript characters that fit in one summary request next to the instructions and reply."""
+        context = self.context_tokens()
+        reply = max(SUMMARY_REPLY_TOKENS, context // 4)
+        prompt_tokens = len(instructions) / CHARS_PER_TOKEN + 100  # + chat template and framing
+        return max(1000, int((context - reply - prompt_tokens) * CHARS_PER_TOKEN))
+
+    def context_tokens(self) -> int:
+        """The chat model's context length: the setting, else the server's `max_model_len` (vLLM),
+        else a conservative default."""
+        if self.settings.llm_context_tokens > 0:
+            return self.settings.llm_context_tokens
+        if self._context_tokens is None:
+            try:
+                self._context_tokens = self._fetch_context_tokens()
+            except (requests.RequestException, ValueError) as exc:
+                # Not cached: the server may just be cold-starting.
+                log.warning("Could not read the model's context length from the server: %s", exc)
+                return DEFAULT_CONTEXT_TOKENS
+        return self._context_tokens
+
+    def _fetch_context_tokens(self) -> int:
+        response = requests.get(
+            f"{self.settings.llm_base_url}/models",
+            headers=self._headers(),
+            timeout=self._timeout(self.settings.llm_timeout_seconds),
+        )
+        response.raise_for_status()
+        for model in response.json().get("data", []):
+            if isinstance(model, dict) and model.get("id") == self.settings.llm_model:
+                length = model.get("max_model_len")
+                if isinstance(length, int) and length > 0:
+                    log.info("Model %s has a context length of %s tokens", self.settings.llm_model, length)
+                    return length
+        log.warning(
+            "The server does not report a context length for %s; assuming %s tokens "
+            "(set SCROLLKEEPER_LLM_CONTEXT_TOKENS)",
+            self.settings.llm_model,
+            DEFAULT_CONTEXT_TOKENS,
+        )
+        return DEFAULT_CONTEXT_TOKENS
+
+    def _build_summary_instructions(self, glossary: Sequence[str] = ()) -> str:
         base = """
 You are a campaign chronicler for a tabletop RPG.
 
-Return valid JSON only with this exact schema:
-{
-  "session_notes_markdown": "string",
-  "cinematic_summary_markdown": "string"
-}
+Write two Markdown fields:
+- `session_notes_markdown`: practical session notes (events, decisions, discoveries, loot, open threads).
+- `cinematic_summary_markdown`: a cinematic narrative recap of the session.
 
 Rules:
 - Use only the provided session transcript as the source of truth.
-- Produce practical session notes and a cinematic narrative recap.
 - Do not invent facts.
-- Do not wrap the JSON in markdown fences.
 - Never return placeholders like "No session notes available." or "No cinematic summary available.".
+"""
+        if glossary:
+            names = "\n".join(f"- {name}" for name in glossary)
+            base += f"""
+The transcript comes from speech-to-text, which often misspells names. These are the correct
+spellings of names in this campaign:
+{names}
+
+- When a word or phrase in the transcript is likely a mis-transcription of one of these names,
+  write the name as spelled in the list.
+- The list is only a spelling aid: do not mention a name unless the transcript refers to it.
 """
         prompt_append = os.getenv("SCROLLKEEPER_SUMMARY_PROMPT_APPEND", "").strip()
         if prompt_append:
@@ -264,7 +291,7 @@ Rules:
             "cinematic_summary_markdown": cinematic,
         }
 
-    def _summary_has_content(self, payload: dict[str, Any], min_content_chars: int) -> bool:
+    def _summary_has_content(self, payload: dict[str, Any]) -> bool:
         sentinels = {
             "",
             "none",
@@ -274,12 +301,7 @@ Rules:
         }
         notes = str(payload.get("session_notes_markdown", "")).strip()
         cinematic = str(payload.get("cinematic_summary_markdown", "")).strip()
-        if notes.lower() in sentinels or cinematic.lower() in sentinels:
-            return False
-        return len(notes) >= min_content_chars and len(cinematic) >= min_content_chars
-
-    def _split_transcript_chunks(self, transcript_markdown: str, max_chars: int) -> list[str]:
-        return split_transcript_chunks(transcript_markdown, max_chars)
+        return notes.lower() not in sentinels and cinematic.lower() not in sentinels
 
     def _extract_facts_sync(self, entity_index: str, transcript_chunk: str) -> dict[str, Any]:
         instructions = f"""
@@ -296,6 +318,9 @@ Rules:
 - Set `entity` to the `#<id>` of a known entity whenever the fact is about it, even when the
   transcript uses a nickname, title or misspelling. Only propose a new entity when nothing in the
   index matches; then set `entity` to the new entity's exact `name`.
+- The transcript comes from speech-to-text, which often misspells names. When a word or phrase is
+  likely a mis-transcription of a known entity's name or alias, treat it as that entity and use
+  the index's spelling in fact text.
 - A new entity's `name` is the fullest proper name used (e.g. "Varric Thane"), not a nickname
   or title; put nicknames and titles ("Old Varric", "Lord Thane") in `aliases`.
 - New entity `type` is one of: {", ".join(ENTITY_TYPES)}. Record plot events as facts on the
@@ -415,7 +440,6 @@ Rules:
     def _chat_sync(
         self,
         messages: list[dict[str, str]],
-        json_mode: bool = False,
         response_format: dict[str, Any] | None = None,
     ) -> str:
         body: dict[str, Any] = {
@@ -428,8 +452,6 @@ Rules:
         }
         if response_format is not None:
             body["response_format"] = response_format
-        elif json_mode:
-            body["response_format"] = {"type": "json_object"}
         response = requests.post(
             f"{self.settings.llm_base_url}/chat/completions",
             json=body,
@@ -441,16 +463,6 @@ Rules:
         if not choices:
             return ""
         return str(choices[0].get("message", {}).get("content") or "").strip()
-
-    def _chat_json_sync(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
-        content = self._chat_sync(
-            [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            json_mode=True,
-        )
-        return json.loads(content)
 
     def _chat_schema_sync(
         self,
@@ -541,6 +553,16 @@ FACT_EXTRACTION_SCHEMA: dict[str, Any] = {
                 },
             },
         },
+    },
+}
+
+SUMMARY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["session_notes_markdown", "cinematic_summary_markdown"],
+    "properties": {
+        "session_notes_markdown": {"type": "string"},
+        "cinematic_summary_markdown": {"type": "string"},
     },
 }
 
