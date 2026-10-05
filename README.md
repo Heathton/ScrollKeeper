@@ -81,7 +81,7 @@ All configuration comes from environment variables (a `.env` file is optional an
 Optional:
 
 - `SCROLLKEEPER_LLM_TIMEOUT_SECONDS=900` / `SCROLLKEEPER_STT_TIMEOUT_SECONDS=600`: read timeouts. They are long on purpose because the LLM host may cold-start for several minutes.
-- `SCROLLKEEPER_LLM_EXTRA_BODY=`: a JSON object merged into every chat request for server-specific options. Reasoning models can spend minutes thinking before answering, and a proxy in front of the LLM may cut long requests. With a Qwen3-family model on vLLM whose chat template defaults to `xhigh` effort, one extraction call took about 4 minutes. On a 19k-character transcript chunk, the same call took about 50 seconds at `low` or `medium`. Medium extracted the most complete facts, so use `{"chat_template_kwargs": {"reasoning_effort": "medium"}}`; `{"chat_template_kwargs": {"enable_thinking": false}}` is about three times faster but makes more mistakes, such as stating claims as facts. Check which kwargs your model's chat template accepts.
+- `SCROLLKEEPER_LLM_EXTRA_BODY=`: a JSON object merged into every chat request for server-specific options, such as a reasoning model's effort level. See [Recommended models and settings](#recommended-models-and-settings).
 - `SCROLLKEEPER_WAIT_NOTICE_SECONDS=20`: if a request takes longer than this, the bot posts a "waking the inference box" notice in the Discord channel.
 - `SCROLLKEEPER_HEALTH_PORT=8080`: serves `GET /healthz` for Kubernetes liveness probes (`0` disables). It returns 503 if the bot's event loop has stalled for over a minute.
 - `SCROLLKEEPER_SUMMARY_SINGLE_PASS_MAX_CHARS=90000` sets when the bot switches from single-pass summary generation to chunked summarization.
@@ -93,6 +93,65 @@ Optional:
 Fact extraction and page rewrites request schema-enforced JSON (`response_format: {"type": "json_schema"}`), which vLLM and other OpenAI-compatible servers support.
 
 Logs go to stdout. The bot never starts other containers and does not need the Docker socket.
+
+## Recommended models and settings
+
+This is what has been tested, and what to use until [#8](https://github.com/Heathton/ScrollKeeper/issues/8) changes how embeddings work.
+
+### Chat LLM (`SCROLLKEEPER_LLM_BASE_URL`, `SCROLLKEEPER_LLM_MODEL`)
+
+Requirements:
+
+- An OpenAI-compatible `POST /v1/chat/completions` that supports **`response_format: {"type": "json_schema"}`** (vLLM does). Fact extraction, entity-match checks and page rewrites depend on it.
+- A context window of **at least 32k tokens**. A single-pass summary sends up to `SCROLLKEEPER_SUMMARY_SINGLE_PASS_MAX_CHARS` (90,000 characters, about 25k tokens) plus the reply.
+
+Tested: a **Qwen3-family 27B reasoning model, 4-bit (W4A16), on vLLM** with a 150k-token context. On synthetic sessions it:
+
+- extracted correct facts and aliases,
+- kept claims as claims,
+- matched misspellings and titles to the right entities,
+- kept two characters with the same first name apart.
+
+Smaller or non-reasoning models are untested. If you try one, check the change reports for invented facts and duplicate entities.
+
+### Reasoning level (`SCROLLKEEPER_LLM_EXTRA_BODY`)
+
+Reasoning models can think for minutes before answering. The tested model's chat template defaults to its highest effort level (`xhigh`), and a proxy in front of the LLM may cut long requests (a wake-on-LAN proxy with a 5-minute timeout did). Set the level explicitly:
+
+```
+SCROLLKEEPER_LLM_EXTRA_BODY={"chat_template_kwargs": {"reasoning_effort": "medium"}}
+```
+
+Timings for one fact-extraction call with the tested model:
+
+| `chat_template_kwargs` | 15-line transcript | 19k-character chunk | Quality |
+|---|---|---|---|
+| default (`xhigh`) | 235 s | would exceed a 5-minute proxy timeout | good |
+| `{"reasoning_effort": "medium"}` | 54 s | 54 s | **best**: most complete facts, claims kept as claims |
+| `{"reasoning_effort": "low"}` | 30 s | 48 s | good, a few facts fewer |
+| `{"enable_thinking": false}` | 17 s | n/a | states claims as facts, misattributes roles; not recommended |
+
+Use **medium**, or **low** if processing takes too long. These kwargs belong to Qwen3-style chat templates on vLLM. Other models and servers use different options, so check what your model's chat template accepts (vLLM's `POST /tokenize` with `chat_template_kwargs` shows the rendered prompt).
+
+Processing time at medium effort:
+
+- About 1 minute per extraction chunk.
+- 15–40 seconds per page rewrite, and about 5 seconds per entity-match check.
+- About 4–7 minutes for a short test session.
+- A long session that touches 40 or more entities can take 20–30 minutes, in the background.
+- `!rebuild-pages` takes about 35–40 seconds per page.
+
+### Embeddings (`SCROLLKEEPER_EMBED_MODEL`, `SCROLLKEEPER_EMBED_BASE_URL`)
+
+No embedding model is bundled yet. The bot calls `POST {SCROLLKEEPER_EMBED_BASE_URL}/embeddings`, which defaults to the LLM base URL. Chat servers usually serve only the chat model, so you will normally need a separate embeddings server.
+
+- **Planned ([#8](https://github.com/Heathton/ScrollKeeper/issues/8))**: embeddings in-process on CPU (Qwen3-Embedding-0.6B or EmbeddingGemma-300M via ONNX), plus exact-name and keyword search. That removes these settings.
+- **Until then**: run any OpenAI-compatible embeddings server with a small model, such as Qwen3-Embedding-0.6B, which is fine on CPU. The bot does not yet add the model's query instruction to questions, which lowers search quality somewhat (#8).
+- **Without a working embeddings endpoint**: wiki pages are still written, the change report says how many are not searchable yet (retried on the next run), and `!campaign-question` fails. `SCROLLKEEPER_EMBED_MODEL` is still required at startup.
+
+### Speech-to-text
+
+Use the bundled Parakeet-TDT service (see [Speech-to-text service](#speech-to-text-service)).
 
 ## Local development with Docker Compose
 
@@ -143,7 +202,7 @@ Pushing a `v*` tag runs `.github/workflows/images.yml`, which publishes `ghcr.io
 - If the voice connection drops mid-session, the bot will try to reconnect to the same channel and continue the session.
 - `discord-ext-voice-recv` is pinned to a commit SHA in `pyproject.toml`; change it deliberately, in its own PR. If Python voice receive keeps breaking, the fallback is a small Node `@discordjs/voice` recorder feeding this pipeline.
 - The bot calls the configured speech-to-text endpoint per speaker segment after the session ends.
-- Summaries, note updates, embeddings, and campaign Q&A go to the configured OpenAI-compatible LLM endpoint.
+- Summaries, wiki updates, and campaign Q&A go to the configured OpenAI-compatible LLM endpoint; embeddings go to the embeddings endpoint.
 - Long completion posts are split across multiple Discord messages automatically to avoid message-length truncation.
 - `!end-session` now queues background processing so users can still run `!campaign-question` while transcription and note generation continue.
 
