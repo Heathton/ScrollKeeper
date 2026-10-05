@@ -56,7 +56,7 @@ class Settings:
             data_dir=data_dir,
             bot_name=os.getenv("SCROLLKEEPER_BOT_NAME", "ScrollKeeper"),
             stt_base_url=_optional_env("SCROLLKEEPER_STT_BASE_URL").rstrip("/"),
-            stt_model=os.getenv("SCROLLKEEPER_STT_MODEL", "whisper-1").strip(),
+            stt_model=os.getenv("SCROLLKEEPER_STT_MODEL", "parakeet-tdt-0.6b-v2").strip(),
             stt_timeout_seconds=int(os.getenv("SCROLLKEEPER_STT_TIMEOUT_SECONDS", "600")),
             llm_base_url=llm_base_url,
             llm_model=_optional_env("SCROLLKEEPER_LLM_MODEL"),

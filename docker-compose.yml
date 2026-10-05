@@ -18,9 +18,7 @@ services:
 
   stt:
     build:
-      context: docker/whisper
+      context: docker/stt
     environment:
-      WHISPER_MODEL: ${SCROLLKEEPER_STT_WHISPER_MODEL:-small.en}
-      WHISPER_DEVICE: cpu
-      WHISPER_COMPUTE_TYPE: int8
+      STT_THREADS: ${STT_THREADS:-3}
     restart: unless-stopped
