@@ -49,6 +49,7 @@ class SessionWikiPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.session = ActiveSession(
             session_id=self.session_id,
             guild_id=1,
+            campaign_id=1,
             voice_channel_id=2,
             text_channel_id=3,
             title="Test",

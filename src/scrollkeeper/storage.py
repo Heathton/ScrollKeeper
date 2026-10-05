@@ -7,12 +7,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterator
 
-from .models import FACT_KINDS, Entity, Fact, Page, SearchDoc, SpeakerSegment, normalize_name
+from .models import FACT_KINDS, Campaign, Entity, Fact, Page, SearchDoc, SpeakerSegment, normalize_name
 
 
 # Forward-only schema migrations, applied in order; `PRAGMA user_version` records how many ran.
 # The base tables (characters, sessions, transcript segments) are created in `_init_db` with
-# IF NOT EXISTS and count as version 0.
+# IF NOT EXISTS and count as version 0. Migration 4 rebuilds `character_registry` per campaign,
+# so the IF NOT EXISTS there is a no-op on any database past version 3.
 MIGRATIONS: list[str] = [
     # 1: campaign wiki (entities, aliases, append-only facts, pages rebuilt from facts).
     """
@@ -128,7 +129,64 @@ MIGRATIONS: list[str] = [
 
     ALTER TABLE pages DROP COLUMN embedding_json;
     """,
+    # 4: campaigns. A server has several campaigns and one active one. Sessions belong to a
+    # campaign; characters, the wiki and the search index are kept per campaign (the wiki and
+    # search tables' guild_id column becomes campaign_id). Existing data moves into a "Default"
+    # campaign per server.
+    """
+    CREATE TABLE campaigns (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        name_norm TEXT NOT NULL,
+        is_active INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        UNIQUE (guild_id, name_norm)
+    );
+    INSERT INTO campaigns (guild_id, name, name_norm, is_active, created_at)
+    SELECT guild_id, 'Default', 'default', 1, strftime('%Y-%m-%dT%H:%M:%f', 'now')
+    FROM (
+        SELECT guild_id FROM sessions
+        UNION SELECT guild_id FROM character_registry
+        UNION SELECT guild_id FROM entities
+        UNION SELECT guild_id FROM search_docs
+    );
+
+    ALTER TABLE sessions ADD COLUMN campaign_id INTEGER REFERENCES campaigns(id);
+    UPDATE sessions SET campaign_id = (SELECT c.id FROM campaigns c WHERE c.guild_id = sessions.guild_id);
+    CREATE INDEX sessions_campaign ON sessions(campaign_id);
+
+    CREATE TABLE character_registry_v4 (
+        campaign_id INTEGER NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+        user_id INTEGER NOT NULL,
+        character_name TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (campaign_id, user_id)
+    );
+    INSERT INTO character_registry_v4 (campaign_id, user_id, character_name, updated_at)
+    SELECT c.id, r.user_id, r.character_name, r.updated_at
+    FROM character_registry r JOIN campaigns c ON c.guild_id = r.guild_id;
+    DROP TABLE character_registry;
+    ALTER TABLE character_registry_v4 RENAME TO character_registry;
+
+    DROP INDEX entities_guild_name;
+    ALTER TABLE entities RENAME COLUMN guild_id TO campaign_id;
+    UPDATE entities SET campaign_id = (SELECT c.id FROM campaigns c WHERE c.guild_id = entities.campaign_id);
+    CREATE INDEX entities_campaign_name ON entities(campaign_id, name_norm);
+
+    DROP INDEX facts_session;
+    DROP INDEX facts_source_ref;
+    ALTER TABLE facts RENAME COLUMN guild_id TO campaign_id;
+    UPDATE facts SET campaign_id = (SELECT c.id FROM campaigns c WHERE c.guild_id = facts.campaign_id);
+    CREATE INDEX facts_session ON facts(campaign_id, session_id);
+    CREATE INDEX facts_source_ref ON facts(campaign_id, source_ref);
+
+    ALTER TABLE search_docs RENAME COLUMN guild_id TO campaign_id;
+    UPDATE search_docs SET campaign_id = (SELECT c.id FROM campaigns c WHERE c.guild_id = search_docs.campaign_id);
+    """,
 ]
+
+DEFAULT_CAMPAIGN = "Default"
 
 # Values of sessions.processing_kind: run speech-to-text then the LLM steps, or the LLM steps only.
 PROCESS_TRANSCRIBE = "transcribe"
@@ -199,48 +257,107 @@ class Storage:
             for target_version, script in enumerate(MIGRATIONS[version:], start=version + 1):
                 conn.executescript(f"BEGIN;\n{script}\nPRAGMA user_version = {target_version};\nCOMMIT;")
 
-    def register_character(self, guild_id: int, user_id: int, character_name: str) -> None:
+    # --- Campaigns: several per server, one active ------------------------------------------
+
+    def active_campaign(self, guild_id: int) -> Campaign:
+        """The server's active campaign, creating the "Default" campaign on first use."""
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM campaigns WHERE guild_id = ? AND is_active = 1", (guild_id,)
+            ).fetchone()
+            if row is None:
+                row = self._activate_campaign(conn, guild_id, DEFAULT_CAMPAIGN)
+        return _campaign_from_row(row)
+
+    def switch_campaign(self, guild_id: int, name: str) -> tuple[Campaign, bool]:
+        """Make `name` the server's active campaign, creating it if needed. Returns (campaign, created)."""
+        name = " ".join(name.split())
+        if not normalize_name(name):
+            raise ValueError("A campaign needs a name.")
+        with self.connection() as conn:
+            existed = self._find_campaign(conn, guild_id, name) is not None
+            row = self._activate_campaign(conn, guild_id, name)
+        return _campaign_from_row(row), not existed
+
+    def list_campaigns(self, guild_id: int) -> list[Campaign]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM campaigns WHERE guild_id = ? ORDER BY name COLLATE NOCASE", (guild_id,)
+            ).fetchall()
+        return [_campaign_from_row(row) for row in rows]
+
+    def get_campaign(self, campaign_id: int) -> Campaign | None:
+        with self.connection() as conn:
+            row = conn.execute("SELECT * FROM campaigns WHERE id = ?", (campaign_id,)).fetchone()
+        return _campaign_from_row(row) if row else None
+
+    def _find_campaign(self, conn: sqlite3.Connection, guild_id: int, name: str) -> sqlite3.Row | None:
+        return conn.execute(
+            "SELECT * FROM campaigns WHERE guild_id = ? AND name_norm = ?", (guild_id, normalize_name(name))
+        ).fetchone()
+
+    def _activate_campaign(self, conn: sqlite3.Connection, guild_id: int, name: str) -> sqlite3.Row:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO campaigns (guild_id, name, name_norm, is_active, created_at)
+            VALUES (?, ?, ?, 0, ?)
+            """,
+            (guild_id, name, normalize_name(name), datetime.utcnow().isoformat()),
+        )
+        row = self._find_campaign(conn, guild_id, name)
+        conn.execute(
+            "UPDATE campaigns SET is_active = (id = ?) WHERE guild_id = ?", (int(row["id"]), guild_id)
+        )
+        return self._find_campaign(conn, guild_id, name)
+
+    # --- Characters (per campaign) ----------------------------------------------------------
+
+    def register_character(self, campaign_id: int, user_id: int, character_name: str) -> None:
         now = datetime.utcnow().isoformat()
         with self.connection() as conn:
             conn.execute(
                 """
-                INSERT INTO character_registry (guild_id, user_id, character_name, updated_at)
+                INSERT INTO character_registry (campaign_id, user_id, character_name, updated_at)
                 VALUES (?, ?, ?, ?)
-                ON CONFLICT(guild_id, user_id) DO UPDATE SET
+                ON CONFLICT(campaign_id, user_id) DO UPDATE SET
                     character_name = excluded.character_name,
                     updated_at = excluded.updated_at
                 """,
-                (guild_id, user_id, character_name, now),
+                (campaign_id, user_id, character_name, now),
             )
 
-    def list_registered_characters(self, guild_id: int) -> list[str]:
+    def list_registered_characters(self, campaign_id: int) -> list[str]:
         with self.connection() as conn:
             rows = conn.execute(
-                "SELECT character_name FROM character_registry WHERE guild_id = ? ORDER BY character_name",
-                (guild_id,),
+                "SELECT character_name FROM character_registry WHERE campaign_id = ? ORDER BY character_name",
+                (campaign_id,),
             ).fetchall()
         return [row["character_name"] for row in rows]
 
-    def get_character_name(self, guild_id: int, user_id: int, fallback_name: str) -> str:
-        return self.get_registered_character_name(guild_id, user_id) or fallback_name
+    def get_character_name(self, campaign_id: int, user_id: int, fallback_name: str) -> str:
+        return self.get_registered_character_name(campaign_id, user_id) or fallback_name
 
-    def get_registered_character_name(self, guild_id: int, user_id: int) -> str | None:
+    def get_registered_character_name(self, campaign_id: int, user_id: int) -> str | None:
         """The name from `!register-character`, or None if the user hasn't registered (and isn't recorded)."""
         with self.connection() as conn:
             row = conn.execute(
                 """
                 SELECT character_name
                 FROM character_registry
-                WHERE guild_id = ? AND user_id = ?
+                WHERE campaign_id = ? AND user_id = ?
                 """,
-                (guild_id, user_id),
+                (campaign_id, user_id),
             ).fetchone()
         return row["character_name"] if row else None
 
-    def registered_user_ids(self, guild_id: int) -> set[int]:
+    def registered_user_ids(self, campaign_id: int) -> set[int]:
         with self.connection() as conn:
-            rows = conn.execute("SELECT user_id FROM character_registry WHERE guild_id = ?", (guild_id,)).fetchall()
+            rows = conn.execute(
+                "SELECT user_id FROM character_registry WHERE campaign_id = ?", (campaign_id,)
+            ).fetchall()
         return {int(row["user_id"]) for row in rows}
+
+    # --- Sessions ---------------------------------------------------------------------------
 
     def create_session(
         self,
@@ -248,18 +365,22 @@ class Storage:
         voice_channel_id: int,
         text_channel_id: int,
         title: str | None,
+        campaign_id: int | None = None,
     ) -> int:
+        """Create a recording session in `campaign_id` (default: the server's active campaign)."""
+        if campaign_id is None:
+            campaign_id = self.active_campaign(guild_id).id
         started_at = datetime.utcnow().isoformat()
         with self.connection() as conn:
             cursor = conn.execute(
                 """
                 INSERT INTO sessions (
-                    guild_id, voice_channel_id, text_channel_id, title,
+                    guild_id, campaign_id, voice_channel_id, text_channel_id, title,
                     started_at, status
                 )
-                VALUES (?, ?, ?, ?, ?, 'recording')
+                VALUES (?, ?, ?, ?, ?, ?, 'recording')
                 """,
-                (guild_id, voice_channel_id, text_channel_id, title, started_at),
+                (guild_id, campaign_id, voice_channel_id, text_channel_id, title, started_at),
             )
             return int(cursor.lastrowid)
 
@@ -437,17 +558,17 @@ class Storage:
             ).fetchone()
         return row
 
-    def get_latest_session(self, guild_id: int) -> sqlite3.Row | None:
+    def get_latest_session(self, campaign_id: int) -> sqlite3.Row | None:
         with self.connection() as conn:
             row = conn.execute(
                 """
                 SELECT *
                 FROM sessions
-                WHERE guild_id = ?
+                WHERE campaign_id = ?
                 ORDER BY id DESC
                 LIMIT 1
                 """,
-                (guild_id,),
+                (campaign_id,),
             ).fetchone()
         return row
 
@@ -525,7 +646,7 @@ class Storage:
 
     def create_entity(
         self,
-        guild_id: int,
+        campaign_id: int,
         entity_type: str,
         name: str,
         aliases: list[str] | None = None,
@@ -537,13 +658,13 @@ class Storage:
             cursor = conn.execute(
                 """
                 INSERT INTO entities (
-                    guild_id, type, canonical_name, name_norm, short_description,
+                    campaign_id, type, canonical_name, name_norm, short_description,
                     created_session_id, created_at, updated_at
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    guild_id,
+                    campaign_id,
                     entity_type,
                     name.strip(),
                     normalize_name(name),
@@ -558,7 +679,7 @@ class Storage:
                 self._insert_alias(conn, entity_id, name, alias)
         return entity_id
 
-    def get_entity(self, guild_id: int, entity_id: int) -> Entity | None:
+    def get_entity(self, campaign_id: int, entity_id: int) -> Entity | None:
         """Return the live entity for `entity_id`, following merges to the surviving entity."""
         with self.connection() as conn:
             seen: set[int] = set()
@@ -566,8 +687,8 @@ class Storage:
             while current not in seen:
                 seen.add(current)
                 row = conn.execute(
-                    "SELECT * FROM entities WHERE guild_id = ? AND id = ?",
-                    (guild_id, current),
+                    "SELECT * FROM entities WHERE campaign_id = ? AND id = ?",
+                    (campaign_id, current),
                 ).fetchone()
                 if row is None:
                     return None
@@ -576,20 +697,20 @@ class Storage:
                 current = int(row["merged_into"])
         return None
 
-    def list_entities(self, guild_id: int) -> list[Entity]:
+    def list_entities(self, campaign_id: int) -> list[Entity]:
         with self.connection() as conn:
             rows = conn.execute(
                 """
                 SELECT *
                 FROM entities
-                WHERE guild_id = ? AND merged_into IS NULL
+                WHERE campaign_id = ? AND merged_into IS NULL
                 ORDER BY type, canonical_name COLLATE NOCASE
                 """,
-                (guild_id,),
+                (campaign_id,),
             ).fetchall()
             return [self._entity_from_row(conn, row) for row in rows]
 
-    def find_entities_by_name(self, guild_id: int, name: str) -> list[Entity]:
+    def find_entities_by_name(self, campaign_id: int, name: str) -> list[Entity]:
         """Live entities whose canonical name or an alias normalizes to the same text as `name`."""
         norm = normalize_name(name)
         if not norm:
@@ -600,11 +721,11 @@ class Storage:
                 SELECT DISTINCT e.*
                 FROM entities e
                 LEFT JOIN entity_aliases a ON a.entity_id = e.id
-                WHERE e.guild_id = ? AND e.merged_into IS NULL
+                WHERE e.campaign_id = ? AND e.merged_into IS NULL
                   AND (e.name_norm = ? OR a.alias_norm = ?)
                 ORDER BY e.id
                 """,
-                (guild_id, norm, norm),
+                (campaign_id, norm, norm),
             ).fetchall()
             return [self._entity_from_row(conn, row) for row in rows]
 
@@ -641,7 +762,7 @@ class Storage:
         with self.connection() as conn:
             conn.execute("UPDATE entities SET status = ? WHERE id = ?", (status, entity_id))
 
-    def active_facts_by_type(self, guild_id: int, entity_type: str) -> dict[int, list[str]]:
+    def active_facts_by_type(self, campaign_id: int, entity_type: str) -> dict[int, list[str]]:
         """Active fact texts of every live entity of one type, keyed by entity id."""
         with self.connection() as conn:
             rows = conn.execute(
@@ -649,11 +770,11 @@ class Storage:
                 SELECT f.entity_id, f.text
                 FROM facts f
                 JOIN entities e ON e.id = f.entity_id
-                WHERE e.guild_id = ? AND e.type = ? AND e.merged_into IS NULL
+                WHERE e.campaign_id = ? AND e.type = ? AND e.merged_into IS NULL
                   AND f.superseded_by IS NULL AND f.retracted_at IS NULL
                 ORDER BY f.id
                 """,
-                (guild_id, entity_type),
+                (campaign_id, entity_type),
             ).fetchall()
         result: dict[int, list[str]] = {}
         for row in rows:
@@ -693,7 +814,7 @@ class Storage:
 
     def add_fact(
         self,
-        guild_id: int,
+        campaign_id: int,
         entity_id: int,
         text: str,
         kind: str,
@@ -709,13 +830,13 @@ class Storage:
             cursor = conn.execute(
                 """
                 INSERT INTO facts (
-                    guild_id, entity_id, session_id, transcript_ts, source_ref, text, kind,
+                    campaign_id, entity_id, session_id, transcript_ts, source_ref, text, kind,
                     created_at, created_by_user_id
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    guild_id,
+                    campaign_id,
                     entity_id,
                     session_id,
                     transcript_ts or None,
@@ -728,22 +849,22 @@ class Storage:
             )
             return int(cursor.lastrowid)
 
-    def get_fact(self, guild_id: int, fact_id: int) -> Fact | None:
+    def get_fact(self, campaign_id: int, fact_id: int) -> Fact | None:
         with self.connection() as conn:
             row = conn.execute(
-                "SELECT * FROM facts WHERE guild_id = ? AND id = ?",
-                (guild_id, fact_id),
+                "SELECT * FROM facts WHERE campaign_id = ? AND id = ?",
+                (campaign_id, fact_id),
             ).fetchone()
         return _fact_from_row(row) if row else None
 
-    def get_facts(self, guild_id: int, fact_ids: list[int]) -> dict[int, Fact]:
+    def get_facts(self, campaign_id: int, fact_ids: list[int]) -> dict[int, Fact]:
         if not fact_ids:
             return {}
         placeholders = ",".join("?" for _ in fact_ids)
         with self.connection() as conn:
             rows = conn.execute(
-                f"SELECT * FROM facts WHERE guild_id = ? AND id IN ({placeholders})",
-                (guild_id, *fact_ids),
+                f"SELECT * FROM facts WHERE campaign_id = ? AND id IN ({placeholders})",
+                (campaign_id, *fact_ids),
             ).fetchall()
         return {int(row["id"]): _fact_from_row(row) for row in rows}
 
@@ -756,46 +877,46 @@ class Storage:
             rows = conn.execute(query, (entity_id,)).fetchall()
         return [_fact_from_row(row) for row in rows]
 
-    def count_active_facts(self, guild_id: int) -> dict[int, int]:
+    def count_active_facts(self, campaign_id: int) -> dict[int, int]:
         with self.connection() as conn:
             rows = conn.execute(
                 """
                 SELECT entity_id, COUNT(*) AS n
                 FROM facts
-                WHERE guild_id = ? AND superseded_by IS NULL AND retracted_at IS NULL
+                WHERE campaign_id = ? AND superseded_by IS NULL AND retracted_at IS NULL
                 GROUP BY entity_id
                 """,
-                (guild_id,),
+                (campaign_id,),
             ).fetchall()
         return {int(row["entity_id"]): int(row["n"]) for row in rows}
 
-    def active_fact_ids_by_entity(self, guild_id: int) -> dict[int, set[int]]:
+    def active_fact_ids_by_entity(self, campaign_id: int) -> dict[int, set[int]]:
         with self.connection() as conn:
             rows = conn.execute(
                 """
                 SELECT f.entity_id, f.id
                 FROM facts f
                 JOIN entities e ON e.id = f.entity_id
-                WHERE f.guild_id = ? AND e.merged_into IS NULL
+                WHERE f.campaign_id = ? AND e.merged_into IS NULL
                   AND f.superseded_by IS NULL AND f.retracted_at IS NULL
                 """,
-                (guild_id,),
+                (campaign_id,),
             ).fetchall()
         result: dict[int, set[int]] = {}
         for row in rows:
             result.setdefault(int(row["entity_id"]), set()).add(int(row["id"]))
         return result
 
-    def page_source_ids_by_entity(self, guild_id: int) -> dict[int, set[int]]:
+    def page_source_ids_by_entity(self, campaign_id: int) -> dict[int, set[int]]:
         with self.connection() as conn:
             rows = conn.execute(
                 """
                 SELECT p.entity_id, p.source_fact_ids_json
                 FROM pages p
                 JOIN entities e ON e.id = p.entity_id
-                WHERE e.guild_id = ?
+                WHERE e.campaign_id = ?
                 """,
-                (guild_id,),
+                (campaign_id,),
             ).fetchall()
         return {int(row["entity_id"]): set(json.loads(row["source_fact_ids_json"])) for row in rows}
 
@@ -818,7 +939,7 @@ class Storage:
                 (now, reason, fact_id),
             )
 
-    def retract_session_facts(self, guild_id: int, session_id: int, reason: str) -> tuple[int, set[int]]:
+    def retract_session_facts(self, campaign_id: int, session_id: int, reason: str) -> tuple[int, set[int]]:
         """Retract the active observed facts from one session (before re-extraction).
 
         Returns (retracted count, affected entity ids).
@@ -829,10 +950,10 @@ class Storage:
                 """
                 SELECT id, entity_id
                 FROM facts
-                WHERE guild_id = ? AND session_id = ? AND kind = 'observed'
+                WHERE campaign_id = ? AND session_id = ? AND kind = 'observed'
                   AND superseded_by IS NULL AND retracted_at IS NULL
                 """,
-                (guild_id, session_id),
+                (campaign_id, session_id),
             ).fetchall()
             conn.executemany(
                 "UPDATE facts SET retracted_at = ?, retraction_reason = ? WHERE id = ?",
@@ -864,17 +985,17 @@ class Storage:
         with self.connection() as conn:
             conn.execute("DELETE FROM pages WHERE entity_id = ?", (entity_id,))
 
-    def list_pages(self, guild_id: int) -> list[tuple[Entity, Page]]:
+    def list_pages(self, campaign_id: int) -> list[tuple[Entity, Page]]:
         with self.connection() as conn:
             rows = conn.execute(
                 """
                 SELECT e.*, p.markdown, p.source_fact_ids_json, p.updated_at AS page_updated_at
                 FROM pages p
                 JOIN entities e ON e.id = p.entity_id
-                WHERE e.guild_id = ? AND e.merged_into IS NULL
+                WHERE e.campaign_id = ? AND e.merged_into IS NULL
                 ORDER BY e.type, e.canonical_name COLLATE NOCASE
                 """,
-                (guild_id,),
+                (campaign_id,),
             ).fetchall()
             return [
                 (
@@ -891,14 +1012,18 @@ class Storage:
 
     # --- Search index (#8): documents derived from pages and sessions -----------------------
 
-    def search_guild_ids(self) -> list[int]:
+    def search_campaign_ids(self) -> list[int]:
         with self.connection() as conn:
             rows = conn.execute(
-                "SELECT guild_id FROM entities UNION SELECT guild_id FROM sessions ORDER BY guild_id"
+                """
+                SELECT campaign_id FROM entities
+                UNION SELECT campaign_id FROM sessions WHERE campaign_id IS NOT NULL
+                ORDER BY campaign_id
+                """
             ).fetchall()
-        return [int(row["guild_id"]) for row in rows]
+        return [int(row["campaign_id"]) for row in rows]
 
-    def page_doc_sources(self, guild_id: int) -> list[sqlite3.Row]:
+    def page_doc_sources(self, campaign_id: int) -> list[sqlite3.Row]:
         """Live pages with a version string that changes when the page text or the entity's names do."""
         with self.connection() as conn:
             return list(
@@ -907,39 +1032,39 @@ class Storage:
                     SELECT e.id AS entity_id, p.updated_at || '|' || e.updated_at || '|' || e.canonical_name AS version
                     FROM pages p
                     JOIN entities e ON e.id = p.entity_id
-                    WHERE e.guild_id = ? AND e.merged_into IS NULL
+                    WHERE e.campaign_id = ? AND e.merged_into IS NULL
                     ORDER BY e.id
                     """,
-                    (guild_id,),
+                    (campaign_id,),
                 ).fetchall()
             )
 
-    def summarized_sessions(self, guild_id: int) -> list[sqlite3.Row]:
+    def summarized_sessions(self, campaign_id: int) -> list[sqlite3.Row]:
         """Sessions with a written summary; `ended_at` changes each time a session is (re)processed."""
         with self.connection() as conn:
             return list(
                 conn.execute(
                     """
                     SELECT * FROM sessions
-                    WHERE guild_id = ? AND summary_path IS NOT NULL AND status = 'completed'
+                    WHERE campaign_id = ? AND summary_path IS NOT NULL AND status = 'completed'
                     ORDER BY id
                     """,
-                    (guild_id,),
+                    (campaign_id,),
                 ).fetchall()
             )
 
-    def search_doc_versions(self, guild_id: int) -> dict[tuple[str, int, int], tuple[int, str]]:
-        """(kind, ref_id, part) -> (doc id, version) for every indexed document of a guild."""
+    def search_doc_versions(self, campaign_id: int) -> dict[tuple[str, int, int], tuple[int, str]]:
+        """(kind, ref_id, part) -> (doc id, version) for every indexed document of a campaign."""
         with self.connection() as conn:
             rows = conn.execute(
-                "SELECT id, kind, ref_id, part, version FROM search_docs WHERE guild_id = ?",
-                (guild_id,),
+                "SELECT id, kind, ref_id, part, version FROM search_docs WHERE campaign_id = ?",
+                (campaign_id,),
             ).fetchall()
         return {(row["kind"], int(row["ref_id"]), int(row["part"])): (int(row["id"]), row["version"]) for row in rows}
 
     def replace_search_docs(
         self,
-        guild_id: int,
+        campaign_id: int,
         kind: str,
         ref_id: int,
         docs: list[SearchDoc],
@@ -951,8 +1076,8 @@ class Storage:
             existing = {
                 int(row["part"]): row
                 for row in conn.execute(
-                    "SELECT * FROM search_docs WHERE guild_id = ? AND kind = ? AND ref_id = ?",
-                    (guild_id, kind, ref_id),
+                    "SELECT * FROM search_docs WHERE campaign_id = ? AND kind = ? AND ref_id = ?",
+                    (campaign_id, kind, ref_id),
                 ).fetchall()
             }
             for doc in docs:
@@ -960,10 +1085,10 @@ class Storage:
                 if old is None:
                     conn.execute(
                         """
-                        INSERT INTO search_docs (guild_id, kind, ref_id, part, session_id, start_ts, title, body, version)
+                        INSERT INTO search_docs (campaign_id, kind, ref_id, part, session_id, start_ts, title, body, version)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
-                        (guild_id, kind, ref_id, doc.part, doc.session_id, doc.start_ts, doc.title, doc.body, version),
+                        (campaign_id, kind, ref_id, doc.part, doc.session_id, doc.start_ts, doc.title, doc.body, version),
                     )
                 elif old["title"] == doc.title and old["body"] == doc.body:
                     conn.execute(
@@ -983,30 +1108,30 @@ class Storage:
             for old in existing.values():
                 conn.execute("DELETE FROM search_docs WHERE id = ?", (old["id"],))
 
-    def delete_search_docs(self, guild_id: int, kind: str, ref_id: int) -> None:
+    def delete_search_docs(self, campaign_id: int, kind: str, ref_id: int) -> None:
         with self.connection() as conn:
             conn.execute(
-                "DELETE FROM search_docs WHERE guild_id = ? AND kind = ? AND ref_id = ?",
-                (guild_id, kind, ref_id),
+                "DELETE FROM search_docs WHERE campaign_id = ? AND kind = ? AND ref_id = ?",
+                (campaign_id, kind, ref_id),
             )
 
-    def clear_search_index(self, guild_id: int) -> None:
-        """Drop every search document of a guild (they are rebuilt from pages and sessions)."""
+    def clear_search_index(self, campaign_id: int) -> None:
+        """Drop every search document of a campaign (they are rebuilt from pages and sessions)."""
         with self.connection() as conn:
-            conn.execute("DELETE FROM search_docs WHERE guild_id = ?", (guild_id,))
+            conn.execute("DELETE FROM search_docs WHERE campaign_id = ?", (campaign_id,))
 
-    def docs_needing_embedding(self, guild_id: int, model: str, kinds: tuple[str, ...]) -> list[SearchDoc]:
+    def docs_needing_embedding(self, campaign_id: int, model: str, kinds: tuple[str, ...]) -> list[SearchDoc]:
         """Documents without an embedding from `model` (new, changed, or embedded by another model)."""
         placeholders = ",".join("?" for _ in kinds)
         with self.connection() as conn:
             rows = conn.execute(
                 f"""
                 SELECT * FROM search_docs
-                WHERE guild_id = ? AND kind IN ({placeholders})
+                WHERE campaign_id = ? AND kind IN ({placeholders})
                   AND (embedding IS NULL OR embed_model IS NOT ?)
                 ORDER BY id
                 """,
-                (guild_id, *kinds, model),
+                (campaign_id, *kinds, model),
             ).fetchall()
         return [_search_doc_from_row(row) for row in rows]
 
@@ -1022,20 +1147,20 @@ class Storage:
             )
             return cursor.rowcount > 0
 
-    def doc_embeddings(self, guild_id: int, model: str, dim: int, kinds: tuple[str, ...]) -> list[tuple[int, bytes]]:
+    def doc_embeddings(self, campaign_id: int, model: str, dim: int, kinds: tuple[str, ...]) -> list[tuple[int, bytes]]:
         placeholders = ",".join("?" for _ in kinds)
         with self.connection() as conn:
             rows = conn.execute(
                 f"""
                 SELECT id, embedding FROM search_docs
-                WHERE guild_id = ? AND kind IN ({placeholders}) AND embed_model = ? AND embed_dim = ?
+                WHERE campaign_id = ? AND kind IN ({placeholders}) AND embed_model = ? AND embed_dim = ?
                   AND embedding IS NOT NULL
                 """,
-                (guild_id, *kinds, model, dim),
+                (campaign_id, *kinds, model, dim),
             ).fetchall()
         return [(int(row["id"]), bytes(row["embedding"])) for row in rows]
 
-    def keyword_search(self, guild_id: int, match: str, kinds: tuple[str, ...], limit: int) -> list[int]:
+    def keyword_search(self, campaign_id: int, match: str, kinds: tuple[str, ...], limit: int) -> list[int]:
         """Doc ids matching an FTS5 query, best BM25 first (titles weigh more than bodies)."""
         placeholders = ",".join("?" for _ in kinds)
         with self.connection() as conn:
@@ -1044,11 +1169,11 @@ class Storage:
                 SELECT d.id
                 FROM search_fts
                 JOIN search_docs d ON d.id = search_fts.rowid
-                WHERE search_fts MATCH ? AND d.guild_id = ? AND d.kind IN ({placeholders})
+                WHERE search_fts MATCH ? AND d.campaign_id = ? AND d.kind IN ({placeholders})
                 ORDER BY bm25(search_fts, 4.0, 1.0)
                 LIMIT ?
                 """,
-                (match, guild_id, *kinds, limit),
+                (match, campaign_id, *kinds, limit),
             ).fetchall()
         return [int(row["id"]) for row in rows]
 
@@ -1060,7 +1185,7 @@ class Storage:
             rows = conn.execute(f"SELECT * FROM search_docs WHERE id IN ({placeholders})", doc_ids).fetchall()
         return {int(row["id"]): _search_doc_from_row(row) for row in rows}
 
-    def page_doc_ids(self, guild_id: int, entity_ids: list[int]) -> dict[int, int]:
+    def page_doc_ids(self, campaign_id: int, entity_ids: list[int]) -> dict[int, int]:
         """entity id -> search doc id of its page."""
         if not entity_ids:
             return {}
@@ -1069,14 +1194,14 @@ class Storage:
             rows = conn.execute(
                 f"""
                 SELECT id, ref_id FROM search_docs
-                WHERE guild_id = ? AND kind = 'page' AND ref_id IN ({placeholders})
+                WHERE campaign_id = ? AND kind = 'page' AND ref_id IN ({placeholders})
                 """,
-                (guild_id, *entity_ids),
+                (campaign_id, *entity_ids),
             ).fetchall()
         return {int(row["ref_id"]): int(row["id"]) for row in rows}
 
-    def count_unembedded_docs(self, guild_id: int, model: str, kinds: tuple[str, ...]) -> int:
-        return len(self.docs_needing_embedding(guild_id, model, kinds))
+    def count_unembedded_docs(self, campaign_id: int, model: str, kinds: tuple[str, ...]) -> int:
+        return len(self.docs_needing_embedding(campaign_id, model, kinds))
 
     def _insert_alias(self, conn: sqlite3.Connection, entity_id: int, canonical_name: str, alias: str) -> bool:
         alias = alias.strip()
@@ -1105,7 +1230,7 @@ class Storage:
         ).fetchall()
         return Entity(
             id=int(row["id"]),
-            guild_id=int(row["guild_id"]),
+            campaign_id=int(row["campaign_id"]),
             type=row["type"],
             canonical_name=row["canonical_name"],
             aliases=[alias["alias"] for alias in aliases],
@@ -1115,10 +1240,19 @@ class Storage:
         )
 
 
+def _campaign_from_row(row: sqlite3.Row) -> Campaign:
+    return Campaign(
+        id=int(row["id"]),
+        guild_id=int(row["guild_id"]),
+        name=row["name"],
+        is_active=bool(row["is_active"]),
+    )
+
+
 def _fact_from_row(row: sqlite3.Row) -> Fact:
     return Fact(
         id=int(row["id"]),
-        guild_id=int(row["guild_id"]),
+        campaign_id=int(row["campaign_id"]),
         entity_id=int(row["entity_id"]),
         kind=row["kind"],
         text=row["text"],
@@ -1134,7 +1268,7 @@ def _fact_from_row(row: sqlite3.Row) -> Fact:
 def _search_doc_from_row(row: sqlite3.Row) -> SearchDoc:
     return SearchDoc(
         id=int(row["id"]),
-        guild_id=int(row["guild_id"]),
+        campaign_id=int(row["campaign_id"]),
         kind=row["kind"],
         ref_id=int(row["ref_id"]),
         part=int(row["part"]),

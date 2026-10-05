@@ -82,7 +82,7 @@ class CampaignWiki:
 
     async def process_session(
         self,
-        guild_id: int,
+        campaign_id: int,
         session_id: int,
         timed_transcript: str,
         on_wait: WaitNotifier | None = None,
@@ -94,9 +94,9 @@ class CampaignWiki:
         `!reprocess-llm` replaces rather than duplicates them.
         """
         report = WikiChangeReport()
-        await self.ensure_player_characters(guild_id)
+        await self.ensure_player_characters(campaign_id)
         retracted, _ = await asyncio.to_thread(
-            self.storage.retract_session_facts, guild_id, session_id, "session reprocessed"
+            self.storage.retract_session_facts, campaign_id, session_id, "session reprocessed"
         )
         report.facts_retracted = retracted
 
@@ -104,18 +104,18 @@ class CampaignWiki:
         chunks = split_transcript_chunks(timed_transcript, self.settings.extract_chunk_chars)
         for index, chunk in enumerate(chunks, start=1):
             _progress(on_progress, f"Extracting campaign facts ({index}/{len(chunks)}).")
-            entities = await asyncio.to_thread(self.storage.list_entities, guild_id)
+            entities = await asyncio.to_thread(self.storage.list_entities, campaign_id)
             index_text = await asyncio.to_thread(format_entity_index, entities, chunk)
             payload = await self.llm.extract_facts(index_text, chunk, on_wait=on_wait)
-            await self._apply_extraction(guild_id, session_id, payload, chunk, result, on_wait=on_wait)
+            await self._apply_extraction(campaign_id, session_id, payload, chunk, result, on_wait=on_wait)
         report.facts_added = result.facts_added
         report.renamed = result.renamed
 
-        report.page_failures = await self.refresh_stale_pages(guild_id, on_wait=on_wait, on_progress=on_progress)
+        report.page_failures = await self.refresh_stale_pages(campaign_id, on_wait=on_wait, on_progress=on_progress)
         if self.search is not None:
-            report.pages_without_embedding = await self.search.pending_count(guild_id)
+            report.pages_without_embedding = await self.search.pending_count(campaign_id)
 
-        entities = await asyncio.to_thread(self.storage.list_entities, guild_id)
+        entities = await asyncio.to_thread(self.storage.list_entities, campaign_id)
         by_id = {entity.id: entity for entity in entities}
         created = set(result.created)
         report.new_entities = [by_id[i] for i in result.created if i in by_id]
@@ -130,30 +130,30 @@ class CampaignWiki:
         )
         return report
 
-    async def ensure_player_characters(self, guild_id: int) -> list[int]:
+    async def ensure_player_characters(self, campaign_id: int) -> list[int]:
         """Create a Character entity for every `!register-character` name that has none yet."""
 
         def ensure() -> list[int]:
             created = []
-            for name in self.storage.list_registered_characters(guild_id):
-                if not self.storage.find_entities_by_name(guild_id, name):
+            for name in self.storage.list_registered_characters(campaign_id):
+                if not self.storage.find_entities_by_name(campaign_id, name):
                     created.append(
-                        self.storage.create_entity(guild_id, "Character", name, short_description="Player character")
+                        self.storage.create_entity(campaign_id, "Character", name, short_description="Player character")
                     )
             return created
 
         return await asyncio.to_thread(ensure)
 
-    def spelling_glossary(self, guild_id: int) -> list[str]:
+    def spelling_glossary(self, campaign_id: int) -> list[str]:
         """Names (blocking) the summarizer should spell correctly. Names only, no descriptions or
         facts, so a summary still comes from its own transcript alone."""
         return spelling_glossary(
-            self.storage.list_entities(guild_id), self.storage.list_registered_characters(guild_id)
+            self.storage.list_entities(campaign_id), self.storage.list_registered_characters(campaign_id)
         )
 
     async def _apply_extraction(
         self,
-        guild_id: int,
+        campaign_id: int,
         session_id: int | None,
         payload: dict[str, Any],
         chunk: str,
@@ -167,7 +167,7 @@ class CampaignWiki:
         checking existing entities (see `_resolve_reference`).
         """
         for reveal in payload.get("name_reveals", []):
-            await self._apply_name_reveal(guild_id, reveal, result)
+            await self._apply_name_reveal(campaign_id, reveal, result)
 
         proposals: dict[str, dict[str, Any]] = {}
         for item in payload.get("new_entities", []):
@@ -183,7 +183,7 @@ class CampaignWiki:
                 names = {normalize_name(n) for n in ([proposal["name"], *proposal["aliases"]] if proposal else [ref])}
                 evidence = [f for f in facts if normalize_name(f["entity"]) in names]
                 resolved[key] = await self._resolve_reference(
-                    guild_id, session_id, ref, proposal, evidence, chunk, result, on_wait
+                    campaign_id, session_id, ref, proposal, evidence, chunk, result, on_wait
                 )
             entity_id = resolved[key]
             if entity_id is None:
@@ -192,7 +192,7 @@ class CampaignWiki:
             timestamp = fact.get("timestamp", "")
             await asyncio.to_thread(
                 self.storage.add_fact,
-                guild_id,
+                campaign_id,
                 entity_id,
                 fact["text"],
                 "observed",
@@ -204,13 +204,13 @@ class CampaignWiki:
 
         for update in payload.get("alias_updates", []):
             match = ENTITY_ID_RE.match(update["entity"])
-            entity = await asyncio.to_thread(self.storage.get_entity, guild_id, int(match.group(1))) if match else None
+            entity = await asyncio.to_thread(self.storage.get_entity, campaign_id, int(match.group(1))) if match else None
             if entity is not None:
                 await asyncio.to_thread(self.storage.add_alias, entity.id, update["alias"])
 
     async def _resolve_reference(
         self,
-        guild_id: int,
+        campaign_id: int,
         session_id: int | None,
         ref: str,
         proposal: dict[str, Any] | None,
@@ -230,11 +230,11 @@ class CampaignWiki:
         """
         match = ENTITY_ID_RE.match(ref)
         if match:
-            entity = await asyncio.to_thread(self.storage.get_entity, guild_id, int(match.group(1)))
+            entity = await asyncio.to_thread(self.storage.get_entity, campaign_id, int(match.group(1)))
             return entity.id if entity else None
 
         names = [proposal["name"], *proposal["aliases"]] if proposal else [ref]
-        exact = await asyncio.to_thread(self._find_by_any_name, guild_id, names)
+        exact = await asyncio.to_thread(self._find_by_any_name, campaign_id, names)
         if len(exact) == 1:
             await asyncio.to_thread(self._add_aliases, exact[0].id, names)
             return exact[0].id
@@ -242,7 +242,7 @@ class CampaignWiki:
         if exact:
             candidates = exact
         else:
-            entities = await asyncio.to_thread(self.storage.list_entities, guild_id)
+            entities = await asyncio.to_thread(self.storage.list_entities, campaign_id)
             candidates = match_candidates(entities, names)
         decision: dict[str, str] | None = None
         chosen: Entity | None = None
@@ -266,7 +266,7 @@ class CampaignWiki:
 
         entity_id = await asyncio.to_thread(
             self.storage.create_entity,
-            guild_id,
+            campaign_id,
             proposal["type"],
             proposal["name"],
             proposal["aliases"],
@@ -274,7 +274,7 @@ class CampaignWiki:
             session_id,
         )
         result.created.append(entity_id)
-        new_entity = await asyncio.to_thread(self.storage.get_entity, guild_id, entity_id)
+        new_entity = await asyncio.to_thread(self.storage.get_entity, campaign_id, entity_id)
         if decision is not None and (decision["decision"] == "unsure" or exact):
             other = chosen or candidates[0]
             label = "possibly the same" if decision["decision"] == "unsure" else "shares a name"
@@ -317,15 +317,15 @@ class CampaignWiki:
         log.info("Entity match for %r: %s %s (%s)", names[0], decision["decision"], decision["entity"], decision["reason"])
         return decision
 
-    async def _apply_name_reveal(self, guild_id: int, reveal: dict[str, str], result: "ExtractionResult") -> None:
+    async def _apply_name_reveal(self, campaign_id: int, reveal: dict[str, str], result: "ExtractionResult") -> None:
         match = ENTITY_ID_RE.match(reveal["entity"])
-        entity = await asyncio.to_thread(self.storage.get_entity, guild_id, int(match.group(1))) if match else None
+        entity = await asyncio.to_thread(self.storage.get_entity, campaign_id, int(match.group(1))) if match else None
         new_name = reveal["name"].strip()
         if entity is None or normalize_name(new_name) == normalize_name(entity.canonical_name):
             return
         others = [
             other
-            for other in await asyncio.to_thread(self.storage.find_entities_by_name, guild_id, new_name)
+            for other in await asyncio.to_thread(self.storage.find_entities_by_name, campaign_id, new_name)
             if other.id != entity.id
         ]
         if others:
@@ -336,10 +336,10 @@ class CampaignWiki:
         await asyncio.to_thread(self.storage.rename_entity, entity.id, new_name)
         result.renamed.append((entity.canonical_name, new_name))
 
-    def _find_by_any_name(self, guild_id: int, names: list[str]) -> list[Entity]:
+    def _find_by_any_name(self, campaign_id: int, names: list[str]) -> list[Entity]:
         found: dict[int, Entity] = {}
         for name in names:
-            for entity in self.storage.find_entities_by_name(guild_id, name):
+            for entity in self.storage.find_entities_by_name(campaign_id, name):
                 found.setdefault(entity.id, entity)
         return list(found.values())
 
@@ -349,9 +349,9 @@ class CampaignWiki:
 
     # --- Pages --------------------------------------------------------------------------
 
-    def stale_entity_ids(self, guild_id: int) -> list[int]:
-        active = self.storage.active_fact_ids_by_entity(guild_id)
-        pages = self.storage.page_source_ids_by_entity(guild_id)
+    def stale_entity_ids(self, campaign_id: int) -> list[int]:
+        active = self.storage.active_fact_ids_by_entity(campaign_id)
+        pages = self.storage.page_source_ids_by_entity(campaign_id)
         return sorted(
             entity_id
             for entity_id in set(active) | set(pages)
@@ -360,27 +360,27 @@ class CampaignWiki:
 
     async def refresh_stale_pages(
         self,
-        guild_id: int,
+        campaign_id: int,
         on_wait: WaitNotifier | None = None,
         on_progress: ProgressCallback | None = None,
     ) -> list[str]:
         """Rewrite every page whose facts changed. Returns names of entities whose rewrite failed."""
-        stale = await asyncio.to_thread(self.stale_entity_ids, guild_id)
+        stale = await asyncio.to_thread(self.stale_entity_ids, campaign_id)
         failures: list[str] = []
         for index, entity_id in enumerate(stale, start=1):
             _progress(on_progress, f"Rewriting wiki pages ({index}/{len(stale)}).")
             try:
-                await self.refresh_page(guild_id, entity_id, on_wait=on_wait)
+                await self.refresh_page(campaign_id, entity_id, on_wait=on_wait)
             except Exception:
                 log.exception("Could not rewrite the wiki page for entity %s", entity_id)
-                entity = await asyncio.to_thread(self.storage.get_entity, guild_id, entity_id)
+                entity = await asyncio.to_thread(self.storage.get_entity, campaign_id, entity_id)
                 failures.append(entity.canonical_name if entity else f"#{entity_id}")
-        await self._after_change(guild_id)
+        await self._after_change(campaign_id)
         return failures
 
     async def refresh_page(
         self,
-        guild_id: int,
+        campaign_id: int,
         entity_id: int,
         on_wait: WaitNotifier | None = None,
         force_full: bool = False,
@@ -390,7 +390,7 @@ class CampaignWiki:
         `force_full` rebuilds the page from all facts even if it is current (e.g. after a layout
         change).
         """
-        entity = await asyncio.to_thread(self.storage.get_entity, guild_id, entity_id)
+        entity = await asyncio.to_thread(self.storage.get_entity, campaign_id, entity_id)
         if entity is None:
             return False
         facts = await asyncio.to_thread(self.storage.get_entity_facts, entity.id)
@@ -411,7 +411,7 @@ class CampaignWiki:
 
         pinned = [fact for fact in facts if fact.kind == "pinned"]
         pinned_text = "\n".join(format_fact(fact) for fact in pinned)
-        layout = page_layout(entity, await asyncio.to_thread(self._is_player_character, guild_id, entity))
+        layout = page_layout(entity, await asyncio.to_thread(self._is_player_character, campaign_id, entity))
         markdown = page.markdown if page else ""
         short_description = entity.short_description
         status = entity.status
@@ -437,69 +437,69 @@ class CampaignWiki:
             await asyncio.to_thread(self.storage.set_entity_status, entity.id, status)
         return True
 
-    def linked_quests(self, guild_id: int) -> dict[int, list[Entity]]:
-        return linked_quests(self.storage, guild_id)
+    def linked_quests(self, campaign_id: int) -> dict[int, list[Entity]]:
+        return linked_quests(self.storage, campaign_id)
 
     async def rebuild_all_pages(
         self,
-        guild_id: int,
+        campaign_id: int,
         on_wait: WaitNotifier | None = None,
         on_progress: ProgressCallback | None = None,
     ) -> tuple[int, list[str]]:
         """Rebuild every page from its facts (after a layout change). Returns (rebuilt, failures)."""
-        entity_ids = sorted(await asyncio.to_thread(self.storage.active_fact_ids_by_entity, guild_id))
+        entity_ids = sorted(await asyncio.to_thread(self.storage.active_fact_ids_by_entity, campaign_id))
         rebuilt, failures = 0, []
         for index, entity_id in enumerate(entity_ids, start=1):
             _progress(on_progress, f"Rebuilding wiki pages ({index}/{len(entity_ids)}).")
             try:
-                await self.refresh_page(guild_id, entity_id, on_wait=on_wait, force_full=True)
+                await self.refresh_page(campaign_id, entity_id, on_wait=on_wait, force_full=True)
                 rebuilt += 1
             except Exception:
                 log.exception("Could not rebuild the wiki page for entity %s", entity_id)
-                entity = await asyncio.to_thread(self.storage.get_entity, guild_id, entity_id)
+                entity = await asyncio.to_thread(self.storage.get_entity, campaign_id, entity_id)
                 failures.append(entity.canonical_name if entity else f"#{entity_id}")
-        await self._after_change(guild_id)
+        await self._after_change(campaign_id)
         return rebuilt, failures
 
-    def _is_player_character(self, guild_id: int, entity: Entity) -> bool:
+    def _is_player_character(self, campaign_id: int, entity: Entity) -> bool:
         if entity.type != "Character":
             return False
         names = {normalize_name(name) for name in entity.names()}
-        return any(normalize_name(name) in names for name in self.storage.list_registered_characters(guild_id))
+        return any(normalize_name(name) in names for name in self.storage.list_registered_characters(campaign_id))
 
     # --- Review commands ----------------------------------------------------------------
 
-    async def resolve_entity(self, guild_id: int, ref: str) -> list[Entity]:
+    async def resolve_entity(self, campaign_id: int, ref: str) -> list[Entity]:
         """Look up an entity by `#id`, id, canonical name or alias."""
         ref = ref.strip()
         match = ENTITY_ID_RE.match(ref)
         if match:
-            entity = await asyncio.to_thread(self.storage.get_entity, guild_id, int(match.group(1)))
+            entity = await asyncio.to_thread(self.storage.get_entity, campaign_id, int(match.group(1)))
             if entity is not None:
                 return [entity]
-        return await asyncio.to_thread(self.storage.find_entities_by_name, guild_id, ref)
+        return await asyncio.to_thread(self.storage.find_entities_by_name, campaign_id, ref)
 
-    async def merge(self, guild_id: int, source: Entity, target: Entity, on_wait: WaitNotifier | None = None) -> None:
+    async def merge(self, campaign_id: int, source: Entity, target: Entity, on_wait: WaitNotifier | None = None) -> None:
         await asyncio.to_thread(self.storage.merge_entities, source.id, target.id)
-        await self.refresh_after_change(guild_id, target.id, on_wait=on_wait)
+        await self.refresh_after_change(campaign_id, target.id, on_wait=on_wait)
 
-    async def rename(self, guild_id: int, entity: Entity, new_name: str, on_wait: WaitNotifier | None = None) -> None:
+    async def rename(self, campaign_id: int, entity: Entity, new_name: str, on_wait: WaitNotifier | None = None) -> None:
         await asyncio.to_thread(self.storage.rename_entity, entity.id, new_name)
-        await self._after_change(guild_id)
+        await self._after_change(campaign_id)
 
-    async def has_name(self, guild_id: int, entity: Entity, name: str) -> bool:
+    async def has_name(self, campaign_id: int, entity: Entity, name: str) -> bool:
         return normalize_name(name) in {normalize_name(existing) for existing in entity.names()}
 
-    async def add_alias(self, guild_id: int, entity: Entity, alias: str, on_wait: WaitNotifier | None = None) -> None:
+    async def add_alias(self, campaign_id: int, entity: Entity, alias: str, on_wait: WaitNotifier | None = None) -> None:
         if await asyncio.to_thread(self.storage.add_alias, entity.id, alias):
-            await self._after_change(guild_id)
+            await self._after_change(campaign_id)
 
-    async def refresh_after_change(self, guild_id: int, entity_id: int, on_wait: WaitNotifier | None = None) -> None:
+    async def refresh_after_change(self, campaign_id: int, entity_id: int, on_wait: WaitNotifier | None = None) -> None:
         """Rewrite one entity's page after a manual fact change (pin, correction, retraction, merge)."""
-        await self.refresh_page(guild_id, entity_id, on_wait=on_wait)
-        await self._after_change(guild_id)
+        await self.refresh_page(campaign_id, entity_id, on_wait=on_wait)
+        await self._after_change(campaign_id)
 
-    async def render_entity(self, guild_id: int, entity: Entity) -> str:
+    async def render_entity(self, campaign_id: int, entity: Entity) -> str:
         """Discord view of one entity: page (or raw facts) plus the sources it cites."""
         page = await asyncio.to_thread(self.storage.get_page, entity.id)
         facts = await asyncio.to_thread(self.storage.get_entity_facts, entity.id)
@@ -516,7 +516,7 @@ class CampaignWiki:
         else:
             lines.append("_No facts recorded._")
             cited = []
-        quests = (await asyncio.to_thread(self.linked_quests, guild_id)).get(entity.id, [])
+        quests = (await asyncio.to_thread(self.linked_quests, campaign_id)).get(entity.id, [])
         if quests:
             lines.extend(["", *quest_list(quests)])
         by_id = {fact.id: fact for fact in facts}
@@ -528,22 +528,22 @@ class CampaignWiki:
 
     # --- Export -------------------------------------------------------------------------
 
-    def export(self, guild_id: int) -> Path:
+    def export(self, campaign_id: int) -> Path:
         """Write an Obsidian-style vault: one Markdown file per entity, `[[links]]`, cited sources.
 
         The directory is regenerated from the database each time; do not edit files in it.
         """
         with self._export_lock:
-            return self._export_locked(guild_id)
+            return self._export_locked(campaign_id)
 
-    def _export_locked(self, guild_id: int) -> Path:
-        target = self.export_root / str(guild_id)
-        pages = self.storage.list_pages(guild_id)
+    def _export_locked(self, campaign_id: int) -> Path:
+        target = self.export_root / str(campaign_id)
+        pages = self.storage.list_pages(campaign_id)
         fact_ids = sorted({fact_id for _, page in pages for fact_id in cited_fact_ids(page.markdown)})
-        facts = self.storage.get_facts(guild_id, fact_ids)
+        facts = self.storage.get_facts(campaign_id, fact_ids)
         entities = [entity for entity, _ in pages]
         file_names = _unique_file_names(entities)
-        links = self.linked_quests(guild_id)
+        links = self.linked_quests(campaign_id)
         if target.exists():
             shutil.rmtree(target)
         for entity, page in pages:
@@ -562,16 +562,16 @@ class CampaignWiki:
             (folder / f"{file_names[entity.id]}.md").write_text(content, encoding="utf-8")
         return target
 
-    async def _after_change(self, guild_id: int) -> None:
+    async def _after_change(self, campaign_id: int) -> None:
         """Export the vault and re-index changed pages for search. Search indexing failures are
         logged, not raised: the wiki change itself is saved."""
         if self.settings.wiki_export:
-            await asyncio.to_thread(self.export, guild_id)
+            await asyncio.to_thread(self.export, campaign_id)
         if self.search is not None:
             try:
-                await self.search.refresh(guild_id)
+                await self.search.refresh(campaign_id)
             except Exception:
-                log.exception("Could not update the search index for guild %s", guild_id)
+                log.exception("Could not update the search index for campaign %s", campaign_id)
 
 
 # --- Page layouts ----------------------------------------------------------------------------
@@ -707,12 +707,12 @@ def entity_header(entity: Entity) -> str:
     return header
 
 
-def linked_quests(storage: Storage, guild_id: int) -> dict[int, list[Entity]]:
+def linked_quests(storage: Storage, campaign_id: int) -> dict[int, list[Entity]]:
     """Quests each entity is involved in: those whose active facts name it (name or alias)."""
-    entities = storage.list_entities(guild_id)
+    entities = storage.list_entities(campaign_id)
     quests = {entity.id: entity for entity in entities if entity.type == "Quest"}
     links: dict[int, list[Entity]] = {}
-    for quest_id, texts in storage.active_facts_by_type(guild_id, "Quest").items():
+    for quest_id, texts in storage.active_facts_by_type(campaign_id, "Quest").items():
         if quest_id not in quests:
             continue
         for entity_id in sorted(mentioned_entity_ids(entities, "\n".join(texts), fuzzy=False)):
