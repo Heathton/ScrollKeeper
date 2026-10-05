@@ -7,10 +7,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scrollkeeper.llm import LocalAIService, normalize_extraction_payload
-from scrollkeeper.models import Entity, Fact, WikiChangeReport
+from scrollkeeper.models import ENTITY_TYPES, Entity, Fact, WikiChangeReport
 from scrollkeeper.storage import Storage
 from scrollkeeper.wiki import (
+    PAGE_LAYOUTS,
+    PLAYER_CHARACTER_LAYOUT,
     CampaignWiki,
+    normalize_headings,
+    render_layout,
     match_candidates,
     mentioned_entity_ids,
     transcript_excerpt,
@@ -45,9 +49,9 @@ class FakeLLM:
         self.extract_calls.append((entity_index, transcript_chunk))
         return normalize_extraction_payload(self.extractions.pop(0) if self.extractions else {})
 
-    async def rewrite_page(self, entity_header, current_page, pinned_facts, new_facts, on_wait=None) -> dict:
+    async def rewrite_page(self, entity_header, current_page, pinned_facts, new_facts, template="", on_wait=None) -> dict:
         self.rewrite_calls.append(
-            {"entity": entity_header, "page": current_page, "pinned": pinned_facts, "new": new_facts}
+            {"entity": entity_header, "page": current_page, "pinned": pinned_facts, "new": new_facts, "template": template}
         )
         lines = [line for line in (current_page.splitlines() if current_page else [])]
         for block in (pinned_facts, new_facts):
@@ -318,6 +322,46 @@ class EntityMatchingTests(WikiTestCase):
         self.assertEqual(len(self.storage.find_entities_by_name(1, "Brenna")), 1)
 
 
+class PageLayoutTests(WikiTestCase):
+    async def test_each_type_gets_its_layout_and_player_characters_the_light_one(self) -> None:
+        quest = self.storage.create_entity(1, "Quest", "Recover the Ledger")
+        npc = self.storage.create_entity(1, "Character", "Varric Thane")
+        self.storage.register_character(1, 55, "Brenna")
+        await self.wiki.ensure_player_characters(1)
+        pc = self.storage.find_entities_by_name(1, "Brenna")[0].id
+        for entity_id in (quest, npc, pc):
+            self.storage.add_fact(1, entity_id, "A fact.", "observed")
+            await self.wiki.refresh_page(1, entity_id)
+
+        layouts = [call["template"] for call in self.llm.rewrite_calls]
+        expected = [PAGE_LAYOUTS["Quest"], PAGE_LAYOUTS["Character"], PLAYER_CHARACTER_LAYOUT]
+        self.assertEqual(layouts, [render_layout(layout) for layout in expected])
+        self.assertIn("- `## Progress`: steps taken, in session order.", layouts[0])
+        for entity_type in ("Character", "Faction", "Location", "Item", "PointOfInterest"):
+            self.assertIn("Quests", [heading for heading, _ in PAGE_LAYOUTS[entity_type][1]])
+        self.assertEqual(set(PAGE_LAYOUTS), set(ENTITY_TYPES))
+
+    def test_copied_guidance_is_trimmed_from_headings(self) -> None:
+        markdown = "Intro.\n## Status: alive, dead or missing\n## Relationships (with others)\n## Status Quo Ante\n## Other"
+        self.assertEqual(
+            normalize_headings(markdown, PAGE_LAYOUTS["Character"]),
+            "Intro.\n## Status\n## Relationships\n## Status Quo Ante\n## Other",
+        )
+        self.assertEqual(normalize_headings("short_description: A quest\n\nIntro.", None), "Intro.")
+
+    async def test_rebuild_all_pages_rewrites_current_pages_from_scratch(self) -> None:
+        entity_id = self.storage.create_entity(1, "Location", "Gullhaven")
+        self.storage.add_fact(1, entity_id, "A port town.", "observed")
+        await self.wiki.refresh_page(1, entity_id)
+        self.assertFalse(await self.wiki.refresh_page(1, entity_id), "an up-to-date page is left alone")
+
+        rebuilt, failures = await self.wiki.rebuild_all_pages(1)
+
+        self.assertEqual((rebuilt, failures), (1, []))
+        self.assertEqual(self.llm.rewrite_calls[-1]["page"], "")
+        self.assertIn("A port town.", self.llm.rewrite_calls[-1]["new"])
+
+
 class ReviewCommandTests(WikiTestCase):
     async def _entity_with_page(self, name: str, *facts: str) -> Entity:
         entity_id = self.storage.create_entity(1, "Character", name)
@@ -498,6 +542,15 @@ class SchemaRequestTests(unittest.TestCase):
         self.assertEqual(body["chat_template_kwargs"], {"enable_thinking": False})
         self.assertEqual(body["model"], "test-model")
         self.assertEqual(body["response_format"]["type"], "json_schema")
+
+    def test_page_prompt_includes_the_layout(self) -> None:
+        service = LocalAIService(fake_settings())
+        content = '{"short_description": "s", "markdown": "m"}'
+        with patch("scrollkeeper.llm.requests.post", return_value=self._response(content)) as post:
+            service._rewrite_page_sync("[Quest] Recover the Ledger", "", "", "", render_layout(PAGE_LAYOUTS["Quest"]))
+        system_prompt = post.call_args.kwargs["json"]["messages"][0]["content"]
+        self.assertIn("Page layout:", system_prompt)
+        self.assertIn("## Progress", system_prompt)
 
     def test_invalid_json_is_retried_once(self) -> None:
         service = LocalAIService(fake_settings())

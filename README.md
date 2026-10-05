@@ -28,7 +28,7 @@ ScrollKeeper is a Discord bot for tabletop campaigns. It can join a voice channe
 
 Entities are referred to by `#id`, name or alias. Put names with spaces in quotes when another argument follows (`!merge-entity "Lord Varric" Varric`).
 
-- `!entities [type]`: list entities (types: Character, Faction, Location, Item, Mystery, PointOfInterest) with fact counts
+- `!entities [type]`: list entities (types: Character, Faction, Location, Item, Mystery, PointOfInterest, Quest) with fact counts
 - `!entity <name>`: show an entity's page and the facts it cites (fact ids `F12`, with session and transcript time)
 - `!merge-entity <from> <into>`: merge a duplicate; its facts move over and its names become aliases
 - `!rename-entity <entity> <new name>`: change the canonical name (the old name stays as an alias)
@@ -36,8 +36,24 @@ Entities are referred to by `#id`, name or alias. Put names with spaces in quote
 - `!pin-fact <entity> <text>`: add an authoritative fact; pinned facts override anything that conflicts
 - `!correct-fact <fact-id> <text>`: replace a wrong fact with a pinned one (the old fact is kept as history)
 - `!retract-fact <fact-id> [reason]`: withdraw a wrong fact
+- `!rebuild-pages`: rewrite every page from its facts (after a page-layout change); one LLM call per entity
 
 After each processed session the bot posts the new, updated and renamed entities and **possible duplicates** so they can be merged.
+
+Pages follow a fixed layout per type (`PAGE_LAYOUTS` in `src/scrollkeeper/wiki.py`): an opening paragraph, then sections in a set order, each written only when facts support it.
+
+| Type | Sections |
+|---|---|
+| Character | Appearance & Personality, Relationships, Quests, History, Status, Open Questions |
+| Player character (registered) | Relationships, Quests, History |
+| Faction | Members & Leadership, Allies & Enemies, Activities, Relationship with the Party, Quests, Open Questions |
+| Location | Notable Places, Notable People, Quests, History, Current State, Open Questions |
+| Item | Properties & Effects, Provenance, Quests, History, Open Questions |
+| Mystery | Clues, Theories, Status |
+| PointOfInterest | Features, Dangers, Quests, History, Open Questions |
+| Quest | Status, Progress, People & Places, Open Questions |
+
+Quests are entities too: extraction records each quest's giver, objective, reward and status changes on the Quest, and the link on each entity involved, so their pages list it under Quests.
 
 How the bot decides whether someone or something is already known:
 

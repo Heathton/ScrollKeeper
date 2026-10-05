@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 
 
-ENTITY_TYPES = ("Character", "Faction", "Location", "Item", "Mystery", "PointOfInterest")
+ENTITY_TYPES = ("Character", "Faction", "Location", "Item", "Mystery", "PointOfInterest", "Quest")
 FACT_KINDS = ("observed", "pinned", "imported")
 
 

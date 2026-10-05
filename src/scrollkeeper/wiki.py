@@ -364,8 +364,18 @@ class CampaignWiki:
             await asyncio.to_thread(self.export, guild_id)
         return failures
 
-    async def refresh_page(self, guild_id: int, entity_id: int, on_wait: WaitNotifier | None = None) -> bool:
-        """Bring one page up to date with its entity's active facts. Returns True if it changed."""
+    async def refresh_page(
+        self,
+        guild_id: int,
+        entity_id: int,
+        on_wait: WaitNotifier | None = None,
+        force_full: bool = False,
+    ) -> bool:
+        """Bring one page up to date with its entity's active facts. Returns True if it changed.
+
+        `force_full` rebuilds the page from all facts even if it is current (e.g. after a layout
+        change).
+        """
         entity = await asyncio.to_thread(self.storage.get_entity, guild_id, entity_id)
         if entity is None:
             return False
@@ -378,7 +388,7 @@ class CampaignWiki:
             return False
 
         active_ids = {fact.id for fact in facts}
-        if page is not None and not set(page.source_fact_ids) <= active_ids:
+        if page is not None and (force_full or not set(page.source_fact_ids) <= active_ids):
             page = None  # A source fact was retracted, superseded or moved: rebuild from scratch.
         known = set(page.source_fact_ids) if page else set()
         new_facts = [fact for fact in facts if fact.id not in known]
@@ -387,6 +397,7 @@ class CampaignWiki:
 
         pinned = [fact for fact in facts if fact.kind == "pinned"]
         pinned_text = "\n".join(format_fact(fact) for fact in pinned)
+        layout = page_layout(entity, await asyncio.to_thread(self._is_player_character, guild_id, entity))
         markdown = page.markdown if page else ""
         short_description = entity.short_description
         for batch in _batch_facts([fact for fact in new_facts if fact.kind != "pinned"] or [None]):
@@ -395,11 +406,12 @@ class CampaignWiki:
                 markdown,
                 pinned_text,
                 "\n".join(format_fact(fact) for fact in batch if fact is not None),
+                render_layout(layout),
                 on_wait=on_wait,
             )
             if not result["markdown"]:
                 raise RuntimeError(f"The LLM returned an empty page for {entity.canonical_name}.")
-            markdown = result["markdown"]
+            markdown = normalize_headings(result["markdown"], layout)
             short_description = _strip_citations(result["short_description"]) or short_description
 
         embedding = await self.llm.embed_text(page_embedding_text(entity, markdown), on_wait=on_wait)
@@ -407,6 +419,33 @@ class CampaignWiki:
         if short_description != entity.short_description:
             await asyncio.to_thread(self.storage.set_entity_short_description, entity.id, short_description)
         return True
+
+    async def rebuild_all_pages(
+        self,
+        guild_id: int,
+        on_wait: WaitNotifier | None = None,
+        on_progress: ProgressCallback | None = None,
+    ) -> tuple[int, list[str]]:
+        """Rebuild every page from its facts (after a layout change). Returns (rebuilt, failures)."""
+        entity_ids = sorted(await asyncio.to_thread(self.storage.active_fact_ids_by_entity, guild_id))
+        rebuilt, failures = 0, []
+        for index, entity_id in enumerate(entity_ids, start=1):
+            _progress(on_progress, f"Rebuilding wiki pages ({index}/{len(entity_ids)}).")
+            try:
+                await self.refresh_page(guild_id, entity_id, on_wait=on_wait, force_full=True)
+                rebuilt += 1
+            except Exception:
+                log.exception("Could not rebuild the wiki page for entity %s", entity_id)
+                entity = await asyncio.to_thread(self.storage.get_entity, guild_id, entity_id)
+                failures.append(entity.canonical_name if entity else f"#{entity_id}")
+        await self._export_if_enabled(guild_id)
+        return rebuilt, failures
+
+    def _is_player_character(self, guild_id: int, entity: Entity) -> bool:
+        if entity.type != "Character":
+            return False
+        names = {normalize_name(name) for name in entity.names()}
+        return any(normalize_name(name) in names for name in self.storage.list_registered_characters(guild_id))
 
     async def reembed_page(self, guild_id: int, entity_id: int, on_wait: WaitNotifier | None = None) -> None:
         """Refresh a page's embedding after a name or alias change (the text is unchanged)."""
@@ -522,6 +561,138 @@ class CampaignWiki:
     async def _export_if_enabled(self, guild_id: int) -> None:
         if self.settings.wiki_export:
             await asyncio.to_thread(self.export, guild_id)
+
+
+# --- Page layouts ----------------------------------------------------------------------------
+
+# One layout per entity type: what the opening paragraph covers, then `##` sections (heading,
+# guidance) in order, each written only when facts support it. Changing a layout affects pages as
+# they are next rewritten; `!rebuild-pages` applies it to every page at once.
+Layout = tuple[str, list[tuple[str, str]]]
+
+_QUESTS = (
+    "Quests",
+    "only Quest entities the facts name, that this entity gave, is the target of, or is involved in; "
+    "one bullet each with the quest name and its status. Do not turn other plot threads into quests",
+)
+_OPEN_QUESTIONS = ("Open Questions", "unresolved questions raised by the facts")
+_STATUS_RULE = "only what the facts state; leave out anything unknown"
+
+PAGE_LAYOUTS: dict[str, Layout] = {
+    "Character": (
+        "who they are, their role, and where they are usually found",
+        [
+            ("Appearance & Personality", "how they look and behave"),
+            ("Relationships", "with other characters, factions and the party"),
+            _QUESTS,
+            ("History", "what happened involving them, in session order"),
+            ("Status", f"alive, dead or missing; current location; {_STATUS_RULE}"),
+            _OPEN_QUESTIONS,
+        ],
+    ),
+    "Faction": (
+        "what the faction is, its purpose, and where it is based",
+        [
+            ("Members & Leadership", "known members and who leads"),
+            ("Allies & Enemies", "other factions and characters"),
+            ("Activities", "what they do and have done"),
+            ("Relationship with the Party", "how they treat the party and why"),
+            _QUESTS,
+            _OPEN_QUESTIONS,
+        ],
+    ),
+    "Location": (
+        "what and where it is, and what larger region it belongs to",
+        [
+            ("Notable Places", "buildings and sites within it"),
+            ("Notable People", "who lives or works there"),
+            _QUESTS,
+            ("History", "what happened there, in session order"),
+            ("Current State", _STATUS_RULE),
+            _OPEN_QUESTIONS,
+        ],
+    ),
+    "Item": (
+        "what it is and who holds it now",
+        [
+            ("Properties & Effects", "what it does, including curses"),
+            ("Provenance", "where it came from and who held it before"),
+            _QUESTS,
+            ("History", "what happened involving it, in session order"),
+            _OPEN_QUESTIONS,
+        ],
+    ),
+    "Mystery": (
+        "the unanswered question, stated plainly",
+        [
+            ("Clues", "each clue as a cited bullet, in the order the party found them"),
+            ("Theories", "each labelled as a theory, with who proposed it; never state one as fact"),
+            ("Status", "open or resolved, and how it was resolved"),
+        ],
+    ),
+    "PointOfInterest": (
+        "what it is and where it is",
+        [
+            ("Features", "what is there"),
+            ("Dangers", "threats and hazards"),
+            _QUESTS,
+            ("History", "what happened there, in session order"),
+            _OPEN_QUESTIONS,
+        ],
+    ),
+    "Quest": (
+        "the objective, who gave the quest, and the promised reward",
+        [
+            ("Status", "offered, active, completed, failed or abandoned, with the session it changed"),
+            ("Progress", "steps taken, in session order"),
+            ("People & Places", "the entities involved and their part in it"),
+            _OPEN_QUESTIONS,
+        ],
+    ),
+}
+PLAYER_CHARACTER_LAYOUT: Layout = (
+    "who this player character is in the story so far",
+    [
+        ("Relationships", "with other characters, factions and the party"),
+        _QUESTS,
+        ("History", "what happened involving them, in session order"),
+    ],
+)
+
+
+def page_layout(entity: Entity, player_character: bool = False) -> Layout | None:
+    return PLAYER_CHARACTER_LAYOUT if player_character else PAGE_LAYOUTS.get(entity.type)
+
+
+def render_layout(layout: Layout | None) -> str:
+    """Layout text for the page-rewrite prompt; headings are kept apart from their guidance."""
+    if layout is None:
+        return ""
+    opening, sections = layout
+    lines = [f"Opening paragraph (no heading): {opening}.", "Sections, in this order (heading: what goes in it):"]
+    lines.extend(f"- `## {heading}`: {guidance}." for heading, guidance in sections)
+    return "\n".join(lines)
+
+
+def normalize_headings(markdown: str, layout: Layout | None) -> str:
+    """Trim guidance text a model copied into a heading (`## Status: alive, dead...` -> `## Status`)
+    and a leading `short_description:` line copied from the response fields."""
+    # Some models echo the JSON field into the page body; drop such a line.
+    markdown = re.sub(r"^\s*\**short_description\**\s*:.*\n+", "", markdown, flags=re.IGNORECASE)
+    if layout is None:
+        return markdown
+    headings = sorted((heading for heading, _ in layout[1]), key=len, reverse=True)
+    lines = []
+    for line in markdown.splitlines():
+        match = re.match(r"^(#{2,3})\s+(.*)$", line)
+        if match:
+            text = match.group(2).strip()
+            for heading in headings:
+                if text.lower().startswith(heading.lower()) and text[len(heading) :].strip()[:1] in {":", "(", "-", "–", "—", ""}:
+                    line = f"{match.group(1)} {heading}"
+                    break
+        lines.append(line)
+    return "\n".join(lines)
 
 
 # --- Formatting helpers (pure, unit-tested) ------------------------------------------------

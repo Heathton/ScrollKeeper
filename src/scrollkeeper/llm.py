@@ -92,6 +92,7 @@ class LocalAIService:
         current_page: str,
         pinned_facts: str,
         new_facts: str,
+        template: str = "",
         on_wait: WaitNotifier | None = None,
     ) -> dict[str, str]:
         return await self._run_blocking(
@@ -100,6 +101,7 @@ class LocalAIService:
             current_page,
             pinned_facts,
             new_facts,
+            template,
             on_wait=on_wait,
             wait_message="Waking the inference box, this can take a few minutes...",
         )
@@ -313,6 +315,14 @@ Rules:
   or title; put nicknames and titles ("Old Varric", "Lord Thane") in `aliases`.
 - New entity `type` is one of: {", ".join(ENTITY_TYPES)}. Record plot events as facts on the
   entities involved, not as entities.
+- A Quest is a task, job or goal the party is offered or takes on (e.g. "Recover Varric's
+  Ledger"); name it with a short imperative title. Record its giver, objective, reward and every
+  status change (offered, accepted, progress, completed, failed, abandoned) as facts on the Quest.
+  Also record the link on each entity involved (e.g. on the giver: "Varric Thane gave the party
+  the quest to recover his ledger").
+- A fact that matters to several entities is recorded once for each of them, phrased from that
+  entity's side (a murder: "Varric Thane paid the Black Tide to murder Aldous Penn" on Varric,
+  "Aldous Penn was murdered on Varric Thane's orders" on Aldous Penn).
 - `timestamp` is the [HH:MM:SS] of the line the fact comes from.
 - Use `alias_updates` when the transcript calls a known entity by a new name or title.
 - Use `name_reveals` when the transcript reveals the real name of a known entity that is listed
@@ -360,10 +370,11 @@ Similar names alone are not enough for `same`; check that the facts fit together
         current_page: str,
         pinned_facts: str,
         new_facts: str,
+        template: str = "",
     ) -> dict[str, str]:
         instructions = """
 You maintain one page of a tabletop RPG campaign wiki. Rewrite the page so it includes the new
-facts.
+facts, following the page layout below.
 
 Rules:
 - Use only the current page and the listed facts. Do not invent anything.
@@ -373,10 +384,12 @@ Rules:
   (e.g. "was an ally until session 7").
 - Cite facts by id in square brackets after the statement they support, e.g. `[F12]` or `[F12, F15]`.
   Keep existing citations from the current page.
-- Write Markdown without a top-level heading: a short opening paragraph, then `##` sections only
-  when there is enough material (for example Appearance, Relationships, History, Open Questions).
+- Write Markdown without a top-level heading. Start with the opening paragraph described in the
+  layout (no heading), then use exactly the layout's `##` headings, in that order. Leave out a
+  section when no fact supports it; never write empty sections or add headings of your own.
 - `short_description` is one line (under 100 characters) saying what the entity is.
 """
+        instructions += f"\nPage layout:\n{template}\n" if template else ""
         prompt = (
             f"Entity: {entity_header}\n\n"
             f"Current page:\n{current_page or '(empty)'}\n\n"

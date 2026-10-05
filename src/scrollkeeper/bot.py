@@ -374,6 +374,18 @@ def build_bot(settings: Settings) -> commands.Bot:
         if await _wiki_update(ctx, wiki.refresh_after_change(ctx.guild.id, fact.entity_id, on_wait=ctx.send)):
             await ctx.reply(f"Retracted F{fact_id}; the page was rewritten.")
 
+    @bot.command(name="rebuild-pages")
+    async def rebuild_pages(ctx: commands.Context) -> None:
+        if ctx.guild is None:
+            await ctx.reply("This command must be used in a server.")
+            return
+        await ctx.reply("Rebuilding every wiki page from its facts. This makes one LLM call per entity.")
+        rebuilt, failures = await wiki.rebuild_all_pages(ctx.guild.id, on_wait=ctx.send)
+        message = f"Rebuilt {rebuilt} wiki page(s)."
+        if failures:
+            message += f" Could not rebuild: {', '.join(failures)} (retried after the next processed session)."
+        await ctx.send(message)
+
     @bot.command(name="session-status")
     async def session_status(ctx: commands.Context) -> None:
         if ctx.guild is None:
