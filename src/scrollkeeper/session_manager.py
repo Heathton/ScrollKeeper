@@ -17,7 +17,7 @@ from discord.ext import voice_recv
 
 from .audio import LEGACY_OPUS_EXTENSION, convert_legacy_clips, decode_for_transcription, ogg_duration_seconds
 from .llm import LocalAIService
-from .models import SessionArtifacts, SpeakerSegment, WikiChangeReport
+from .models import Campaign, SessionArtifacts, SpeakerSegment, WikiChangeReport
 from .recorder import Speaker, TrackRecorder
 from .storage import PROCESS_LLM_ONLY, PROCESS_TRANSCRIBE, Storage
 from .transcript import TranscriptLine, format_offset, merge_lines, render_compact, render_timed, split_utterances
@@ -42,6 +42,7 @@ __all__ = ["ActiveSession", "SessionManager", "format_offset"]
 class ActiveSession:
     session_id: int
     guild_id: int
+    campaign_id: int
     voice_channel_id: int
     text_channel_id: int
     title: str | None
@@ -99,7 +100,7 @@ class SessionAudioSink(voice_recv.AudioSink):
         speaker: Speaker | None = None
         display_name = getattr(user, "display_name", None) or getattr(user, "name", str(user.id))
         if not getattr(user, "bot", False):
-            character_name = self.manager.storage.get_registered_character_name(self.session.guild_id, user.id)
+            character_name = self.manager.storage.get_registered_character_name(self.session.campaign_id, user.id)
             if character_name:
                 speaker = Speaker(user.id, display_name, character_name)
             else:
@@ -219,6 +220,28 @@ class SessionManager:
         if session is not None and session.sink is not None:
             session.sink.speakers.pop(user_id, None)
 
+    # --- Campaigns -------------------------------------------------------------------------
+
+    async def active_campaign(self, guild_id: int) -> Campaign:
+        return await asyncio.to_thread(self.storage.active_campaign, guild_id)
+
+    async def list_campaigns(self, guild_id: int) -> list[Campaign]:
+        return await asyncio.to_thread(self.storage.list_campaigns, guild_id)
+
+    async def switch_campaign(self, guild_id: int, name: str) -> tuple[Campaign, bool]:
+        """Make `name` the active campaign (creating it if needed). Returns (campaign, created).
+
+        Not allowed while a session records: its players registered characters in the current
+        campaign. Queued and processing sessions are fine; each keeps the campaign it was recorded in.
+        """
+        existing = self.active_sessions.get(guild_id)
+        if existing is not None and not existing.closed:
+            raise RuntimeError("Cannot switch campaigns while a session is recording. Use `!end-session` first.")
+        try:
+            return await asyncio.to_thread(self.storage.switch_campaign, guild_id, name)
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+
     async def start_session(
         self,
         guild: discord.Guild,
@@ -231,12 +254,14 @@ class SessionManager:
             raise RuntimeError("A session is already active in this server.")
         self._loop = asyncio.get_running_loop()
 
+        campaign = await asyncio.to_thread(self.storage.active_campaign, guild.id)
         session_id = await asyncio.to_thread(
             self.storage.create_session,
             guild_id=guild.id,
             voice_channel_id=voice_channel.id,
             text_channel_id=text_channel.id,
             title=title,
+            campaign_id=campaign.id,
         )
         row = await asyncio.to_thread(self.storage.get_session, session_id)
         session = self._session_from_row(row)
@@ -314,23 +339,24 @@ class SessionManager:
         if session_id is not None:
             row = await asyncio.to_thread(self.storage.get_session, session_id)
         else:
-            row = await asyncio.to_thread(self.storage.get_latest_session, guild_id)
+            campaign = await asyncio.to_thread(self.storage.active_campaign, guild_id)
+            row = await asyncio.to_thread(self.storage.get_latest_session, campaign.id)
         if row is None:
-            raise RuntimeError("No saved session was found to reprocess.")
+            raise RuntimeError("No saved session was found to reprocess in the active campaign.")
         if int(row["guild_id"]) != guild_id:
             raise RuntimeError("That session does not belong to this server.")
         return row
 
     async def answer_campaign_question(
         self,
-        guild_id: int,
+        campaign_id: int,
         question: str,
         on_wait: Callable[[str], Awaitable[None]] | None = None,
         deep: bool = False,
     ) -> str:
         if self.search is None:
             raise RuntimeError("Campaign search is not configured.")
-        return await self.search.answer(guild_id, question, deep=deep, on_wait=on_wait)
+        return await self.search.answer(campaign_id, question, deep=deep, on_wait=on_wait)
 
     def session_status(self, guild_id: int) -> str:
         status = self.statuses.get(guild_id)
@@ -437,29 +463,31 @@ class SessionManager:
         lines = await asyncio.to_thread(self._transcript_lines, session)
         note = self._interruption_note(session)
         transcript_markdown = render_compact(lines, note)
-        glossary = await asyncio.to_thread(self.wiki.spelling_glossary, guild_id)
+        transcript_path = session.base_dir / "transcript.md"
+        summary_path = session.base_dir / "summary.md"
+        # Written before the summary, so a failed LLM step still leaves a readable transcript.
+        await asyncio.to_thread(self._write_output, transcript_path, transcript_markdown)
+        glossary = await asyncio.to_thread(self.wiki.spelling_glossary, session.campaign_id)
         log.info("Generating summary for session %s (%s names in the spelling glossary)", session.session_id, len(glossary))
         self._set_status(guild_id, "processing", session.session_id, "Writing the session summary.")
         summary_payload = await self.llm.summarize_session(lines, note, glossary, on_wait=notify)
         session_notes = summary_payload["session_notes_markdown"].strip()
         cinematic = summary_payload["cinematic_summary_markdown"].strip()
 
-        transcript_path = session.base_dir / "transcript.md"
-        summary_path = session.base_dir / "summary.md"
         summary_markdown = (
             "# Session Notes\n\n"
             f"{session_notes}\n\n"
             "# Cinematic Summary\n\n"
             f"{cinematic}\n"
         )
-        await asyncio.to_thread(self._write_outputs, session.base_dir, transcript_markdown, summary_markdown)
+        await asyncio.to_thread(self._write_output, summary_path, summary_markdown)
 
         # The summary is saved already; a wiki failure is reported but doesn't fail the session.
         log.info("Updating the campaign wiki from session %s", session.session_id)
         try:
             timed_transcript = await asyncio.to_thread(self._build_timed_transcript, session)
             wiki_report = await self.wiki.process_session(
-                guild_id,
+                session.campaign_id,
                 session.session_id,
                 timed_transcript,
                 on_wait=notify,
@@ -478,7 +506,7 @@ class SessionManager:
         # Index the new summary and transcript; a failure only delays it to the next change.
         if self.search is not None:
             try:
-                await self.search.refresh(guild_id)
+                await self.search.refresh(session.campaign_id)
             except Exception:
                 log.exception("Could not index session %s for search", session.session_id)
         return SessionArtifacts(
@@ -492,10 +520,9 @@ class SessionManager:
         )
 
     @staticmethod
-    def _write_outputs(base_dir: Path, transcript_markdown: str, summary_markdown: str) -> None:
-        base_dir.mkdir(parents=True, exist_ok=True)
-        (base_dir / "transcript.md").write_text(transcript_markdown, encoding="utf-8")
-        (base_dir / "summary.md").write_text(summary_markdown, encoding="utf-8")
+    def _write_output(path: Path, markdown: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(markdown, encoding="utf-8")
 
     # --- Speech-to-text, one whole track per speaker -----------------------------------------
 
@@ -559,7 +586,7 @@ class SessionManager:
         track_start = datetime.fromisoformat(track["started_at"])
         user_id = int(track["user_id"])
         # Use the current registry name, so a character renamed since the recording is fixed on reprocess.
-        name = self.storage.get_registered_character_name(session.guild_id, user_id) or track["character_name"]
+        name = self.storage.get_registered_character_name(session.campaign_id, user_id) or track["character_name"]
         segments = [
             SpeakerSegment(
                 discord_user_id=user_id,
@@ -658,6 +685,7 @@ class SessionManager:
         return ActiveSession(
             session_id=session_id,
             guild_id=int(row["guild_id"]),
+            campaign_id=int(row["campaign_id"]),
             voice_channel_id=int(row["voice_channel_id"]),
             text_channel_id=int(row["text_channel_id"]),
             title=row["title"],

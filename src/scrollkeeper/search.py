@@ -102,7 +102,7 @@ class SearchIndex:
     # --- Keeping the index current -------------------------------------------------------
 
     def start(self) -> None:
-        """Load the model and bring every guild's index up to date, in the background.
+        """Load the model and bring every campaign's index up to date, in the background.
 
         A changed `SCROLLKEEPER_EMBED_MODEL` re-embeds everything here, since stored vectors
         record the model that made them.
@@ -112,55 +112,55 @@ class SearchIndex:
 
     async def _refresh_all(self) -> None:
         try:
-            for guild_id in await asyncio.to_thread(self.storage.search_guild_ids):
-                pending = await self.refresh(guild_id)
+            for campaign_id in await asyncio.to_thread(self.storage.search_campaign_ids):
+                pending = await self.refresh(campaign_id)
                 if pending:
-                    log.warning("Guild %s: %s document(s) are not embedded yet", guild_id, pending)
+                    log.warning("Campaign %s: %s document(s) are not embedded yet", campaign_id, pending)
         except Exception:
             log.exception("Could not refresh the search index at startup")
 
-    async def refresh(self, guild_id: int) -> int:
+    async def refresh(self, campaign_id: int) -> int:
         """Index new or changed pages, summaries and transcripts and embed what needs it.
 
         Returns how many documents still have no embedding from the current model.
         """
         async with self._lock:
-            await asyncio.to_thread(self.sync_documents, guild_id)
-            return await self._embed_pending(guild_id)
+            await asyncio.to_thread(self.sync_documents, campaign_id)
+            return await self._embed_pending(campaign_id)
 
-    async def reindex(self, guild_id: int) -> tuple[int, int]:
-        """Rebuild a guild's index from scratch. Returns (documents, documents without embedding)."""
+    async def reindex(self, campaign_id: int) -> tuple[int, int]:
+        """Rebuild a campaign's index from scratch. Returns (documents, documents without embedding)."""
         async with self._lock:
-            await asyncio.to_thread(self.storage.clear_search_index, guild_id)
-            await asyncio.to_thread(self.sync_documents, guild_id)
-            pending = await self._embed_pending(guild_id)
-            total = len(await asyncio.to_thread(self.storage.search_doc_versions, guild_id))
+            await asyncio.to_thread(self.storage.clear_search_index, campaign_id)
+            await asyncio.to_thread(self.sync_documents, campaign_id)
+            pending = await self._embed_pending(campaign_id)
+            total = len(await asyncio.to_thread(self.storage.search_doc_versions, campaign_id))
         return total, pending
 
-    async def pending_count(self, guild_id: int) -> int:
+    async def pending_count(self, campaign_id: int) -> int:
         model = self.embedder.spec.name if self.embedder else ""
-        return await asyncio.to_thread(self.storage.count_unembedded_docs, guild_id, model, EMBEDDED_KINDS)
+        return await asyncio.to_thread(self.storage.count_unembedded_docs, campaign_id, model, EMBEDDED_KINDS)
 
-    def sync_documents(self, guild_id: int) -> None:
+    def sync_documents(self, campaign_id: int) -> None:
         """Make the stored documents match the current pages and summarized sessions (blocking)."""
         versions: dict[tuple[str, int], str] = {}
-        for (kind, ref_id, _part), (_doc_id, version) in self.storage.search_doc_versions(guild_id).items():
+        for (kind, ref_id, _part), (_doc_id, version) in self.storage.search_doc_versions(campaign_id).items():
             versions[(kind, ref_id)] = version
         wanted: set[tuple[str, int]] = set()
 
-        for row in self.storage.page_doc_sources(guild_id):
+        for row in self.storage.page_doc_sources(campaign_id):
             entity_id, version = int(row["entity_id"]), row["version"]
             wanted.add(("page", entity_id))
             if versions.get(("page", entity_id)) == version:
                 continue
-            entity = self.storage.get_entity(guild_id, entity_id)
+            entity = self.storage.get_entity(campaign_id, entity_id)
             page = self.storage.get_page(entity_id)
             if entity is None or page is None:
                 continue
             doc = SearchDoc("page", entity_id, ", ".join(entity.names()), page_embedding_text(entity, page.markdown))
-            self.storage.replace_search_docs(guild_id, "page", entity_id, [doc], version)
+            self.storage.replace_search_docs(campaign_id, "page", entity_id, [doc], version)
 
-        for session in self.storage.summarized_sessions(guild_id):
+        for session in self.storage.summarized_sessions(campaign_id):
             session_id, version = int(session["id"]), session["ended_at"] or ""
             wanted.update({("summary", session_id), ("transcript", session_id)})
             if versions.get(("summary", session_id)) != version:
@@ -169,24 +169,24 @@ class SearchIndex:
                     self.storage.sessions_dir / str(session_id) / "summary.md"
                 )
                 docs = [summary_doc(session, summary)] if summary.strip() else []
-                self.storage.replace_search_docs(guild_id, "summary", session_id, docs, version)
+                self.storage.replace_search_docs(campaign_id, "summary", session_id, docs, version)
             if versions.get(("transcript", session_id)) != version:
                 started_at = datetime.fromisoformat(session["started_at"])
                 lines = merge_lines(self.storage.get_session_segments(session_id))
                 docs = transcript_docs(session_id, started_at, lines)
-                self.storage.replace_search_docs(guild_id, "transcript", session_id, docs, version)
+                self.storage.replace_search_docs(campaign_id, "transcript", session_id, docs, version)
 
         for kind, ref_id in set(versions) - wanted:
-            self.storage.delete_search_docs(guild_id, kind, ref_id)
+            self.storage.delete_search_docs(campaign_id, kind, ref_id)
 
-    async def _embed_pending(self, guild_id: int) -> int:
+    async def _embed_pending(self, campaign_id: int) -> int:
         if not await self._ensure_embedder():
-            return await self.pending_count(guild_id)
+            return await self.pending_count(campaign_id)
         assert self.embedder is not None
         spec = self.embedder.spec
-        docs = await asyncio.to_thread(self.storage.docs_needing_embedding, guild_id, spec.name, EMBEDDED_KINDS)
+        docs = await asyncio.to_thread(self.storage.docs_needing_embedding, campaign_id, spec.name, EMBEDDED_KINDS)
         if docs:
-            log.info("Guild %s: embedding %s document(s) with %s", guild_id, len(docs), spec.name)
+            log.info("Campaign %s: embedding %s document(s) with %s", campaign_id, len(docs), spec.name)
         for doc in docs:
             try:
                 vector = await asyncio.to_thread(self.embedder.embed_document, doc.title, doc.body)
@@ -196,7 +196,7 @@ class SearchIndex:
             await asyncio.to_thread(
                 self.storage.set_doc_embedding, doc.id, doc.title, doc.body, spec.name, pack_vector(vector), len(vector)
             )
-        return await self.pending_count(guild_id)
+        return await self.pending_count(campaign_id)
 
     async def _ensure_embedder(self) -> bool:
         """Load the embedding model (downloading it the first time). A failure is retried later;
@@ -218,16 +218,16 @@ class SearchIndex:
 
     # --- Retrieval ------------------------------------------------------------------------
 
-    async def search(self, guild_id: int, question: str, deep: bool = False) -> RetrievalResult:
+    async def search(self, campaign_id: int, question: str, deep: bool = False) -> RetrievalResult:
         kinds = DEEP_KINDS if deep else SEARCH_KINDS
-        entities = await asyncio.to_thread(self.storage.list_entities, guild_id)
+        entities = await asyncio.to_thread(self.storage.list_entities, campaign_id)
         mentioned = [entity for entity in entities if entity.id in mentioned_entity_ids(entities, question)]
-        page_ids = await asyncio.to_thread(self.storage.page_doc_ids, guild_id, [entity.id for entity in mentioned])
+        page_ids = await asyncio.to_thread(self.storage.page_doc_ids, campaign_id, [entity.id for entity in mentioned])
         name_hits = [page_ids[entity.id] for entity in mentioned if entity.id in page_ids]
 
         match = fts_query(question, [name for entity in mentioned for name in entity.names()])
         keyword_hits = (
-            await asyncio.to_thread(self.storage.keyword_search, guild_id, match, kinds, CANDIDATES_PER_METHOD)
+            await asyncio.to_thread(self.storage.keyword_search, campaign_id, match, kinds, CANDIDATES_PER_METHOD)
             if match
             else []
         )
@@ -239,7 +239,7 @@ class SearchIndex:
             spec = self.embedder.spec
             query = await asyncio.to_thread(self.embedder.embed_query, question)
             stored = await asyncio.to_thread(
-                self.storage.doc_embeddings, guild_id, spec.name, len(query), tuple(k for k in kinds if k in EMBEDDED_KINDS)
+                self.storage.doc_embeddings, campaign_id, spec.name, len(query), tuple(k for k in kinds if k in EMBEDDED_KINDS)
             )
             scored = rank_by_similarity(query, stored)
             best = scored[0][1] if scored else None
@@ -254,14 +254,14 @@ class SearchIndex:
 
     async def answer(
         self,
-        guild_id: int,
+        campaign_id: int,
         question: str,
         deep: bool = False,
         on_wait: WaitNotifier | None = None,
     ) -> str:
-        if not await asyncio.to_thread(self.storage.search_doc_versions, guild_id):
+        if not await asyncio.to_thread(self.storage.search_doc_versions, campaign_id):
             return NO_NOTES_YET
-        result = await self.search(guild_id, question, deep=deep)
+        result = await self.search(campaign_id, question, deep=deep)
         log.info(
             "Question %r: %s document(s), best similarity %s%s",
             question,
@@ -271,11 +271,11 @@ class SearchIndex:
         )
         if result.weak or not result.docs:
             return NOT_IN_NOTES
-        context, labels = await asyncio.to_thread(self.build_context, guild_id, result.docs)
+        context, labels = await asyncio.to_thread(self.build_context, campaign_id, result.docs)
         answer = await self.llm.answer_question(question, context, on_wait=on_wait)
         return replace_source_tags(answer, labels) or NOT_IN_NOTES
 
-    def build_context(self, guild_id: int, docs: list[SearchDoc]) -> tuple[str, dict[str, str]]:
+    def build_context(self, campaign_id: int, docs: list[SearchDoc]) -> tuple[str, dict[str, str]]:
         """Numbered sources for the answer prompt, and each tag's citation label (blocking)."""
         links: dict[int, list[Any]] | None = None
         blocks: list[str] = []
@@ -284,13 +284,13 @@ class SearchIndex:
         for doc in docs:
             tag = f"S{len(blocks) + 1}"
             if doc.kind == "page":
-                entity = self.storage.get_entity(guild_id, doc.ref_id)
+                entity = self.storage.get_entity(campaign_id, doc.ref_id)
                 page = self.storage.get_page(doc.ref_id)
                 if entity is None or page is None:
                     continue
                 if links is None:
-                    links = linked_quests(self.storage, guild_id)
-                facts = self.storage.get_facts(guild_id, cited_fact_ids(page.markdown))
+                    links = linked_quests(self.storage, campaign_id)
+                facts = self.storage.get_facts(campaign_id, cited_fact_ids(page.markdown))
                 heading = f"Wiki page {entity_header(entity)}"
                 text = "\n".join([render_citations(page.markdown, facts), *quest_list(links.get(entity.id, []))])
                 labels[tag] = f"wiki: {entity.canonical_name}"

@@ -87,8 +87,9 @@ class SessionCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.manager.set_completion_handler(completion)
         self.decode_patch = patch("scrollkeeper.session_manager.decode_for_transcription", side_effect=fake_decode)
         self.decode_patch.start()
-        self.storage.register_character(1, 10, "Mira")
-        self.storage.register_character(1, 20, "Varric")
+        self.campaign_id = self.storage.active_campaign(1).id
+        self.storage.register_character(self.campaign_id, 10, "Mira")
+        self.storage.register_character(self.campaign_id, 20, "Varric")
 
     async def asyncTearDown(self) -> None:
         self.decode_patch.stop()
@@ -142,7 +143,7 @@ class SessionCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("guest", posted[0])
 
         # The guest registers mid-session: recorded from their next packet on.
-        self.storage.register_character(1, 30, "Brother Aldous")
+        self.storage.register_character(self.campaign_id, 30, "Brother Aldous")
         self.manager.active_sessions[1] = sink.session
         sink.session.sink = sink
         self.manager.forget_speaker(1, 30)

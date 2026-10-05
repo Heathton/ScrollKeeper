@@ -145,15 +145,56 @@ def build_bot(settings: Settings) -> commands.Bot:
         # Loads (first time: downloads) the embedding model and indexes anything new, in the background.
         search.start()
 
+    async def _campaign_id(ctx: commands.Context) -> int:
+        return (await sessions.active_campaign(ctx.guild.id)).id
+
+    @bot.command(name="switch-campaign")
+    async def switch_campaign(ctx: commands.Context, *, campaign_name: str) -> None:
+        if ctx.guild is None:
+            await ctx.reply("This command must be used in a server.")
+            return
+        try:
+            campaign, created = await sessions.switch_campaign(ctx.guild.id, campaign_name)
+        except RuntimeError as exc:
+            await ctx.reply(str(exc))
+            return
+        if created:
+            await ctx.reply(
+                f"Created campaign **{campaign.name}** and made it active. "
+                "Players need to `!register-character` for this campaign before they are recorded."
+            )
+        else:
+            await ctx.reply(f"Active campaign is now **{campaign.name}**.")
+
+    @bot.command(name="current-campaign")
+    async def current_campaign(ctx: commands.Context) -> None:
+        if ctx.guild is None:
+            await ctx.reply("This command must be used in a server.")
+            return
+        campaign = await sessions.active_campaign(ctx.guild.id)
+        await ctx.reply(f"Active campaign: **{campaign.name}**.")
+
+    @bot.command(name="list-campaigns")
+    async def list_campaigns(ctx: commands.Context) -> None:
+        if ctx.guild is None:
+            await ctx.reply("This command must be used in a server.")
+            return
+        await sessions.active_campaign(ctx.guild.id)  # creates "Default" on first use
+        campaigns = await sessions.list_campaigns(ctx.guild.id)
+        lines = ["Campaigns (`!switch-campaign <name>` to change):"]
+        lines.extend(f"- **{c.name}** (active)" if c.is_active else f"- {c.name}" for c in campaigns)
+        await _send_long(ctx, "\n".join(lines))
+
     @bot.command(name="register-character")
     async def register_character(ctx: commands.Context, *, character_name: str) -> None:
         if ctx.guild is None or ctx.author is None:
             await ctx.reply("This command must be used in a server.")
             return
-        storage.register_character(ctx.guild.id, ctx.author.id, character_name.strip())
+        campaign = await sessions.active_campaign(ctx.guild.id)
+        await asyncio.to_thread(storage.register_character, campaign.id, ctx.author.id, character_name.strip())
         sessions.forget_speaker(ctx.guild.id, ctx.author.id)  # start recording them if a session is live
-        await wiki.ensure_player_characters(ctx.guild.id)
-        await ctx.reply(f"Registered character name: **{character_name.strip()}**")
+        await wiki.ensure_player_characters(campaign.id)
+        await ctx.reply(f"Registered character name **{character_name.strip()}** in campaign **{campaign.name}**.")
 
     @bot.command(name="join")
     async def join(ctx: commands.Context) -> None:
@@ -197,14 +238,16 @@ def build_bot(settings: Settings) -> commands.Bot:
             await ctx.reply(str(exc))
             return
         voice_channel = ctx.author.voice.channel
-        registered = await asyncio.to_thread(storage.registered_user_ids, ctx.guild.id)
+        registered = await asyncio.to_thread(storage.registered_user_ids, session.campaign_id)
+        campaign = await asyncio.to_thread(storage.get_campaign, session.campaign_id)
         unregistered = [
             member.display_name
             for member in getattr(voice_channel, "members", [])
             if not member.bot and member.id not in registered
         ]
         notice = [
-            f"Session **#{session.session_id}** is now recording in **{voice_channel.name}**.",
+            f"Session **#{session.session_id}** is now recording in **{voice_channel.name}** "
+            f"for campaign **{campaign.name if campaign else session.campaign_id}**.",
             "Recording notice: the voices of players who have run `!register-character` are recorded and "
             "transcribed for the session notes. Everyone else, and bots, are not recorded.",
         ]
@@ -234,7 +277,9 @@ def build_bot(settings: Settings) -> commands.Bot:
             return
         await ctx.reply("Searching campaign notes and session transcripts." if deep else "Searching campaign notes.")
         try:
-            answer = await sessions.answer_campaign_question(ctx.guild.id, question.strip(), on_wait=ctx.send, deep=deep)
+            answer = await sessions.answer_campaign_question(
+                await _campaign_id(ctx), question.strip(), on_wait=ctx.send, deep=deep
+            )
         except Exception as exc:
             log.exception("Could not answer a campaign question")
             await ctx.send(f"Could not answer right now: {str(exc)[:1800]}")
@@ -260,7 +305,7 @@ def build_bot(settings: Settings) -> commands.Bot:
             return
         await ctx.reply("Rebuilding the search index: every wiki page and session summary is re-embedded on CPU.")
         try:
-            total, pending = await search.reindex(ctx.guild.id)
+            total, pending = await search.reindex(await _campaign_id(ctx))
         except Exception as exc:
             log.exception("Reindex failed")
             await ctx.send(f"Reindex failed: {str(exc)[:1800]}")
@@ -279,7 +324,7 @@ def build_bot(settings: Settings) -> commands.Bot:
 
     async def _one_entity(ctx: commands.Context, ref: str) -> Entity | None:
         """Resolve `#id`, name or alias to exactly one entity, replying when that isn't possible."""
-        matches = await wiki.resolve_entity(ctx.guild.id, ref)
+        matches = await wiki.resolve_entity(await _campaign_id(ctx), ref)
         if not matches:
             await ctx.reply(f"No entity matches **{ref}**. Use `!entities` to list them.")
             return None
@@ -303,9 +348,9 @@ def build_bot(settings: Settings) -> commands.Bot:
             return False
 
     async def _active_fact(ctx: commands.Context, fact_id: int):
-        fact = await asyncio.to_thread(storage.get_fact, ctx.guild.id, fact_id)
+        fact = await asyncio.to_thread(storage.get_fact, await _campaign_id(ctx), fact_id)
         if fact is None:
-            await ctx.reply(f"Could not find fact F{fact_id} in this server.")
+            await ctx.reply(f"Could not find fact F{fact_id} in this campaign.")
             return None
         if not fact.active:
             await ctx.reply(f"Fact F{fact_id} was already corrected or retracted.")
@@ -317,7 +362,8 @@ def build_bot(settings: Settings) -> commands.Bot:
         if ctx.guild is None:
             await ctx.reply("This command must be used in a server.")
             return
-        entities = await asyncio.to_thread(storage.list_entities, ctx.guild.id)
+        campaign_id = await _campaign_id(ctx)
+        entities = await asyncio.to_thread(storage.list_entities, campaign_id)
         if entity_type:
             wanted = entity_type.strip().casefold()
             entities = [e for e in entities if e.type.casefold() == wanted]
@@ -327,7 +373,7 @@ def build_bot(settings: Settings) -> commands.Bot:
             else:
                 await ctx.reply("No campaign wiki entities yet.")
             return
-        counts = await asyncio.to_thread(storage.count_active_facts, ctx.guild.id)
+        counts = await asyncio.to_thread(storage.count_active_facts, campaign_id)
         lines = ["Campaign wiki entities (`!entity <name or #id>` to read one):"]
         current_type = None
         for entity in entities:
@@ -348,7 +394,7 @@ def build_bot(settings: Settings) -> commands.Bot:
         entity = await _one_entity(ctx, ref)
         if entity is None:
             return
-        await _send_long(ctx, await wiki.render_entity(ctx.guild.id, entity))
+        await _send_long(ctx, await wiki.render_entity(entity.campaign_id, entity))
 
     @bot.command(name="merge-entity")
     async def merge_entity(ctx: commands.Context, source_ref: str, target_ref: str) -> None:
@@ -363,7 +409,7 @@ def build_bot(settings: Settings) -> commands.Bot:
             await ctx.reply("Those are the same entity.")
             return
         await ctx.reply(f"Merging #{source.id} {source.canonical_name} into #{target.id} {target.canonical_name}.")
-        if not await _wiki_update(ctx, wiki.merge(ctx.guild.id, source, target, on_wait=ctx.send)):
+        if not await _wiki_update(ctx, wiki.merge(target.campaign_id, source, target, on_wait=ctx.send)):
             return
         await ctx.send(f"Merged. **{source.canonical_name}** is now an alias of **{target.canonical_name}** (#{target.id}).")
 
@@ -375,7 +421,7 @@ def build_bot(settings: Settings) -> commands.Bot:
         entity = await _one_entity(ctx, ref)
         if entity is None:
             return
-        if not await _wiki_update(ctx, wiki.rename(ctx.guild.id, entity, new_name.strip(), on_wait=ctx.send)):
+        if not await _wiki_update(ctx, wiki.rename(entity.campaign_id, entity, new_name.strip(), on_wait=ctx.send)):
             return
         await ctx.reply(f"Renamed #{entity.id} to **{new_name.strip()}** (old name kept as an alias).")
 
@@ -387,10 +433,10 @@ def build_bot(settings: Settings) -> commands.Bot:
         entity = await _one_entity(ctx, ref)
         if entity is None:
             return
-        if await wiki.has_name(ctx.guild.id, entity, alias):
+        if await wiki.has_name(entity.campaign_id, entity, alias):
             await ctx.reply(f"#{entity.id} {entity.canonical_name} already has that name.")
             return
-        if await _wiki_update(ctx, wiki.add_alias(ctx.guild.id, entity, alias.strip(), on_wait=ctx.send)):
+        if await _wiki_update(ctx, wiki.add_alias(entity.campaign_id, entity, alias.strip(), on_wait=ctx.send)):
             await ctx.reply(f"Added alias **{alias.strip()}** to #{entity.id} {entity.canonical_name}.")
 
     @bot.command(name="pin-fact")
@@ -402,9 +448,9 @@ def build_bot(settings: Settings) -> commands.Bot:
         if entity is None:
             return
         fact_id = await asyncio.to_thread(
-            storage.add_fact, ctx.guild.id, entity.id, text.strip(), "pinned", None, None, None, getattr(ctx.author, "id", None)
+            storage.add_fact, entity.campaign_id, entity.id, text.strip(), "pinned", None, None, None, getattr(ctx.author, "id", None)
         )
-        if await _wiki_update(ctx, wiki.refresh_after_change(ctx.guild.id, entity.id, on_wait=ctx.send)):
+        if await _wiki_update(ctx, wiki.refresh_after_change(entity.campaign_id, entity.id, on_wait=ctx.send)):
             await ctx.reply(f"Pinned F{fact_id} on #{entity.id} {entity.canonical_name}; its page was rewritten.")
 
     @bot.command(name="correct-fact")
@@ -416,10 +462,10 @@ def build_bot(settings: Settings) -> commands.Bot:
         if fact is None:
             return
         new_id = await asyncio.to_thread(
-            storage.add_fact, ctx.guild.id, fact.entity_id, text.strip(), "pinned", None, None, None, getattr(ctx.author, "id", None)
+            storage.add_fact, fact.campaign_id, fact.entity_id, text.strip(), "pinned", None, None, None, getattr(ctx.author, "id", None)
         )
         await asyncio.to_thread(storage.supersede_fact, fact.id, new_id)
-        if await _wiki_update(ctx, wiki.refresh_after_change(ctx.guild.id, fact.entity_id, on_wait=ctx.send)):
+        if await _wiki_update(ctx, wiki.refresh_after_change(fact.campaign_id, fact.entity_id, on_wait=ctx.send)):
             await ctx.reply(f"F{fact_id} is superseded by pinned fact F{new_id}; the page was rewritten.")
 
     @bot.command(name="retract-fact")
@@ -431,7 +477,7 @@ def build_bot(settings: Settings) -> commands.Bot:
         if fact is None:
             return
         await asyncio.to_thread(storage.retract_fact, fact.id, reason.strip())
-        if await _wiki_update(ctx, wiki.refresh_after_change(ctx.guild.id, fact.entity_id, on_wait=ctx.send)):
+        if await _wiki_update(ctx, wiki.refresh_after_change(fact.campaign_id, fact.entity_id, on_wait=ctx.send)):
             await ctx.reply(f"Retracted F{fact_id}; the page was rewritten.")
 
     @bot.command(name="rebuild-pages")
@@ -440,7 +486,7 @@ def build_bot(settings: Settings) -> commands.Bot:
             await ctx.reply("This command must be used in a server.")
             return
         await ctx.reply("Rebuilding every wiki page from its facts. This makes one LLM call per entity.")
-        rebuilt, failures = await wiki.rebuild_all_pages(ctx.guild.id, on_wait=ctx.send)
+        rebuilt, failures = await wiki.rebuild_all_pages(await _campaign_id(ctx), on_wait=ctx.send)
         message = f"Rebuilt {rebuilt} wiki page(s)."
         if failures:
             message += f" Could not rebuild: {', '.join(failures)} (retried after the next processed session)."

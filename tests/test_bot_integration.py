@@ -61,7 +61,8 @@ class FakeCampaignWiki:
 class FakeSessionManager:
     last_instance: "FakeSessionManager | None" = None
 
-    def __init__(self, _storage: FakeStorage, _llm: FakeLocalAIService, _wiki: FakeCampaignWiki, **_kwargs) -> None:
+    def __init__(self, storage: FakeStorage, _llm: FakeLocalAIService, _wiki: FakeCampaignWiki, **_kwargs) -> None:
+        self.storage = storage
         self.completion_handler = None
         self.notice_handler = None
         self.end_session_calls: list[int] = []
@@ -73,6 +74,11 @@ class FakeSessionManager:
 
     async def start(self) -> None:
         return
+
+    async def active_campaign(self, guild_id: int):
+        if hasattr(self.storage, "active_campaign"):
+            return self.storage.active_campaign(guild_id)
+        return types.SimpleNamespace(id=guild_id, guild_id=guild_id, name="Default", is_active=True)
 
     def forget_speaker(self, guild_id: int, user_id: int) -> None:
         self.forgotten = (guild_id, user_id)

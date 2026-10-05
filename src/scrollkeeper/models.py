@@ -42,9 +42,17 @@ class TranscriptionResult:
 
 
 @dataclass(slots=True)
-class Entity:
+class Campaign:
     id: int
     guild_id: int
+    name: str
+    is_active: bool = False
+
+
+@dataclass(slots=True)
+class Entity:
+    id: int
+    campaign_id: int
     type: str
     canonical_name: str
     aliases: list[str] = field(default_factory=list)
@@ -59,7 +67,7 @@ class Entity:
 @dataclass(slots=True)
 class Fact:
     id: int
-    guild_id: int
+    campaign_id: int
     entity_id: int
     kind: str
     text: str
@@ -109,7 +117,7 @@ class SearchDoc:
     session_id: int | None = None
     start_ts: str | None = None
     id: int = 0
-    guild_id: int = 0
+    campaign_id: int = 0
 
 
 @dataclass(slots=True)

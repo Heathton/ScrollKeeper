@@ -15,7 +15,10 @@ ScrollKeeper is a Discord bot for tabletop campaigns. It can join a voice channe
 
 ## Commands
 
-- `!register-character <character name>`: map your Discord user to an in-game character. **Recording is opt-in:** only players who have registered a character are recorded (bots never are).
+- `!list-campaigns`: list this server's campaigns and mark the active one
+- `!current-campaign`: show the active campaign
+- `!switch-campaign <name>`: make another campaign active, creating it if no campaign has that name (case-insensitive). Not allowed while a session is recording.
+- `!register-character <character name>`: map your Discord user to an in-game character in the active campaign. **Recording is opt-in:** only players who have registered a character in the active campaign are recorded (bots never are).
 - `!join`: bot joins your current voice channel
 - `!start-session [title]`: begin recording the active voice channel. The bot posts a recording notice and names anyone in the channel who is not being recorded.
 - `!end-session`: stop recording, finalize transcript, write the summary, update the campaign wiki, and post the result with a wiki change report
@@ -25,6 +28,15 @@ ScrollKeeper is a Discord bot for tabletop campaigns. It can join a voice channe
 - `!session-status`: show the current session state
 - `!reprocess-session [session-id]`: rerun speech-to-text + summary/note generation from saved audio (also works for sessions recorded before per-speaker tracks; see [Recording](#recording))
 - `!reprocess-llm [session-id]`: rerun the summary and wiki update from existing transcript text (skips speech-to-text). The session's earlier extracted facts are retracted and replaced.
+
+### Campaigns
+
+A server can run several campaigns, and one of them is active. The first command that needs a campaign creates one called **Default**. Character registrations, sessions, the campaign wiki, and questions all belong to a campaign:
+
+- `!start-session` records into the active campaign. Each session keeps its campaign, so switching while earlier sessions are still processing is fine; they update the wiki of the campaign they were recorded in.
+- Wiki commands (`!entities`, `!entity`, `!pin-fact`, ...) and questions (`!campaign-question`, `!deep-question`) work on the active campaign only. The same name in two campaigns is two different entities.
+- `!reprocess-session` and `!reprocess-llm` without a session id pick the latest session of the active campaign.
+- Players register a character separately in each campaign.
 
 ### Campaign wiki
 
@@ -233,7 +245,7 @@ Pushing a `v*` tag runs `.github/workflows/images.yml`, which publishes `ghcr.io
 - `data/sessions/<session-id>/transcript.md`: finalized transcript
 - `data/sessions/<session-id>/summary.md`: session notes + cinematic summary
 - `data/models/`: downloaded embedding model files
-- `data/wiki/<guild-id>/<Type>/<Name>.md`: Obsidian-style wiki export, one file per entity with `aliases` frontmatter, `[[links]]` and session citations. It is regenerated from the database, so edits there are overwritten; use the commands above.
+- `data/wiki/<campaign-id>/<Type>/<Name>.md`: Obsidian-style wiki export, one file per entity with `aliases` frontmatter, `[[links]]` and session citations. It is regenerated from the database, so edits there are overwritten; use the commands above.
 
 ## Important implementation notes
 
