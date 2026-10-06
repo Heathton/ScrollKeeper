@@ -26,8 +26,8 @@ ScrollKeeper is a Discord bot for tabletop campaigns. It can join a voice channe
 - `!deep-question <question>`: the same, but also searches session transcripts (slower to read, but finds what never made it into the notes)
 - `!reindex`: rebuild the search index and re-embed everything (needs the Manage Server permission). Rarely needed: the index updates itself after every change and when the embedding model changes
 - `!session-status`: show the current session state
-- `!reprocess-session [session-id]`: rerun speech-to-text + summary/note generation from saved audio (also works for sessions recorded before per-speaker tracks; see [Recording](#recording))
-- `!reprocess-llm [session-id]`: rerun the summary and wiki update from existing transcript text (skips speech-to-text). The session's earlier extracted facts are retracted and replaced.
+- `!reprocess-session [number]`: rerun speech-to-text + summary/note generation from saved audio (also works for sessions recorded before per-speaker tracks; see [Recording](#recording))
+- `!reprocess-llm [number]`: rerun the summary and wiki update from existing transcript text (skips speech-to-text). The session's earlier extracted facts are retracted and replaced.
 - `!import-journal [preview]` with a journal export attached: import a VTT journal into the active campaign's wiki, or with `preview` show what it would import (any member can run it; see [Importing a VTT journal](#importing-a-vtt-journal))
 - `!import-status`: show the progress of a running journal import
 
@@ -37,8 +37,12 @@ A server can run several campaigns, and one of them is active. The first command
 
 - `!start-session` records into the active campaign. Each session keeps its campaign, so switching while earlier sessions are still processing is fine; they update the wiki of the campaign they were recorded in.
 - Wiki commands (`!entities`, `!entity`, `!pin-fact`, ...) and questions (`!campaign-question`, `!deep-question`) work on the active campaign only. The same name in two campaigns is two different entities.
-- `!reprocess-session` and `!reprocess-llm` without a session id pick the latest session of the active campaign.
+- Sessions are numbered 1, 2, 3… within their campaign. `!reprocess-session` and `!reprocess-llm` take that number in the active campaign; without one they pick its latest recorded session.
 - Players register a character separately in each campaign.
+
+### Session numbers and dates
+
+Everything people read names a session by its number in the campaign and the date it was played: wiki citations look like `session 12, 2024-03-10 @ 01:43:10` (time into the recording), and the post after processing is headed `Session 12 (2024-03-10)`. A recorded session's date is its start in the bot's time zone (set `TZ`, e.g. `America/Toronto`, so an evening game keeps its date); an imported recap's date is its journal date. The LLM sees the same labels and resolves conflicting facts by date, so a recap imported after newer sessions doesn't override them. A new session takes the campaign's next number; existing sessions were numbered by date when this was introduced. Internally, sessions keep a server-wide id for storage (`data/sessions/<session-id>/`).
 
 ### Campaign wiki
 
@@ -120,7 +124,7 @@ The import runs in the background, one per server, and posts progress and a repo
 2. **Keywords**: SQLite FTS5 full-text search (BM25, English stemming; titles weigh more than text). The names of mentioned entities are added as search terms, so "the Grey Warden" also finds summaries that say "Thalrin".
 3. **Meaning**: cosine similarity of embeddings, for questions that share no words with the notes ("where are the lizards?" finds the page about lizardfolk).
 
-The top documents go to the LLM as numbered sources. Answers cite them: wiki facts as `(session 12 @ 01:43:10)`, summaries as `(session 12 summary)`, transcript excerpts as `(session 12 @ 01:40:05)`, and pages as `(wiki: Name)`. If nothing relevant is found, the bot says **"That's not in the notes."** without asking the LLM, and the LLM is told to give the same answer when the sources don't contain one.
+The top documents go to the LLM as numbered sources. Answers cite them: wiki facts as `(session 12, 2024-03-10 @ 01:43:10)`, summaries as `(session 12, 2024-03-10 summary)`, transcript excerpts as `(session 12, 2024-03-10 @ 01:40:05)`, and pages as `(wiki: Name)`. If nothing relevant is found, the bot says **"That's not in the notes."** without asking the LLM, and the LLM is told to give the same answer when the sources don't contain one.
 
 `!deep-question` also searches session transcripts, cut into chunks of about 1,500 characters that each start with a `[HH:MM:SS]` time. Transcript chunks are found by name and keyword only: embedding every chunk of every session would take hours of CPU.
 

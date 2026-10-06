@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -79,17 +79,21 @@ class Fact:
     created_at: str = ""
     superseded_by: int | None = None
     retracted_at: str | None = None
+    # The source session's number in its campaign and the date it was played (read with the fact).
+    session_number: int | None = None
+    session_date: str | None = None
 
     @property
     def active(self) -> bool:
         return self.superseded_by is None and self.retracted_at is None
 
     def source_label(self) -> str:
-        """Short human-readable provenance, e.g. `session 12 @ 01:23:45`, `pinned`, `journal`."""
+        """Short human-readable provenance, e.g. `session 12, 2024-03-10 @ 01:23:45`, `pinned`,
+        `journal`. The date lets readers (and the LLM) order sessions whatever their numbers."""
         if self.kind == "pinned":
             return "pinned"
         if self.session_id is not None:
-            label = f"session {self.session_id}"
+            label = session_label(self.session_number or self.session_id, self.session_date)
             if self.transcript_ts:
                 label += f" @ {self.transcript_ts}"
             return label
@@ -153,6 +157,26 @@ class SessionArtifacts:
     transcript_path: Path
     summary_path: Path
     wiki_report: WikiChangeReport | None = None
+    session_number: int = 0  # The session's number in its campaign, and the date it was played.
+    session_date: str = ""
+
+
+def session_date(started_at: str, imported: bool = False) -> str:
+    """The date a session was played, `YYYY-MM-DD` ("" if unknown). A recorded session's start is
+    stored in UTC and shown in the bot's local time zone (`TZ`), so an evening game keeps its own
+    date; an imported recap's start is already its journal date."""
+    try:
+        moment = datetime.fromisoformat(started_at)
+    except (TypeError, ValueError):
+        return ""
+    if not imported and moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc).astimezone()
+    return moment.date().isoformat()
+
+
+def session_label(number: int, date: str | None = None) -> str:
+    """`session 12, 2024-03-10` (the campaign's session number and the date it was played)."""
+    return f"session {number}, {date}" if date else f"session {number}"
 
 
 _ARTICLE_PREFIX = re.compile(r"^(the|a|an)\s+")

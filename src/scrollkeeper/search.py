@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from .llm import NOT_IN_NOTES_REPLY
-from .models import SearchDoc
+from .models import SearchDoc, session_date, session_label
 from .storage import Storage
 from .transcript import format_offset, merge_lines
 from .wiki import (
@@ -161,7 +161,8 @@ class SearchIndex:
             self.storage.replace_search_docs(campaign_id, "page", entity_id, [doc], version)
 
         for session in self.storage.summarized_sessions(campaign_id):
-            session_id, version = int(session["id"]), session["ended_at"] or ""
+            # The number is part of the version: titles carry it (and changed with #24).
+            session_id, version = int(session["id"]), f"{session['ended_at'] or ''}|{session['number']}"
             wanted.update({("summary", session_id), ("transcript", session_id)})
             if versions.get(("summary", session_id)) != version:
                 # The stored path is absolute; fall back to the usual place if the data dir moved.
@@ -173,7 +174,7 @@ class SearchIndex:
             if versions.get(("transcript", session_id)) != version:
                 started_at = datetime.fromisoformat(session["started_at"])
                 lines = merge_lines(self.storage.get_session_segments(session_id))
-                docs = transcript_docs(session_id, started_at, lines)
+                docs = transcript_docs(session_id, started_at, lines, number=session["number"])
                 self.storage.replace_search_docs(campaign_id, "transcript", session_id, docs, version)
 
         for kind, ref_id in set(versions) - wanted:
@@ -297,11 +298,12 @@ class SearchIndex:
             elif doc.kind == "summary":
                 heading = f"Summary of {doc.title}"
                 text = doc.body
-                labels[tag] = f"session {doc.session_id} summary"
+                labels[tag] = f"{self._session_label(doc.session_id)} summary"
             else:
-                heading = f"Transcript of session {doc.session_id} from {doc.start_ts}"
+                label = self._session_label(doc.session_id)
+                heading = f"Transcript of {label} from {doc.start_ts}"
                 text = doc.body
-                labels[tag] = f"session {doc.session_id} @ {doc.start_ts}"
+                labels[tag] = f"{label} @ {doc.start_ts}"
             text = text.strip()
             if len(text) > DOC_CONTEXT_CHARS:
                 text = text[:DOC_CONTEXT_CHARS].rstrip() + "\n[...]"
@@ -314,19 +316,35 @@ class SearchIndex:
         return "\n\n".join(blocks), labels
 
 
+    def _session_label(self, session_id: int | None) -> str:
+        """`session 12, 2024-03-10` for a source document's session (blocking)."""
+        row = self.storage.get_session(session_id) if session_id is not None else None
+        if row is None:
+            return f"session {session_id}"
+        return session_label(row["number"] or session_id, session_date(row["started_at"], row["journal_id"] is not None))
+
+
 # --- Pure helpers (unit-tested) --------------------------------------------------------------
 
 
 def summary_doc(session: Any, summary_markdown: str) -> SearchDoc:
+    """A session summary titled `session 12: Title (2024-03-10)`: its number in the campaign and
+    the date it was played."""
     session_id = int(session["id"])
-    date = str(session["started_at"])[:10]
-    title = f"session {session_id}"
+    date = session_date(session["started_at"], session["journal_id"] is not None) or str(session["started_at"])[:10]
+    title = f"session {session['number'] or session_id}"
     if session["title"]:
         title += f": {session['title']}"
     return SearchDoc("summary", session_id, f"{title} ({date})", summary_markdown.strip(), session_id=session_id)
 
 
-def transcript_docs(session_id: int, started_at: datetime, lines: list[Any], max_chars: int = TRANSCRIPT_CHUNK_CHARS) -> list[SearchDoc]:
+def transcript_docs(
+    session_id: int,
+    started_at: datetime,
+    lines: list[Any],
+    max_chars: int = TRANSCRIPT_CHUNK_CHARS,
+    number: int | None = None,
+) -> list[SearchDoc]:
     """Cut a session transcript into chunks of whole `[HH:MM:SS] Speaker: text` lines."""
     docs: list[SearchDoc] = []
     current: list[str] = []
@@ -339,7 +357,7 @@ def transcript_docs(session_id: int, started_at: datetime, lines: list[Any], max
                 SearchDoc(
                     "transcript",
                     session_id,
-                    f"session {session_id} transcript {start_ts}",
+                    f"session {number or session_id} transcript {start_ts}",
                     "\n".join(current),
                     part=len(docs),
                     session_id=session_id,

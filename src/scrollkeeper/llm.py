@@ -442,8 +442,9 @@ Rules:
 - Use only the current page and the listed facts. Do not invent anything.
 - Pinned facts are authoritative corrections from the game master: they override anything that
   conflicts with them, including the current page.
-- When other facts conflict, prefer the later session and mention the change if it matters
-  (e.g. "was an ally until session 7").
+- Facts cite their session with its number and the date it was played (e.g. `session 7,
+  2024-03-10`). When facts conflict, prefer the one from the later date and mention the change
+  if it matters (e.g. "was an ally until session 7").
 - Cite facts by id in square brackets after the statement they support, e.g. `[F12]` or `[F12, F15]`.
   Keep existing citations from the current page.
 - Write Markdown without a top-level heading. Start with the opening paragraph described in the
@@ -475,9 +476,10 @@ sources given (wiki pages, session summaries and transcript excerpts, each tagge
 Rules:
 - Use only the sources. Do not add outside knowledge, and do not guess.
 - Cite every statement. Wiki pages carry citations in parentheses such as
-  (session 12 @ 01:43:10); copy the one that supports the statement. Otherwise cite the
+  (session 12, 2024-03-10 @ 01:43:10); copy the one that supports the statement. Otherwise cite the
   source's tag, such as [S2] or [S1, S3].
-- When sources disagree, prefer the later session and say what changed.
+- When sources disagree, prefer the one from the later date (sessions carry the date they were
+  played) and say what changed.
 - If the sources do not answer the question, reply exactly: {NOT_IN_NOTES_REPLY}
 - Be concise: a few sentences or a short list.
 """

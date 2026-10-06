@@ -117,7 +117,8 @@ def build_bot(settings: Settings) -> commands.Bot:
             await channel.send("Session processing finished without generated artifacts.")
             return
         response = [
-            f"## Session {artifacts.session_id}",
+            f"## Session {artifacts.session_number or artifacts.session_id}"
+            + (f" ({artifacts.session_date})" if artifacts.session_date else ""),
             "",
             "### Session Notes",
             artifacts.session_notes_markdown,
@@ -256,7 +257,7 @@ def build_bot(settings: Settings) -> commands.Bot:
             if not member.bot and member.id not in registered
         ]
         notice = [
-            f"Session **#{session.session_id}** is now recording in **{voice_channel.name}** "
+            f"Session **#{session.number or session.session_id}** is now recording in **{voice_channel.name}** "
             f"for campaign **{campaign.name if campaign else session.campaign_id}**.",
             "Recording notice: the voices of players who have run `!register-character` are recorded and "
             "transcribed for the session notes. Everyone else, and bots, are not recorded.",
@@ -272,12 +273,12 @@ def build_bot(settings: Settings) -> commands.Bot:
             return
         await ctx.reply("Ending the session. Processing will continue in the background.")
         try:
-            session_id = await sessions.end_session(ctx.guild)
+            session_number = await sessions.end_session(ctx.guild)
         except Exception as exc:
             await ctx.reply(str(exc))
             return
         await ctx.send(
-            f"Session **#{session_id}** is now in processing. "
+            f"Session **#{session_number}** is now in processing. "
             "You can continue using `!campaign-question` while this runs."
         )
 
@@ -559,34 +560,34 @@ def build_bot(settings: Settings) -> commands.Bot:
         await ctx.reply(sessions.session_status(ctx.guild.id))
 
     @bot.command(name="reprocess-session")
-    async def reprocess_session(ctx: commands.Context, session_id: int | None = None) -> None:
+    async def reprocess_session(ctx: commands.Context, number: int | None = None) -> None:
         if ctx.guild is None:
             await ctx.reply("This command must be used in a server.")
             return
         await ctx.reply("Reprocessing saved session audio in the background.")
         try:
-            resolved_session_id = await sessions.reprocess_session(ctx.guild.id, session_id=session_id)
+            resolved = await sessions.reprocess_session(ctx.guild.id, number)
         except Exception as exc:
             await ctx.send(str(exc))
             return
         await ctx.send(
-            f"Session **#{resolved_session_id}** is now reprocessing from saved audio. "
+            f"Session **#{resolved}** is now reprocessing from saved audio. "
             "Use `!session-status` to check progress."
         )
 
     @bot.command(name="reprocess-llm")
-    async def reprocess_llm(ctx: commands.Context, session_id: int | None = None) -> None:
+    async def reprocess_llm(ctx: commands.Context, number: int | None = None) -> None:
         if ctx.guild is None:
             await ctx.reply("This command must be used in a server.")
             return
         await ctx.reply("Reprocessing summaries and notes from existing transcript text.")
         try:
-            resolved_session_id = await sessions.reprocess_llm_only(ctx.guild.id, session_id=session_id)
+            resolved = await sessions.reprocess_llm_only(ctx.guild.id, number)
         except Exception as exc:
             await ctx.send(str(exc))
             return
         await ctx.send(
-            f"Session **#{resolved_session_id}** is now reprocessing LLM outputs only (speech-to-text skipped). "
+            f"Session **#{resolved}** is now reprocessing LLM outputs only (speech-to-text skipped). "
             "Use `!session-status` to check progress."
         )
 

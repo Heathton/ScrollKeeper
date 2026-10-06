@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterator
 
-from .models import FACT_KINDS, Campaign, Entity, Fact, Page, SearchDoc, SpeakerSegment, normalize_name
+from .models import FACT_KINDS, Campaign, Entity, Fact, Page, SearchDoc, SpeakerSegment, normalize_name, session_date
 
 
 # Forward-only schema migrations, applied in order; `PRAGMA user_version` records how many ran.
@@ -216,7 +216,26 @@ MIGRATIONS: list[str] = [
         finished_at TEXT
     );
     """,
+    # 6: per-campaign session numbers (#24). Sessions are numbered 1, 2, 3... within their
+    # campaign, by date; the id stays the storage key (folders, fact sources).
+    """
+    ALTER TABLE sessions ADD COLUMN number INTEGER;
+    UPDATE sessions SET number = (
+        SELECT COUNT(*) FROM sessions s
+        WHERE s.campaign_id IS sessions.campaign_id
+          AND (s.started_at < sessions.started_at OR (s.started_at = sessions.started_at AND s.id <= sessions.id))
+    );
+    CREATE UNIQUE INDEX sessions_campaign_number ON sessions(campaign_id, number);
+    """,
 ]
+
+# A session's number: the next one in its campaign.
+_NEXT_SESSION_NUMBER = "(SELECT COALESCE(MAX(number), 0) + 1 FROM sessions WHERE campaign_id = ?)"
+# Facts with the number and start of the session they come from (for citations, see `Fact`).
+_FACTS_WITH_SESSION = """
+    SELECT f.*, s.number AS session_number, s.started_at AS session_started_at, s.journal_id AS session_journal_id
+    FROM facts f LEFT JOIN sessions s ON s.id = f.session_id
+"""
 
 DEFAULT_CAMPAIGN = "Default"
 
@@ -407,12 +426,12 @@ class Storage:
             cursor = conn.execute(
                 """
                 INSERT INTO sessions (
-                    guild_id, campaign_id, voice_channel_id, text_channel_id, title,
+                    guild_id, campaign_id, number, voice_channel_id, text_channel_id, title,
                     started_at, status
                 )
-                VALUES (?, ?, ?, ?, ?, ?, 'recording')
-                """,
-                (guild_id, campaign_id, voice_channel_id, text_channel_id, title, started_at),
+                VALUES (?, ?, {_NEXT_SESSION_NUMBER}, ?, ?, ?, ?, 'recording')
+                """.format(_NEXT_SESSION_NUMBER=_NEXT_SESSION_NUMBER),
+                (guild_id, campaign_id, campaign_id, voice_channel_id, text_channel_id, title, started_at),
             )
             return int(cursor.lastrowid)
 
@@ -589,6 +608,12 @@ class Storage:
                 (session_id,),
             ).fetchone()
         return row
+
+    def get_session_by_number(self, campaign_id: int, number: int) -> sqlite3.Row | None:
+        with self.connection() as conn:
+            return conn.execute(
+                "SELECT * FROM sessions WHERE campaign_id = ? AND number = ?", (campaign_id, number)
+            ).fetchone()
 
     def get_latest_session(self, campaign_id: int) -> sqlite3.Row | None:
         """The campaign's latest recorded session (imported journal recaps don't count)."""
@@ -885,7 +910,7 @@ class Storage:
     def get_fact(self, campaign_id: int, fact_id: int) -> Fact | None:
         with self.connection() as conn:
             row = conn.execute(
-                "SELECT * FROM facts WHERE campaign_id = ? AND id = ?",
+                f"{_FACTS_WITH_SESSION} WHERE f.campaign_id = ? AND f.id = ?",
                 (campaign_id, fact_id),
             ).fetchone()
         return _fact_from_row(row) if row else None
@@ -896,16 +921,16 @@ class Storage:
         placeholders = ",".join("?" for _ in fact_ids)
         with self.connection() as conn:
             rows = conn.execute(
-                f"SELECT * FROM facts WHERE campaign_id = ? AND id IN ({placeholders})",
+                f"{_FACTS_WITH_SESSION} WHERE f.campaign_id = ? AND f.id IN ({placeholders})",
                 (campaign_id, *fact_ids),
             ).fetchall()
         return {int(row["id"]): _fact_from_row(row) for row in rows}
 
     def get_entity_facts(self, entity_id: int, active_only: bool = True) -> list[Fact]:
-        query = "SELECT * FROM facts WHERE entity_id = ?"
+        query = f"{_FACTS_WITH_SESSION} WHERE f.entity_id = ?"
         if active_only:
-            query += " AND superseded_by IS NULL AND retracted_at IS NULL"
-        query += " ORDER BY id"
+            query += " AND f.superseded_by IS NULL AND f.retracted_at IS NULL"
+        query += " ORDER BY f.id"
         with self.connection() as conn:
             rows = conn.execute(query, (entity_id,)).fetchall()
         return [_fact_from_row(row) for row in rows]
@@ -1088,12 +1113,12 @@ class Storage:
                 cursor = conn.execute(
                     """
                     INSERT INTO sessions (
-                        guild_id, campaign_id, voice_channel_id, text_channel_id, title, started_at,
+                        guild_id, campaign_id, number, voice_channel_id, text_channel_id, title, started_at,
                         status, journal_id
                     )
-                    VALUES (?, ?, 0, 0, ?, ?, 'completed', ?)
-                    """,
-                    (int(guild["guild_id"]), campaign_id, title, started_at.isoformat(), journal_id),
+                    VALUES (?, ?, {_NEXT_SESSION_NUMBER}, 0, 0, ?, ?, 'completed', ?)
+                    """.format(_NEXT_SESSION_NUMBER=_NEXT_SESSION_NUMBER),
+                    (int(guild["guild_id"]), campaign_id, campaign_id, title, started_at.isoformat(), journal_id),
                 )
                 session_id = int(cursor.lastrowid)
             else:
@@ -1443,6 +1468,12 @@ def _fact_from_row(row: sqlite3.Row) -> Fact:
         created_at=row["created_at"],
         superseded_by=row["superseded_by"],
         retracted_at=row["retracted_at"],
+        session_number=row["session_number"] if "session_number" in row.keys() else None,
+        session_date=(
+            session_date(row["session_started_at"], row["session_journal_id"] is not None) or None
+            if "session_started_at" in row.keys()
+            else None
+        ),
     )
 
 
