@@ -17,7 +17,7 @@ from discord.ext import voice_recv
 
 from .audio import LEGACY_OPUS_EXTENSION, convert_legacy_clips, decode_for_transcription, ogg_duration_seconds
 from .llm import LocalAIService
-from .models import Campaign, SessionArtifacts, SpeakerSegment, WikiChangeReport
+from .models import Campaign, SessionArtifacts, SpeakerSegment, WikiChangeReport, session_date
 from .recorder import Speaker, TrackRecorder
 from .storage import PROCESS_LLM_ONLY, PROCESS_TRANSCRIBE, Storage
 from .transcript import TranscriptLine, format_offset, merge_lines, render_compact, render_timed, split_utterances
@@ -49,6 +49,7 @@ class ActiveSession:
     base_dir: Path
     audio_dir: Path
     started_at: datetime
+    number: int = 0  # The session's number in its campaign (shown to people; `session_id` is the key).
     record_dir: Path | None = None
     voice_client: voice_recv.VoiceRecvClient | None = None
     sink: "SessionAudioSink | None" = None
@@ -61,7 +62,7 @@ class ActiveSession:
 @dataclass(slots=True)
 class SessionStatus:
     state: str
-    session_id: int | None = None
+    session_number: int | None = None
     message: str = ""
     updated_at: datetime = field(default_factory=datetime.utcnow)
 
@@ -194,7 +195,7 @@ class SessionManager:
             notices.append(
                 (
                     int(row["text_channel_id"]),
-                    f"Session **#{session_id}** was still recording when I restarted. The audio up to {offset} "
+                    f"Session **#{row['number'] or session_id}** was still recording when I restarted. The audio up to {offset} "
                     "into the session was saved and is being processed; anything after that was not recorded.",
                 )
             )
@@ -202,7 +203,7 @@ class SessionManager:
             guild_ids.add(int(row["guild_id"]))
             if row["interrupted_at"] is None or int(row["processing_attempts"]) > 0:
                 notices.append(
-                    (int(row["text_channel_id"]), f"Resuming processing of session **#{row['id']}** after a restart.")
+                    (int(row["text_channel_id"]), f"Resuming processing of session **#{row['number'] or row['id']}** after a restart.")
                 )
         return notices, guild_ids
 
@@ -282,7 +283,7 @@ class SessionManager:
         session.sink = sink
         session.reconnect_task = asyncio.create_task(self._monitor_voice_connection(guild, session))
         self.active_sessions[guild.id] = session
-        self._set_status(guild.id, "recording", session_id, "Recording in progress.")
+        self._set_status(guild.id, "recording", session.number, "Recording in progress.")
         return session
 
     async def end_session(self, guild: discord.Guild) -> int:
@@ -294,60 +295,54 @@ class SessionManager:
         await self._stop_recording_session(session)
         self.active_sessions.pop(guild.id, None)
         await asyncio.to_thread(self.storage.queue_session, session.session_id, PROCESS_TRANSCRIBE)
-        self._set_status(guild.id, "processing", session.session_id, "Transcribing and generating notes.")
+        self._set_status(guild.id, "processing", session.number, "Transcribing and generating notes.")
         self._ensure_worker(guild.id)
-        return session.session_id
+        return session.number
 
-    async def reprocess_session(self, guild_id: int, session_id: int | None = None) -> int:
-        row = await self._session_row_for_reprocess(guild_id, session_id)
+    async def reprocess_session(self, guild_id: int, number: int | None = None) -> int:
+        """Re-transcribe session `number` of the active campaign (default: the latest). Returns its number."""
+        row = await self._session_row_for_reprocess(guild_id, number)
         resolved_session_id = int(row["id"])
+        number = int(row["number"] or resolved_session_id)
         if row["audio_deleted_at"]:
-            raise RuntimeError(f"Session #{resolved_session_id}'s audio was deleted (audio retention), so it can't be re-transcribed.")
+            raise RuntimeError(f"Session #{number}'s audio was deleted (audio retention), so it can't be re-transcribed.")
         tracks = await asyncio.to_thread(self.storage.get_session_tracks, resolved_session_id)
         audio_dir = self.storage.sessions_dir / str(resolved_session_id) / "audio"
         if not tracks and not audio_dir.exists():
-            raise RuntimeError(f"Session #{resolved_session_id} has no recorded audio to reprocess.")
+            raise RuntimeError(f"Session #{number} has no recorded audio to reprocess.")
 
         await asyncio.to_thread(self.storage.reset_session_processing, resolved_session_id)
-        self._set_status(
-            guild_id,
-            "processing",
-            resolved_session_id,
-            "Reprocessing saved audio and regenerating notes.",
-        )
+        self._set_status(guild_id, "processing", number, "Reprocessing saved audio and regenerating notes.")
         self._ensure_worker(guild_id)
-        return resolved_session_id
+        return number
 
-    async def reprocess_llm_only(self, guild_id: int, session_id: int | None = None) -> int:
-        row = await self._session_row_for_reprocess(guild_id, session_id)
-        resolved_session_id = int(row["id"])
-        await asyncio.to_thread(self.storage.reset_session_llm_processing, resolved_session_id)
-        self._set_status(
-            guild_id,
-            "processing",
-            resolved_session_id,
-            "Reprocessing summaries and notes from existing transcript text.",
-        )
+    async def reprocess_llm_only(self, guild_id: int, number: int | None = None) -> int:
+        """Rerun the LLM steps of session `number` of the active campaign (default: the latest).
+        Returns its number."""
+        row = await self._session_row_for_reprocess(guild_id, number)
+        number = int(row["number"] or row["id"])
+        await asyncio.to_thread(self.storage.reset_session_llm_processing, int(row["id"]))
+        self._set_status(guild_id, "processing", number, "Reprocessing summaries and notes from existing transcript text.")
         self._ensure_worker(guild_id)
-        return resolved_session_id
+        return number
 
-    async def _session_row_for_reprocess(self, guild_id: int, session_id: int | None) -> sqlite3.Row:
+    async def _session_row_for_reprocess(self, guild_id: int, number: int | None) -> sqlite3.Row:
         if guild_id in self.active_sessions:
             raise RuntimeError("Cannot reprocess while a live session is recording in this server.")
         if guild_id in self.processing_tasks:
             raise RuntimeError("A session is already processing in this server.")
-        if session_id is not None:
-            row = await asyncio.to_thread(self.storage.get_session, session_id)
+        campaign = await asyncio.to_thread(self.storage.active_campaign, guild_id)
+        if number is not None:
+            row = await asyncio.to_thread(self.storage.get_session_by_number, campaign.id, number)
+            if row is None:
+                raise RuntimeError(f"Campaign **{campaign.name}** has no session #{number}.")
         else:
-            campaign = await asyncio.to_thread(self.storage.active_campaign, guild_id)
             row = await asyncio.to_thread(self.storage.get_latest_session, campaign.id)
         if row is None:
             raise RuntimeError("No saved session was found to reprocess in the active campaign.")
-        if int(row["guild_id"]) != guild_id:
-            raise RuntimeError("That session does not belong to this server.")
         if row["journal_id"]:
             raise RuntimeError(
-                f"Session #{row['id']} is a recap imported from the journal; run `!import-journal` again to update it."
+                f"Session #{row['number']} is a recap imported from the journal; run `!import-journal` again to update it."
             )
         return row
 
@@ -366,7 +361,7 @@ class SessionManager:
         status = self.statuses.get(guild_id)
         if status is None:
             return "No active or recent session."
-        session_label = f"Session #{status.session_id}" if status.session_id else "Session"
+        session_label = f"Session #{status.session_number}" if status.session_number else "Session"
         if status.message:
             return f"{session_label} status: {status.state}. {status.message}"
         return f"{session_label} status: {status.state}."
@@ -400,11 +395,11 @@ class SessionManager:
                 )
                 log.error("Session %s: %s", session.session_id, message)
                 await asyncio.to_thread(self.storage.set_session_status, session.session_id, "failed")
-                self._set_status(guild_id, "failed", session.session_id, message)
+                self._set_status(guild_id, "failed", session.number, message)
                 await self._report_completion(guild_id, session, None, message)
                 continue
             transcribe = row["processing_kind"] != PROCESS_LLM_ONLY
-            self._set_status(guild_id, "processing", session.session_id, "Transcribing and generating notes.")
+            self._set_status(guild_id, "processing", session.number, "Transcribing and generating notes.")
             await self._process_session_job(guild_id, session, transcribe_audio=transcribe)
 
     async def _process_session_job(self, guild_id: int, session: ActiveSession, transcribe_audio: bool = True) -> None:
@@ -416,7 +411,7 @@ class SessionManager:
             self._set_status(
                 guild_id,
                 "completed",
-                session.session_id,
+                session.number,
                 "Session processing is complete.",
             )
             log.info("Completed post-session processing for session %s", session.session_id)
@@ -427,7 +422,7 @@ class SessionManager:
             self._set_status(
                 guild_id,
                 "failed",
-                session.session_id,
+                session.number,
                 f"Session processing failed: {error_message}",
             )
         await self._report_completion(guild_id, session, artifacts, error_message)
@@ -473,7 +468,7 @@ class SessionManager:
         await asyncio.to_thread(self._write_output, transcript_path, transcript_markdown)
         glossary = await asyncio.to_thread(self.wiki.spelling_glossary, session.campaign_id)
         log.info("Generating summary for session %s (%s names in the spelling glossary)", session.session_id, len(glossary))
-        self._set_status(guild_id, "processing", session.session_id, "Writing the session summary.")
+        self._set_status(guild_id, "processing", session.number, "Writing the session summary.")
         summary_payload = await self.llm.summarize_session(lines, note, glossary, on_wait=notify)
         session_notes = summary_payload["session_notes_markdown"].strip()
         cinematic = summary_payload["cinematic_summary_markdown"].strip()
@@ -495,7 +490,7 @@ class SessionManager:
                 session.session_id,
                 timed_transcript,
                 on_wait=notify,
-                on_progress=lambda message: self._set_status(guild_id, "processing", session.session_id, message),
+                on_progress=lambda message: self._set_status(guild_id, "processing", session.number, message),
             )
         except Exception as exc:
             log.exception("Campaign wiki update failed for session %s", session.session_id)
@@ -521,6 +516,8 @@ class SessionManager:
             transcript_path=transcript_path,
             summary_path=summary_path,
             wiki_report=wiki_report,
+            session_number=session.number,
+            session_date=session_date(session.started_at.isoformat()),
         )
 
     @staticmethod
@@ -559,7 +556,7 @@ class SessionManager:
                 self._set_status(
                     guild_id,
                     "processing",
-                    session.session_id,
+                    session.number,
                     f"Transcribing track {index}/{len(tracks)} ({name}, {format_offset(timedelta(seconds=int(durations[index - 1])))}).",
                 )
                 source = Path(track["path"])
@@ -696,6 +693,7 @@ class SessionManager:
             base_dir=base_dir,
             audio_dir=base_dir / "audio",
             started_at=datetime.fromisoformat(row["started_at"]),
+            number=int(row["number"] or session_id),
             interrupted_at=datetime.fromisoformat(interrupted_at) if interrupted_at else None,
             closed=True,
         )
@@ -712,10 +710,10 @@ class SessionManager:
             # Drains packets still queued, writes the final pages, records each track's end.
             await asyncio.to_thread(session.recorder.stop)
 
-    def _set_status(self, guild_id: int, state: str, session_id: int | None, message: str) -> None:
+    def _set_status(self, guild_id: int, state: str, session_number: int | None, message: str) -> None:
         self.statuses[guild_id] = SessionStatus(
             state=state,
-            session_id=session_id,
+            session_number=session_number,
             message=message,
             updated_at=datetime.utcnow(),
         )

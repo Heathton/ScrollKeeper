@@ -421,7 +421,13 @@ class JournalSessionStorageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(storage_module, "MIGRATIONS", MIGRATIONS[:4]):
                 old = Storage(Path(tmp))
-                session_id = old.create_session(1, 2, 3, "Recorded")
+                campaign_id = old.active_campaign(1).id
+                with old.connection() as conn:
+                    session_id = conn.execute(
+                        "INSERT INTO sessions (guild_id, campaign_id, voice_channel_id, text_channel_id, started_at, status)"
+                        " VALUES (1, ?, 2, 3, '2026-01-01T20:00:00', 'completed')",
+                        (campaign_id,),
+                    ).lastrowid
             storage = Storage(Path(tmp))
             with storage.connection() as conn:
                 self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], len(MIGRATIONS))

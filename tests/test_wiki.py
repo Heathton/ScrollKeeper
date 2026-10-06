@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scrollkeeper.llm import LocalAIService, normalize_extraction_payload
-from scrollkeeper.models import ENTITY_TYPES, Entity, Fact, WikiChangeReport
+from scrollkeeper.models import ENTITY_TYPES, Entity, Fact, WikiChangeReport, session_date, session_label
 from scrollkeeper.storage import Storage
 from scrollkeeper.wiki import (
     PAGE_LAYOUTS,
@@ -27,6 +27,12 @@ from scrollkeeper.wiki import (
 )
 
 from test_llm_summary import fake_settings
+
+
+def cited_session(storage, session_id: int) -> str:
+    """How facts from a session are cited: its number in the campaign and the date it was played."""
+    row = storage.get_session(session_id)
+    return session_label(row["number"], session_date(row["started_at"]))
 
 
 class FakeLLM:
@@ -433,7 +439,7 @@ class ReviewCommandTests(WikiTestCase):
         entity = await self._entity_with_page("Varric", "Runs the docks.")
         rendered = await self.wiki.render_entity(1, entity)
         fact = self.storage.get_entity_facts(entity.id)[0]
-        self.assertIn(f"- F{fact.id} (session {self.session_id} @ 00:01:00): Runs the docks.", rendered)
+        self.assertIn(f"- F{fact.id} ({cited_session(self.storage, self.session_id)} @ 00:01:00): Runs the docks.", rendered)
 
     async def test_export_writes_linked_markdown_files(self) -> None:
         await self._entity_with_page("Varric", "Varric trusts Mira.")
@@ -444,7 +450,7 @@ class ReviewCommandTests(WikiTestCase):
         varric_file = (target / "Character" / "Varric.md").read_text(encoding="utf-8")
         self.assertIn("# Varric", varric_file)
         self.assertIn("[[Mira|Mira]]", varric_file)
-        self.assertIn(f"(session {self.session_id} @ 00:01:00)", varric_file)
+        self.assertIn(f"({cited_session(self.storage, self.session_id)} @ 00:01:00)", varric_file)
         mira_file = (target / "Character" / "Mira.md").read_text(encoding="utf-8")
         self.assertIn('  - "The \\"Gull\\" Captain"', mira_file)
 

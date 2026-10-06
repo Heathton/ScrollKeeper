@@ -28,7 +28,7 @@ from scrollkeeper.transcript import TranscriptLine
 from scrollkeeper.wiki import CampaignWiki, format_change_report
 
 from test_llm_summary import fake_settings
-from test_wiki import FakeLLM, extraction
+from test_wiki import FakeLLM, cited_session, extraction
 
 
 class FakeEmbedder:
@@ -214,7 +214,7 @@ class RetrievalTests(SearchTestCase):
         answer = await self.search.answer(1, "What did Varric pay for?")
         question, sources = self.llm.questions[-1]
         self.assertTrue(sources.startswith("[S1] Wiki page [Character] Varric Thane"))
-        self.assertIn(f"(session {self.session_id} @ 00:01:00)", sources)
+        self.assertIn(f"({cited_session(self.storage, self.session_id)} @ 00:01:00)", sources)
         self.assertEqual(answer, "Varric runs the docks (wiki: Varric Thane).")
 
     async def test_unrelated_question_is_not_in_the_notes_without_asking_the_llm(self) -> None:
