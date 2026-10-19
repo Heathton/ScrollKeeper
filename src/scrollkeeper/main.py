@@ -6,6 +6,7 @@ import sys
 from .bot import build_bot
 from .config import Settings
 from .health import start_health_server
+from .metrics import render_metrics
 
 
 def main() -> None:
@@ -16,7 +17,16 @@ def main() -> None:
     settings = Settings.load()
     settings.validate()
     bot = build_bot(settings)
-    start_health_server(bot.heartbeat, settings.health_port)
+    storage = bot.storage
+    # build_bot always attaches the Storage it created; /metrics reads it.
+    if storage is not None:
+        start_health_server(
+            bot.heartbeat,
+            settings.health_port,
+            metrics_provider=lambda: render_metrics(storage, bot.heartbeat),
+        )
+    else:
+        start_health_server(bot.heartbeat, settings.health_port)
     bot.run(settings.discord_bot_token)
 
 

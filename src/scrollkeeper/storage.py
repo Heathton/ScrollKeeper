@@ -227,6 +227,14 @@ MIGRATIONS: list[str] = [
     );
     CREATE UNIQUE INDEX sessions_campaign_number ON sessions(campaign_id, number);
     """,
+    # 7: When a session last entered `processing` (#26). The /metrics endpoint
+    # reports each session's processing age from this; it is set on every
+    # transition into `processing` (queue, manual reprocessing, interrupted
+    # recording) and cleared on completion, but a bot restart mid-run leaves
+    # it alone, so a session that keeps dying and re-queueing keeps ageing.
+    """
+    ALTER TABLE sessions ADD COLUMN processing_started_at TEXT;
+    """,
 ]
 
 # A session's number: the next one in its campaign.
@@ -257,6 +265,10 @@ class Storage:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
+        # The /metrics endpoint reads this database from the health server's
+        # thread while the bot's worker threads write; wait for a writer to
+        # finish instead of failing the scrape with `database is locked`.
+        conn.execute("PRAGMA busy_timeout = 5000")
         try:
             yield conn
             conn.commit()
@@ -444,14 +456,16 @@ class Storage:
 
     def queue_session(self, session_id: int, kind: str = PROCESS_TRANSCRIBE) -> None:
         """Put a session on the processing queue (status 'processing'); the queue survives restarts."""
+        queued_at = datetime.utcnow().isoformat()
         with self.connection() as conn:
             conn.execute(
                 """
                 UPDATE sessions
-                SET status = 'processing', processing_kind = ?, processing_attempts = 0
+                SET status = 'processing', processing_kind = ?, processing_attempts = 0,
+                    processing_started_at = ?
                 WHERE id = ?
                 """,
-                (kind, session_id),
+                (kind, queued_at, session_id),
             )
 
     def reset_session_processing(self, session_id: int) -> None:
@@ -463,10 +477,11 @@ class Storage:
                     processing_kind = ?,
                     processing_attempts = 0,
                     transcript_path = NULL,
-                    summary_path = NULL
+                    summary_path = NULL,
+                    processing_started_at = ?
                 WHERE id = ?
                 """,
-                (PROCESS_TRANSCRIBE, session_id),
+                (PROCESS_TRANSCRIBE, datetime.utcnow().isoformat(), session_id),
             )
             # Track utterances are recreated by speech-to-text; legacy clip rows keep their row.
             conn.execute(
@@ -490,10 +505,11 @@ class Storage:
                 SET status = 'processing',
                     processing_kind = ?,
                     processing_attempts = 0,
-                    summary_path = NULL
+                    summary_path = NULL,
+                    processing_started_at = ?
                 WHERE id = ?
                 """,
-                (PROCESS_LLM_ONLY, session_id),
+                (PROCESS_LLM_ONLY, datetime.utcnow().isoformat(), session_id),
             )
 
     def next_queued_session(self, guild_id: int) -> sqlite3.Row | None:
@@ -517,16 +533,33 @@ class Storage:
         with self.connection() as conn:
             return list(conn.execute("SELECT * FROM sessions WHERE status = ? ORDER BY id", (status,)).fetchall())
 
+    def count_sessions(self, status: str) -> int:
+        with self.connection() as conn:
+            return int(conn.execute("SELECT COUNT(*) FROM sessions WHERE status = ?", (status,)).fetchone()[0])
+
+    def sessions_in_processing(self) -> list[sqlite3.Row]:
+        """The sessions in `processing`, for the /metrics processing-age samples."""
+        with self.connection() as conn:
+            return list(
+                conn.execute(
+                    """
+                    SELECT id, guild_id, started_at, processing_started_at, processing_attempts
+                    FROM sessions WHERE status = 'processing' ORDER BY id
+                    """,
+                ).fetchall()
+            )
+
     def mark_session_interrupted(self, session_id: int, interrupted_at: datetime) -> None:
         """A recording cut short by a restart: queue it for processing and note when capture stopped."""
         with self.connection() as conn:
             conn.execute(
                 """
                 UPDATE sessions
-                SET status = 'processing', processing_kind = ?, processing_attempts = 0, interrupted_at = ?
+                SET status = 'processing', processing_kind = ?, processing_attempts = 0, interrupted_at = ?,
+                    processing_started_at = ?
                 WHERE id = ?
                 """,
-                (PROCESS_TRANSCRIBE, interrupted_at.isoformat(), session_id),
+                (PROCESS_TRANSCRIBE, interrupted_at.isoformat(), datetime.utcnow().isoformat(), session_id),
             )
 
     def sessions_for_audio_cleanup(self, ended_before: datetime) -> list[sqlite3.Row]:
@@ -644,7 +677,8 @@ class Storage:
                 SET status = 'completed',
                     ended_at = ?,
                     transcript_path = ?,
-                    summary_path = ?
+                    summary_path = ?,
+                    processing_started_at = NULL
                 WHERE id = ?
                 """,
                 (ended_at, transcript_path, summary_path, session_id),

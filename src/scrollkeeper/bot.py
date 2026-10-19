@@ -28,6 +28,8 @@ class ScrollKeeperBot(commands.Bot):
         super().__init__(*args, **kwargs)
         self.heartbeat = Heartbeat()
         self._heartbeat_task: asyncio.Task | None = None
+        # Attached by build_bot; the health server's /metrics endpoint reads it.
+        self.storage: Storage | None = None
 
     async def setup_hook(self) -> None:
         self._heartbeat_task = asyncio.create_task(self._beat_forever())
@@ -56,6 +58,7 @@ def build_bot(settings: Settings) -> commands.Bot:
         intents=intents,
     )
     storage = Storage(settings.data_dir)
+    bot.storage = storage
     llm = LocalAIService(settings)
     embedder = LocalEmbedder(
         EMBEDDING_MODELS[settings.embed_model],
