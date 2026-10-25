@@ -7,10 +7,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scrollkeeper.config import Settings
-from scrollkeeper.models import SessionArtifacts
+from scrollkeeper.models import Entity, SessionArtifacts, WikiChangeReport
 
 DISCORD_IMPORT_ERROR: str | None = None
 try:
+    import discord
+
     from scrollkeeper.bot import build_bot
 except ModuleNotFoundError as exc:
     build_bot = None
@@ -18,10 +20,16 @@ except ModuleNotFoundError as exc:
 
 
 class FakeTextChannel:
-    def __init__(self) -> None:
+    def __init__(self, reject_files: bool = False) -> None:
         self.messages: list[str] = []
+        self.files: list[tuple[str, str]] = []
+        self.reject_files = reject_files
 
-    async def send(self, message: str) -> None:
+    async def send(self, message: str, file=None) -> None:
+        if file is not None:
+            if self.reject_files:
+                raise discord.Forbidden(types.SimpleNamespace(status=403, reason="Forbidden"), "Missing Permissions")
+            self.files.append((file.filename, file.fp.read().decode("utf-8")))
         self.messages.append(message)
 
 
@@ -178,11 +186,16 @@ class BotIntegrationHarnessTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertEqual(len(channel.messages), 1)
                 self.assertIn("## Session 42", channel.messages[0])
-                self.assertIn("### Session Notes", channel.messages[0])
+                self.assertIn("Cinematic body", channel.messages[0])
+                self.assertNotIn("Session notes body", channel.messages[0])
+                filename, notes = channel.files[0]
+                self.assertEqual(filename, "session-42-notes.md")
+                self.assertIn("## Session Notes\n\nSession notes body", notes)
+                self.assertIn("## Cinematic Summary\n\nCinematic body", notes)
             finally:
                 await bot.close()
 
-    async def test_completion_handler_splits_long_summary_across_messages(self) -> None:
+    async def test_completion_post_is_short_and_attaches_the_full_notes(self) -> None:
         with (
             patch("scrollkeeper.bot.Storage", FakeStorage),
             patch("scrollkeeper.bot.LocalAIService", FakeLocalAIService),
@@ -194,24 +207,67 @@ class BotIntegrationHarnessTests(unittest.IsolatedAsyncioTestCase):
             try:
                 manager = FakeSessionManager.last_instance
                 self.assertIsNotNone(manager)
-                self.assertIsNotNone(manager.completion_handler)
-
                 channel = FakeTextChannel()
                 bot.get_channel = lambda _cid: channel
                 bot.get_guild = lambda _gid: None
+                ward = Entity(id=7, campaign_id=1, type="Location", canonical_name="Old Ward")
                 artifacts = SessionArtifacts(
                     session_id=77,
                     transcript_markdown="# Transcript\n",
                     session_notes_markdown=("Session note line.\n" * 300).strip(),
+                    cinematic_summary_markdown="The gate fell. The lich still waits below.",
+                    transcript_path=Path("/tmp/transcript.md"),
+                    summary_path=Path("/tmp/summary.md"),
+                    wiki_report=WikiChangeReport(facts_added=19, updated_entities=[ward], page_failures=["Belamour"]),
+                    session_number=130,
+                    session_date="2026-10-19",
+                )
+
+                await manager.completion_handler(777, 4321, artifacts, None)
+
+                self.assertEqual(len(channel.messages), 1)
+                post = channel.messages[0]
+                self.assertTrue(post.startswith("## Session 130 (2026-10-19)\n\nThe gate fell."))
+                self.assertIn("Campaign wiki: 19 fact(s) · 1 page(s) updated · 1 failed: Belamour", post)
+                self.assertNotIn("Session note line.", post)
+                filename, notes = channel.files[0]
+                self.assertEqual(filename, "session-130-notes.md")
+                self.assertTrue(notes.startswith("# Session 130 (2026-10-19)\n"))
+                self.assertEqual(notes.count("Session note line."), 300)
+                self.assertIn("## Campaign wiki", notes)
+                self.assertIn("**Updated:** #7 Old Ward", notes)
+            finally:
+                await bot.close()
+
+    async def test_completion_post_without_attach_permission_says_where_the_notes_are(self) -> None:
+        with (
+            patch("scrollkeeper.bot.Storage", FakeStorage),
+            patch("scrollkeeper.bot.LocalAIService", FakeLocalAIService),
+            patch("scrollkeeper.bot.SessionManager", FakeSessionManager),
+            patch("scrollkeeper.bot.CampaignWiki", FakeCampaignWiki),
+            patch("scrollkeeper.bot.discord.TextChannel", FakeTextChannel),
+        ):
+            bot = build_bot(build_settings())
+            try:
+                manager = FakeSessionManager.last_instance
+                channel = FakeTextChannel(reject_files=True)
+                bot.get_channel = lambda _cid: channel
+                bot.get_guild = lambda _gid: None
+                artifacts = SessionArtifacts(
+                    session_id=5,
+                    transcript_markdown="",
+                    session_notes_markdown="Notes",
                     cinematic_summary_markdown=("Cinematic line.\n" * 300).strip(),
                     transcript_path=Path("/tmp/transcript.md"),
                     summary_path=Path("/tmp/summary.md"),
                 )
 
-                await manager.completion_handler(777, 4321, artifacts, None)
+                await manager.completion_handler(1, 2, artifacts, None)
 
                 self.assertGreater(len(channel.messages), 1)
                 self.assertTrue(all(len(message) <= 1900 for message in channel.messages))
+                self.assertIn("Could not attach `session-5-notes.md`", channel.messages[-1])
+                self.assertEqual(channel.files, [])
             finally:
                 await bot.close()
 
