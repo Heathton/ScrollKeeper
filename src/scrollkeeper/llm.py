@@ -29,6 +29,9 @@ SUMMARY_REPLY_TOKENS = 8192
 # Characters per token for estimating prompt size without the model's tokenizer. English chat
 # is about 4; 3 leaves room for names, punctuation and other languages.
 CHARS_PER_TOKEN = 3.0
+# The cinematic recap is read aloud at the next session (150-250 words asked); a longer one gets
+# one retry to shorten it.
+RECAP_MAX_WORDS = 300
 
 
 class LocalAIService:
@@ -196,7 +199,7 @@ class LocalAIService:
         transcript = render_compact(lines, note)
         budget = self._summary_budget_chars(instructions)
         if len(transcript) <= budget:
-            return self._summarize_part(instructions, transcript, "single-pass")
+            return self._shorten_long_recap(self._summarize_part(instructions, transcript, "single-pass"))
 
         header = len(render_compact([], note))
         parts = split_at_pauses(lines, max(1000, budget - header))
@@ -220,9 +223,12 @@ class LocalAIService:
 Final synthesis requirements:
 - The source is recap text written from consecutive parts of the same session, in order.
 - Return one cohesive session-notes section and one cohesive cinematic summary.
+- The session notes keep the full detail of every part.
+- The cinematic summary is one 150–250 word read-aloud recap of the whole session: keep only the
+  session's biggest turning points across all parts, and end on the stakes left open at its end.
 - Do not structure output by phase/chunk/part/pass labels unless the players explicitly used those terms in-session.
 """
-        return self._summarize_part(final_instructions, combined, "final-from-parts")
+        return self._shorten_long_recap(self._summarize_part(final_instructions, combined, "final-from-parts"))
 
     def _summarize_part(self, instructions: str, transcript_markdown: str, stage_label: str) -> dict[str, Any]:
         payload = self._chat_schema_sync(
@@ -232,6 +238,39 @@ Final synthesis requirements:
         if not self._summary_has_content(normalized):
             raise RuntimeError(f"The LLM returned an empty summary ({stage_label}).")
         return normalized
+
+    def _shorten_long_recap(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Retry once, recap only, when the cinematic recap is too long to read aloud (#30)."""
+        recap = payload["cinematic_summary_markdown"]
+        words = len(recap.split())
+        if words <= RECAP_MAX_WORDS:
+            return payload
+        log.warning("Cinematic recap is %s words (limit %s); asking for a shorter one", words, RECAP_MAX_WORDS)
+        instructions = """
+You edit a "Previously on…" recap of a tabletop RPG session that the game master will read aloud
+to open the next session. The recap below is too long.
+
+Rewrite it as `cinematic_summary_markdown`: 150–250 words (about one minute aloud), 2–3 short
+paragraphs of epic, dramatic narration in past tense, by an omniscient bard-like narrator, vivid
+but plain enough to read aloud fluently. Keep only the turning points (the biggest fight,
+revelation, choice, or loss) and end on the unresolved stakes or cliffhanger. No headings, bullet
+lists, or citations. Use only facts from the recap.
+"""
+        try:
+            reply = self._chat_schema_sync(instructions, f"Recap:\n{recap}", "session_recap", RECAP_SCHEMA)
+        except RuntimeError as exc:
+            log.warning("Could not shorten the cinematic recap; keeping the long one: %s", exc)
+            return payload
+        shorter = str(reply.get("cinematic_summary_markdown", "")).strip()
+        if not self._summary_has_content({**payload, "cinematic_summary_markdown": shorter}):
+            log.warning("The shortened cinematic recap was empty; keeping the long one")
+            return payload
+        if len(shorter.split()) >= words:
+            log.warning("The shortened cinematic recap is no shorter; keeping the original")
+            return payload
+        if len(shorter.split()) > RECAP_MAX_WORDS:
+            log.warning("The shortened cinematic recap is still %s words", len(shorter.split()))
+        return {**payload, "cinematic_summary_markdown": shorter}
 
     def _summary_budget_chars(self, instructions: str) -> int:
         """Transcript characters that fit in one summary request next to the instructions and reply."""
@@ -281,7 +320,7 @@ You are a campaign chronicler for a tabletop RPG.
 
 Write two Markdown fields:
 - `session_notes_markdown`: practical session notes (events, decisions, discoveries, loot, open threads).
-- `cinematic_summary_markdown`: a cinematic narrative recap of the session.
+- `cinematic_summary_markdown`: a "Previously on…" recap that the game master will read aloud to open the next session. 150–250 words (about one minute aloud), 2–3 short paragraphs of epic, dramatic narration in past tense: an omniscient bard-like narrator, vivid but plain enough to read aloud fluently. Cover only the session's turning points (the biggest fight, revelation, choice, or loss), not a blow-by-blow. End on the unresolved stakes or cliffhanger that the next session picks up. No headings, bullet lists, or citations.
 
 Rules:
 - Use only the provided session transcript as the source of truth.
@@ -642,6 +681,13 @@ SUMMARY_SCHEMA: dict[str, Any] = {
         "session_notes_markdown": {"type": "string"},
         "cinematic_summary_markdown": {"type": "string"},
     },
+}
+
+RECAP_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["cinematic_summary_markdown"],
+    "properties": {"cinematic_summary_markdown": {"type": "string"}},
 }
 
 ENTITY_MATCH_SCHEMA: dict[str, Any] = {
