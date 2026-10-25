@@ -20,6 +20,9 @@ log = logging.getLogger(__name__)
 WaitNotifier = Callable[[str], Awaitable[None]]
 
 CONNECT_TIMEOUT_SECONDS = 60
+# A slow call only gets a wait notice when the server doesn't answer `GET /models` this fast: a
+# loaded model running a long request still answers, a host that is waking up doesn't (#29).
+PROBE_TIMEOUT_SECONDS = 5
 NOT_IN_NOTES_REPLY = "That's not in the notes."
 # Context length assumed when neither the setting nor the server gives one.
 DEFAULT_CONTEXT_TOKENS = 32768
@@ -153,16 +156,29 @@ class LocalAIService:
         )
 
     async def _run_blocking(self, func, *args, on_wait: WaitNotifier | None, wait_message: str):
-        """Run a blocking call in a worker thread; post `wait_message` once if it runs long."""
+        """Run a blocking call in a worker thread; post `wait_message` once if it runs long and the
+        server is not answering (it is cold-starting, not just busy)."""
         task = asyncio.ensure_future(asyncio.to_thread(func, *args))
         if on_wait is not None:
             done, _ = await asyncio.wait({task}, timeout=self.settings.wait_notice_seconds)
-            if not done:
+            if not done and not await asyncio.to_thread(self._server_is_up):
                 try:
                     await on_wait(wait_message)
                 except Exception:
                     log.warning("Could not post wait notice", exc_info=True)
         return await task
+
+    def _server_is_up(self) -> bool:
+        try:
+            response = requests.get(
+                f"{self.settings.llm_base_url}/models", headers=self._headers(), timeout=PROBE_TIMEOUT_SECONDS
+            )
+        except requests.RequestException as exc:
+            log.info("LLM server is not answering (%s); posting a wait notice", exc)
+            return False
+        if not response.ok:
+            log.info("LLM server answered HTTP %s; posting a wait notice", response.status_code)
+        return response.ok
 
     def _timeout(self, read_seconds: int) -> tuple[int, int]:
         return (CONNECT_TIMEOUT_SECONDS, read_seconds)

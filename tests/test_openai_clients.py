@@ -12,9 +12,11 @@ import urllib.request
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import requests
+
 from scrollkeeper.config import Settings
 from scrollkeeper.health import Heartbeat, start_health_server
-from scrollkeeper.llm import LocalAIService, parse_transcription
+from scrollkeeper.llm import PROBE_TIMEOUT_SECONDS, LocalAIService, parse_transcription
 from test_llm_summary import fake_settings
 
 
@@ -110,7 +112,7 @@ class OpenAIClientTests(unittest.TestCase):
 
 
 class WaitNoticeTests(unittest.IsolatedAsyncioTestCase):
-    async def test_slow_call_posts_notice_once(self) -> None:
+    async def slow_call_notices(self, probe: dict) -> tuple[list[str], MagicMock]:
         service = LocalAIService(fake_settings(wait_notice_seconds=0))
         notices: list[str] = []
 
@@ -123,9 +125,25 @@ class WaitNoticeTests(unittest.IsolatedAsyncioTestCase):
             time.sleep(0.2)
             return "done"
 
-        result = await service._run_blocking(slow, on_wait=on_wait, wait_message="waking")
+        with patch("scrollkeeper.llm.requests.get", **probe) as get:
+            result = await service._run_blocking(slow, on_wait=on_wait, wait_message="waking")
         self.assertEqual(result, "done")
+        return notices, get
+
+    async def test_slow_call_posts_notice_once_when_the_server_is_down(self) -> None:
+        notices, get = await self.slow_call_notices({"side_effect": requests.ConnectTimeout("asleep")})
         self.assertEqual(notices, ["waking"])
+        self.assertEqual(get.call_args.args[0], "http://llm/v1/models")
+        self.assertEqual(get.call_args.kwargs["timeout"], PROBE_TIMEOUT_SECONDS)
+
+    async def test_slow_call_posts_notice_when_the_server_returns_an_error(self) -> None:
+        notices, _ = await self.slow_call_notices({"return_value": MagicMock(ok=False, status_code=503)})
+        self.assertEqual(notices, ["waking"])
+
+    async def test_slow_call_on_a_running_server_posts_no_notice(self) -> None:
+        notices, get = await self.slow_call_notices({"return_value": MagicMock(ok=True, status_code=200)})
+        self.assertEqual(notices, [])
+        get.assert_called_once()
 
     async def test_fast_call_posts_no_notice(self) -> None:
         service = LocalAIService(fake_settings(wait_notice_seconds=5))
