@@ -20,6 +20,7 @@ from scrollkeeper.wiki import (
     transcript_excerpt,
     cited_fact_ids,
     duplicate_reason,
+    format_change_line,
     format_change_report,
     format_entity_index,
     link_entity_names,
@@ -522,6 +523,17 @@ class HelperTests(unittest.TestCase):
         text = format_change_report(WikiChangeReport(error="boom"))
         self.assertIn("boom", text)
         self.assertIn("!reprocess-llm", text)
+
+    def test_change_line_counts_what_changed(self) -> None:
+        ward = Entity(1, 1, "Location", "Old Ward")
+        report = WikiChangeReport(
+            new_entities=[ward], updated_entities=[ward, ward], facts_added=19, page_failures=["Belamour"]
+        )
+        self.assertEqual(
+            format_change_line(report),
+            "Campaign wiki: 19 fact(s) · 1 new · 2 page(s) updated · 1 failed: Belamour",
+        )
+        self.assertIn("!reprocess-llm", format_change_line(WikiChangeReport(error="boom")))
 
 
 class SchemaRequestTests(unittest.TestCase):

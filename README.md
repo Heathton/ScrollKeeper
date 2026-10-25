@@ -21,7 +21,7 @@ ScrollKeeper is a Discord bot for tabletop campaigns. It can join a voice channe
 - `!register-character <character name>`: map your Discord user to an in-game character in the active campaign. **Recording is opt-in:** only players who have registered a character in the active campaign are recorded (bots never are).
 - `!join`: bot joins your current voice channel
 - `!start-session [title]`: begin recording the active voice channel. The bot posts a recording notice and names anyone in the channel who is not being recorded.
-- `!end-session`: stop recording, finalize transcript, write the summary, update the campaign wiki, and post the result with a wiki change report
+- `!end-session`: stop recording, finalize transcript, write the summary, update the campaign wiki, and post a short result: the read-aloud recap and a one-line wiki report, with the full session notes and wiki change report attached as `session-<n>-notes.md`
 - `!campaign-question <question>`: ask about the campaign. Answers come from wiki pages and session summaries and cite their sources (see [Campaign questions](#campaign-questions))
 - `!deep-question <question>`: the same, but also searches session transcripts (slower to read, but finds what never made it into the notes)
 - `!reindex`: rebuild the search index and re-embed everything (needs the Manage Server permission). Rarely needed: the index updates itself after every change and when the embedding model changes
@@ -58,7 +58,7 @@ Entities are referred to by `#id`, name or alias. Put names with spaces in quote
 - `!retract-fact <fact-id> [reason]`: withdraw a wrong fact
 - `!rebuild-pages`: rewrite every page from its facts (after a page-layout change); one LLM call per entity
 
-After each processed session the bot posts the new, updated and renamed entities and **possible duplicates** so they can be merged.
+After each processed session the bot reports the new, updated and renamed entities and **possible duplicates** (so they can be merged) in the attached session notes, with a count in the post.
 
 Pages follow a fixed layout per type (`PAGE_LAYOUTS` in `src/scrollkeeper/wiki.py`): an opening paragraph, then sections in a set order, each written only when facts support it.
 
@@ -241,7 +241,7 @@ Use the bundled Parakeet-TDT service (see [Speech-to-text service](#speech-to-te
 ## Local development with Docker Compose
 
 1. Copy `.env.example` to `.env`; fill in the Discord bot token and your LLM endpoint and model.
-2. Create a Discord bot with the `MESSAGE CONTENT`, `SERVER MEMBERS INTENT`, and `VOICE STATES INTENT` enabled, and invite it with voice permissions.
+2. Create a Discord bot with the `MESSAGE CONTENT`, `SERVER MEMBERS INTENT`, and `VOICE STATES INTENT` enabled, and invite it with voice permissions and Attach Files (the session notes are posted as a file).
 3. Start the stack:
 
 ```bash
@@ -300,7 +300,7 @@ Pushing a `v*` tag runs `.github/workflows/images.yml`, which publishes `ghcr.io
 - `discord-ext-voice-recv` is pinned to a commit SHA in `pyproject.toml`; change it deliberately, in its own PR. If Python voice receive keeps breaking, the fallback is a small Node `@discordjs/voice` recorder feeding this pipeline.
 - The bot calls the configured speech-to-text endpoint once per speaker track after the session ends.
 - Summaries, wiki updates, and campaign Q&A go to the configured OpenAI-compatible LLM endpoint; embeddings are computed in-process.
-- Long completion posts are split across multiple Discord messages automatically to avoid message-length truncation.
+- The completion post is short (recap and a one-line wiki report); the full notes are an attached Markdown file. A post longer than one Discord message is split.
 - `!end-session` now queues background processing so users can still run `!campaign-question` while transcription and note generation continue.
 
 ## Next improvements

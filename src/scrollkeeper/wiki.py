@@ -975,6 +975,23 @@ def format_change_report(report: WikiChangeReport) -> str:
     return "\n".join(lines)
 
 
+def format_change_line(report: WikiChangeReport) -> str:
+    """One line for the session-complete post; `format_change_report` has the full detail."""
+    if report.error:
+        return f"Campaign wiki update failed: {report.error[:300]}. Run `!reprocess-llm` to retry."
+    parts = [f"{report.facts_added} fact(s)"]
+    if report.new_entities:
+        parts.append(f"{len(report.new_entities)} new")
+    parts.append(f"{len(report.updated_entities)} page(s) updated")
+    if report.renamed:
+        parts.append(f"{len(report.renamed)} renamed")
+    if report.possible_duplicates:
+        parts.append(f"{len(report.possible_duplicates)} possible duplicate(s)")
+    if report.page_failures:
+        parts.append(f"{len(report.page_failures)} failed: " + ", ".join(report.page_failures))
+    return "Campaign wiki: " + " · ".join(parts)
+
+
 def cited_fact_ids(markdown: str) -> list[int]:
     ids: list[int] = []
     for group in CITATION_RE.findall(markdown):

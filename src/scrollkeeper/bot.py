@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 
 import discord
@@ -11,12 +12,12 @@ from .config import Settings
 from .llm import LocalAIService
 from .health import Heartbeat, start_health_server
 from .journal import MAX_UPLOAD_BYTES, JournalImporter, parse_rules
-from .models import ENTITY_TYPES, Entity
+from .models import ENTITY_TYPES, Entity, SessionArtifacts
 from .embeddings import EMBEDDING_MODELS, LocalEmbedder
 from .search import SearchIndex
 from .session_manager import SessionManager
 from .storage import Storage
-from .wiki import CampaignWiki, format_change_report
+from .wiki import CampaignWiki, format_change_line, format_change_report
 from .voice_compat import apply_voice_recv_compatibility_patch
 
 
@@ -41,6 +42,29 @@ class ScrollKeeperBot(commands.Bot):
         if self._heartbeat_task:
             self._heartbeat_task.cancel()
         await super().close()
+
+
+def session_complete_post(artifacts: SessionArtifacts) -> tuple[str, str, str]:
+    """The session-complete message, the attachment's filename, and the attached Markdown."""
+    number = artifacts.session_number or artifacts.session_id
+    header = f"## Session {number}" + (f" ({artifacts.session_date})" if artifacts.session_date else "")
+    post = [header, "", artifacts.cinematic_summary_markdown]
+    notes = [
+        header.replace("## ", "# ", 1),
+        "",
+        "## Session Notes",
+        "",
+        artifacts.session_notes_markdown,
+        "",
+        "## Cinematic Summary",
+        "",
+        artifacts.cinematic_summary_markdown,
+    ]
+    if artifacts.wiki_report is not None:
+        post.extend(["", format_change_line(artifacts.wiki_report)])
+        notes.extend(["", format_change_report(artifacts.wiki_report).replace("### ", "## ", 1)])
+    post.extend(["", "Full session notes attached."])
+    return "\n".join(post), f"session-{number}-notes.md", "\n".join(notes) + "\n"
 
 
 def build_bot(settings: Settings) -> commands.Bot:
@@ -116,20 +140,20 @@ def build_bot(settings: Settings) -> commands.Bot:
         if artifacts is None:
             await channel.send("Session processing finished without generated artifacts.")
             return
-        response = [
-            f"## Session {artifacts.session_number or artifacts.session_id}"
-            + (f" ({artifacts.session_date})" if artifacts.session_date else ""),
-            "",
-            "### Session Notes",
-            artifacts.session_notes_markdown,
-            "",
-            "### Cinematic Summary",
-            artifacts.cinematic_summary_markdown,
-        ]
-        if artifacts.wiki_report is not None:
-            response.extend(["", format_change_report(artifacts.wiki_report)])
-        for chunk in _split_long_message("\n".join(response)):
+        # A short post (header, read-aloud recap, one-line wiki report); the full notes are attached (#28).
+        post, filename, notes = session_complete_post(artifacts)
+        chunks = _split_long_message(post)
+        for chunk in chunks[:-1]:
             await channel.send(chunk)
+        try:
+            await channel.send(chunks[-1], file=discord.File(io.BytesIO(notes.encode("utf-8")), filename=filename))
+        except discord.HTTPException:
+            log.warning("Could not attach %s to channel %s", filename, text_channel_id, exc_info=True)
+            await channel.send(chunks[-1])
+            await channel.send(
+                f"Could not attach `{filename}` (the bot needs Attach Files permission here). "
+                f"The notes are saved as `{artifacts.summary_path.name}` and searchable."
+            )
 
     async def post_notice(text_channel_id: int, message: str) -> None:
         channel = bot.get_channel(text_channel_id)
