@@ -13,6 +13,8 @@ dependencies = [
   "discord-ext-voice-recv @ git+https://github.com/rdphillips7/discord-ext-voice-recv.git@ddd28601fe556f585b869e215f29c8236b95f88f",
   "python-dotenv>=1.0.1",
   "requests>=2.32.0",
+  # Drops the distrusted eMudhra emSign ECC Root CA - G3 (#31).
+  "certifi>=2026.10.19",
   # In-process embeddings (#8).
   "numpy>=1.26",
   "onnxruntime>=1.17",

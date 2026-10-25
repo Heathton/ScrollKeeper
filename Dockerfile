@@ -13,7 +13,9 @@ WORKDIR /app
 
 COPY pyproject.toml README.md ./
 COPY src ./src
-RUN pip install --no-cache-dir .
+# pip >= 26.2.2 vendors a certifi without the distrusted eMudhra G3 root (#31).
+RUN pip install --no-cache-dir -U "pip>=26.2.2" \
+    && pip install --no-cache-dir .
 
 EXPOSE 8080
 

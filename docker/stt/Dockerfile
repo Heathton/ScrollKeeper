@@ -16,7 +16,9 @@ RUN apt-get update \
 WORKDIR /service
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# pip >= 26.2.2 vendors a certifi without the distrusted eMudhra G3 root (#31).
+RUN pip install --no-cache-dir -U "pip>=26.2.2" \
+    && pip install --no-cache-dir -r requirements.txt
 
 COPY --from=models /models /models
 COPY pipeline.py app.py ./
