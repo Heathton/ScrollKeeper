@@ -21,7 +21,7 @@ ScrollKeeper is a Discord bot for tabletop campaigns. It can join a voice channe
 - `!register-character <character name>`: map your Discord user to an in-game character in the active campaign. **Recording is opt-in:** only players who have registered a character in the active campaign are recorded (bots never are).
 - `!join`: bot joins your current voice channel
 - `!start-session [title]`: begin recording the active voice channel. The bot posts a recording notice and names anyone in the channel who is not being recorded.
-- `!end-session`: stop recording, finalize transcript, write the summary, update the campaign wiki, and post a short result: the read-aloud recap and a one-line wiki report, with the full session notes and wiki change report attached as `session-<n>-notes.md`
+- `!end-session`: stop recording, finalize transcript, write the summary, update the campaign wiki, and post a short result: the read-aloud recap, a 5–8 bullet list of highlights (key events, decisions, discoveries, loot and open threads) and a one-line wiki report, with the full session notes and wiki change report attached as `session-<n>-notes.md`
 - `!campaign-question <question>`: ask about the campaign. Answers come from wiki pages and session summaries and cite their sources (see [Campaign questions](#campaign-questions))
 - `!deep-question <question>`: the same, but also searches session transcripts (slower to read, but finds what never made it into the notes)
 - `!reindex`: rebuild the search index and re-embed everything (needs the Manage Server permission). Rarely needed: the index updates itself after every change and when the embedding model changes
@@ -283,7 +283,7 @@ Pushing a `v*` tag runs `.github/workflows/images.yml`, which publishes `ghcr.io
 - `data/scrollkeeper.db`: SQLite database
 - `data/sessions/<session-id>/audio/<discord-user-id>.ogg`: one Ogg Opus track per recorded speaker
 - `data/sessions/<session-id>/transcript.md`: finalized transcript
-- `data/sessions/<session-id>/summary.md`: session notes + cinematic summary
+- `data/sessions/<session-id>/summary.md`: session notes, highlights and cinematic summary
 - `data/models/`: downloaded embedding model files
 - `data/imports/<campaign-id>/`: an uploaded journal export while its import runs (deleted when it completes)
 - `data/wiki/<campaign-id>/<Type>/<Name>.md`: Obsidian-style wiki export, one file per entity with `aliases` frontmatter, `[[links]]` and session citations. It is regenerated from the database, so edits there are overwritten; use the commands above.
@@ -300,7 +300,7 @@ Pushing a `v*` tag runs `.github/workflows/images.yml`, which publishes `ghcr.io
 - `discord-ext-voice-recv` is pinned to a commit SHA in `pyproject.toml`; change it deliberately, in its own PR. If Python voice receive keeps breaking, the fallback is a small Node `@discordjs/voice` recorder feeding this pipeline.
 - The bot calls the configured speech-to-text endpoint once per speaker track after the session ends.
 - Summaries, wiki updates, and campaign Q&A go to the configured OpenAI-compatible LLM endpoint; embeddings are computed in-process.
-- The completion post is short (recap and a one-line wiki report); the full notes are an attached Markdown file. A post longer than one Discord message is split.
+- The completion post is short (recap, highlights and a one-line wiki report); the full notes are an attached Markdown file. A post longer than one Discord message is split.
 - `!end-session` now queues background processing so users can still run `!campaign-question` while transcription and note generation continue.
 
 ## Next improvements

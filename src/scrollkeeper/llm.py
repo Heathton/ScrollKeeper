@@ -231,6 +231,7 @@ class LocalAIService:
         ]
         sections = ["# Transcript", ""]
         for payload in part_payloads:
+            # The highlights are left out: the notes have everything they summarize.
             sections.extend(
                 [payload["session_notes_markdown"], "", payload["cinematic_summary_markdown"], ""]
             )
@@ -238,8 +239,9 @@ class LocalAIService:
         final_instructions = instructions + """
 Final synthesis requirements:
 - The source is recap text written from consecutive parts of the same session, in order.
-- Return one cohesive session-notes section and one cohesive cinematic summary.
+- Return one cohesive session-notes section, one highlights list and one cohesive cinematic summary.
 - The session notes keep the full detail of every part.
+- The highlights are one 5–8 bullet list for the whole session, not one list per part.
 - The cinematic summary is one 150–250 word read-aloud recap of the whole session: keep only the
   session's biggest turning points across all parts, and end on the stakes left open at its end.
 - Do not structure output by phase/chunk/part/pass labels unless the players explicitly used those terms in-session.
@@ -334,8 +336,9 @@ lists, or citations. Use only facts from the recap.
         base = """
 You are a campaign chronicler for a tabletop RPG.
 
-Write two Markdown fields:
+Write three Markdown fields:
 - `session_notes_markdown`: practical session notes (events, decisions, discoveries, loot, open threads).
+- `highlights_markdown`: the session at a glance, posted to the players' channel. A Markdown bullet list of 5–8 one- or two-sentence bullets (150–250 words in all), in the order things happened: the key events, decisions, discoveries and loot, with a last bullet on the open threads for next session. Plain past tense; no headings or citations.
 - `cinematic_summary_markdown`: a "Previously on…" recap that the game master will read aloud to open the next session. 150–250 words (about one minute aloud), 2–3 short paragraphs of epic, dramatic narration in past tense: an omniscient bard-like narrator, vivid but plain enough to read aloud fluently. Cover only the session's turning points (the biggest fight, revelation, choice, or loss), not a blow-by-blow. End on the unresolved stakes or cliffhanger that the next session picks up. No headings, bullet lists, or citations.
 
 Rules:
@@ -362,8 +365,11 @@ spellings of names in this campaign:
     def _normalize_summary_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         session_notes = str(payload.get("session_notes_markdown", "")).strip()
         cinematic = str(payload.get("cinematic_summary_markdown", "")).strip()
+        # Optional: a session without highlights still posts its recap and notes (#36).
+        highlights = str(payload.get("highlights_markdown", "")).strip()
         return {
             "session_notes_markdown": session_notes,
+            "highlights_markdown": highlights,
             "cinematic_summary_markdown": cinematic,
         }
 
@@ -692,9 +698,10 @@ JOURNAL_EXTRACTION_SCHEMA: dict[str, Any] = {
 SUMMARY_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["session_notes_markdown", "cinematic_summary_markdown"],
+    "required": ["session_notes_markdown", "highlights_markdown", "cinematic_summary_markdown"],
     "properties": {
         "session_notes_markdown": {"type": "string"},
+        "highlights_markdown": {"type": "string"},
         "cinematic_summary_markdown": {"type": "string"},
     },
 }

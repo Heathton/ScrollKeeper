@@ -37,6 +37,7 @@ def fake_settings(**overrides) -> Settings:
 
 GOOD_SUMMARY = {
     "session_notes_markdown": "- The party breached the castle gate.",
+    "highlights_markdown": "- The party breached the gate.\n- Open thread: the lich below.",
     "cinematic_summary_markdown": "Steel rang against stone as the party forced open the gate.",
 }
 
@@ -143,11 +144,22 @@ class RecapLengthTests(unittest.TestCase):
         self.assertIn("150–250 words", system)
         self.assertEqual(len(service.requests), 1)
 
+    def test_prompt_asks_for_highlights_and_missing_highlights_are_empty(self) -> None:
+        service = ChatStubService([{k: v for k, v in GOOD_SUMMARY.items() if k != "highlights_markdown"}])
+        payload = service._summarize_session_sync(lines_with_gaps([0]))
+        system, response_format = service.requests[0][0][0]["content"], service.requests[0][1]
+        self.assertIn("`highlights_markdown`", system)
+        self.assertIn("5–8", system)
+        self.assertIn("highlights_markdown", response_format["json_schema"]["schema"]["required"])
+        self.assertEqual(payload["highlights_markdown"], "")
+        self.assertEqual(payload["session_notes_markdown"], GOOD_SUMMARY["session_notes_markdown"])
+
     def test_long_recap_is_shortened_once_and_notes_kept(self) -> None:
         service = ChatStubService([self.long_summary(400), {"cinematic_summary_markdown": "Short and epic."}])
         payload = service._summarize_session_sync(lines_with_gaps([0]))
         self.assertEqual(payload["session_notes_markdown"], GOOD_SUMMARY["session_notes_markdown"])
         self.assertEqual(payload["cinematic_summary_markdown"], "Short and epic.")
+        self.assertEqual(payload["highlights_markdown"], GOOD_SUMMARY["highlights_markdown"])
         self.assertEqual(len(service.requests), 2)
         messages, response_format = service.requests[1]
         self.assertEqual(response_format["json_schema"]["name"], "session_recap")
