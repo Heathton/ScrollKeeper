@@ -472,13 +472,11 @@ class SessionManager:
         summary_payload = await self.llm.summarize_session(lines, note, glossary, on_wait=notify)
         session_notes = summary_payload["session_notes_markdown"].strip()
         cinematic = summary_payload["cinematic_summary_markdown"].strip()
-        highlights = summary_payload.get("highlights_markdown", "").strip()
 
         summary_markdown = (
             "# Session Notes\n\n"
             f"{session_notes}\n\n"
-            + (f"# Highlights\n\n{highlights}\n\n" if highlights else "")
-            + "# Cinematic Summary\n\n"
+            "# Cinematic Summary\n\n"
             f"{cinematic}\n"
         )
         await asyncio.to_thread(self._write_output, summary_path, summary_markdown)
@@ -520,7 +518,6 @@ class SessionManager:
             wiki_report=wiki_report,
             session_number=session.number,
             session_date=session_date(session.started_at.isoformat()),
-            highlights_markdown=highlights,
         )
 
     @staticmethod

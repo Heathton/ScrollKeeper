@@ -159,7 +159,6 @@ class SessionArtifacts:
     wiki_report: WikiChangeReport | None = None
     session_number: int = 0  # The session's number in its campaign, and the date it was played.
     session_date: str = ""
-    highlights_markdown: str = ""  # A short bullet list for the session-complete post (#36).
 
 
 def session_date(started_at: str, imported: bool = False) -> str:

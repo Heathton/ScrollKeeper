@@ -22,12 +22,10 @@ except ModuleNotFoundError as exc:
 
 
 class SummaryLLM(FakeLLM):
-    highlights = "- The gate fell."
-
     async def summarize_session(self, lines, note="", glossary=(), on_wait=None) -> dict:
         self.summary_input = render_compact(lines, note)
         self.summary_glossary = list(glossary)
-        return {"session_notes_markdown": "Notes.", "highlights_markdown": self.highlights, "cinematic_summary_markdown": "Recap."}
+        return {"session_notes_markdown": "Notes.", "cinematic_summary_markdown": "Recap."}
 
 
 @unittest.skipUnless(SessionManager is not None, f"discord dependency unavailable: {DISCORD_IMPORT_ERROR}")
@@ -102,18 +100,6 @@ class SessionWikiPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(indexed, {"summary", "transcript"})
         result = await search.search(1, "who owes us?", deep=True)
         self.assertIn("[00:00:05] Mira: Varric owes us.", result.docs[0].body)
-
-    async def test_highlights_are_saved_with_the_summary(self) -> None:
-        artifacts = await self.manager._process_closed_session(1, self.session, transcribe_audio=False)
-        self.assertEqual(artifacts.highlights_markdown, "- The gate fell.")
-        self.assertEqual(
-            artifacts.summary_path.read_text(encoding="utf-8"),
-            "# Session Notes\n\nNotes.\n\n# Highlights\n\n- The gate fell.\n\n# Cinematic Summary\n\nRecap.\n",
-        )
-
-        self.llm.highlights = ""
-        artifacts = await self.manager._process_closed_session(1, self.session, transcribe_audio=False)
-        self.assertNotIn("# Highlights", artifacts.summary_path.read_text(encoding="utf-8"))
 
     async def test_wiki_failure_does_not_fail_the_session(self) -> None:
         async def broken(*_args, **_kwargs):

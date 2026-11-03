@@ -58,16 +58,10 @@ def session_complete_post(artifacts: SessionArtifacts) -> tuple[str, str, str]:
         "",
         artifacts.session_notes_markdown,
         "",
-    ]
-    # Between the read-aloud recap and the attached notes: the session at a glance (#36).
-    if artifacts.highlights_markdown:
-        post.extend(["", "### Highlights", artifacts.highlights_markdown])
-        notes.extend(["## Highlights", "", artifacts.highlights_markdown, ""])
-    notes.extend([
         "## Cinematic Summary",
         "",
         artifacts.cinematic_summary_markdown,
-    ])
+    ]
     if artifacts.wiki_report is not None:
         post.extend(["", format_change_line(artifacts.wiki_report)])
         notes.extend(["", format_change_report(artifacts.wiki_report).replace("### ", "## ", 1)])
@@ -149,7 +143,7 @@ def build_bot(settings: Settings) -> commands.Bot:
         if artifacts is None:
             await channel.send("Session processing finished without generated artifacts.")
             return
-        # A short post (header, read-aloud recap, highlights, one-line wiki report); the full notes are attached (#28).
+        # A short post (header, read-aloud recap, one-line wiki report); the full notes are attached (#28).
         post, filename, notes = session_complete_post(artifacts)
         chunks = _split_long_message(post)
         for chunk in chunks[:-1]:

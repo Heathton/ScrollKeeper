@@ -188,7 +188,6 @@ class BotIntegrationHarnessTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("## Session 42", channel.messages[0])
                 self.assertIn("Cinematic body", channel.messages[0])
                 self.assertNotIn("Session notes body", channel.messages[0])
-                self.assertNotIn("Highlights", channel.messages[0])
                 filename, notes = channel.files[0]
                 self.assertEqual(filename, "session-42-notes.md")
                 self.assertIn("## Session Notes\n\nSession notes body", notes)
@@ -222,7 +221,6 @@ class BotIntegrationHarnessTests(unittest.IsolatedAsyncioTestCase):
                     wiki_report=WikiChangeReport(facts_added=19, updated_entities=[ward], page_failures=["Belamour"]),
                     session_number=130,
                     session_date="2026-10-19",
-                    highlights_markdown="- The party broke the gate.\n- Open thread: the lich below.",
                 )
 
                 await manager.completion_handler(777, 4321, artifacts, None)
@@ -230,18 +228,12 @@ class BotIntegrationHarnessTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(channel.messages), 1)
                 post = channel.messages[0]
                 self.assertTrue(post.startswith("## Session 130 (2026-10-19)\n\nThe gate fell."))
-                self.assertIn(
-                    "The lich still waits below.\n\n### Highlights\n- The party broke the gate.\n"
-                    "- Open thread: the lich below.\n\nCampaign wiki: 19 fact(s)",
-                    post,
-                )
                 self.assertIn("Campaign wiki: 19 fact(s) · 1 page(s) updated · 1 failed: Belamour", post)
                 self.assertNotIn("Session note line.", post)
                 filename, notes = channel.files[0]
                 self.assertEqual(filename, "session-130-notes.md")
                 self.assertTrue(notes.startswith("# Session 130 (2026-10-19)\n"))
                 self.assertEqual(notes.count("Session note line."), 300)
-                self.assertIn("## Highlights\n\n- The party broke the gate.", notes)
                 self.assertIn("## Campaign wiki", notes)
                 self.assertIn("**Updated:** #7 Old Ward", notes)
             finally:
