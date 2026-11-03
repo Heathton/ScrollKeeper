@@ -32,9 +32,9 @@ SUMMARY_REPLY_TOKENS = 8192
 # Characters per token for estimating prompt size without the model's tokenizer. English chat
 # is about 4; 3 leaves room for names, punctuation and other languages.
 CHARS_PER_TOKEN = 3.0
-# The cinematic recap is read aloud at the next session (150-250 words asked); a longer one gets
-# one retry to shorten it.
-RECAP_MAX_WORDS = 300
+# The cinematic recap is read aloud at the next session (700-900 words asked, #36); a longer one
+# gets one retry to shorten it.
+RECAP_MAX_WORDS = 1000
 
 
 class LocalAIService:
@@ -240,8 +240,8 @@ Final synthesis requirements:
 - The source is recap text written from consecutive parts of the same session, in order.
 - Return one cohesive session-notes section and one cohesive cinematic summary.
 - The session notes keep the full detail of every part.
-- The cinematic summary is one 150–250 word read-aloud recap of the whole session: keep only the
-  session's biggest turning points across all parts, and end on the stakes left open at its end.
+- The cinematic summary is one 700–900 word read-aloud recap of the whole session: tell its major
+  scenes across all parts in order, and end on the stakes left open at its end.
 - Do not structure output by phase/chunk/part/pass labels unless the players explicitly used those terms in-session.
 """
         return self._shorten_long_recap(self._summarize_part(final_instructions, combined, "final-from-parts"))
@@ -266,11 +266,11 @@ Final synthesis requirements:
 You edit a "Previously on…" recap of a tabletop RPG session that the game master will read aloud
 to open the next session. The recap below is too long.
 
-Rewrite it as `cinematic_summary_markdown`: 150–250 words (about one minute aloud), 2–3 short
+Rewrite it as `cinematic_summary_markdown`: 700–900 words (about five minutes aloud), 5–7
 paragraphs of epic, dramatic narration in past tense, by an omniscient bard-like narrator, vivid
-but plain enough to read aloud fluently. Keep only the turning points (the biggest fight,
-revelation, choice, or loss) and end on the unresolved stakes or cliffhanger. No headings, bullet
-lists, or citations. Use only facts from the recap.
+but plain enough to read aloud fluently. Keep the major scenes in order (the fights, revelations,
+choices, and losses that mattered) and end on the unresolved stakes or cliffhanger. No headings,
+bullet lists, or citations. Use only facts from the recap.
 """
         try:
             reply = self._chat_schema_sync(instructions, f"Recap:\n{recap}", "session_recap", RECAP_SCHEMA)
@@ -336,7 +336,7 @@ You are a campaign chronicler for a tabletop RPG.
 
 Write two Markdown fields:
 - `session_notes_markdown`: practical session notes (events, decisions, discoveries, loot, open threads).
-- `cinematic_summary_markdown`: a "Previously on…" recap that the game master will read aloud to open the next session. 150–250 words (about one minute aloud), 2–3 short paragraphs of epic, dramatic narration in past tense: an omniscient bard-like narrator, vivid but plain enough to read aloud fluently. Cover only the session's turning points (the biggest fight, revelation, choice, or loss), not a blow-by-blow. End on the unresolved stakes or cliffhanger that the next session picks up. No headings, bullet lists, or citations.
+- `cinematic_summary_markdown`: a "Previously on…" recap that the game master will read aloud to open the next session. 700–900 words (about five minutes aloud), 5–7 paragraphs of epic, dramatic narration in past tense: an omniscient bard-like narrator, vivid but plain enough to read aloud fluently. Tell the session's major scenes in order (the fights, revelations, choices, and losses that mattered), not a blow-by-blow. End on the unresolved stakes or cliffhanger that the next session picks up. No headings, bullet lists, or citations.
 
 Rules:
 - Use only the provided session transcript as the source of truth.

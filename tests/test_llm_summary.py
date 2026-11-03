@@ -135,16 +135,22 @@ class RecapLengthTests(unittest.TestCase):
     def long_summary(self, words: int) -> dict:
         return {**GOOD_SUMMARY, "cinematic_summary_markdown": " ".join(["onward"] * words)}
 
-    def test_prompt_asks_for_a_short_read_aloud_recap(self) -> None:
+    def test_prompt_asks_for_a_five_minute_read_aloud_recap(self) -> None:
         service = ChatStubService()
         service._summarize_session_sync(lines_with_gaps([0]))
         system = service.requests[0][0][0]["content"]
         self.assertIn('"Previously on…" recap', system)
-        self.assertIn("150–250 words", system)
+        self.assertIn("700–900 words", system)
+        self.assertEqual(len(service.requests), 1)
+
+    def test_recap_in_the_asked_range_is_not_shortened(self) -> None:
+        service = ChatStubService([self.long_summary(950)])
+        payload = service._summarize_session_sync(lines_with_gaps([0]))
+        self.assertEqual(len(payload["cinematic_summary_markdown"].split()), 950)
         self.assertEqual(len(service.requests), 1)
 
     def test_long_recap_is_shortened_once_and_notes_kept(self) -> None:
-        service = ChatStubService([self.long_summary(400), {"cinematic_summary_markdown": "Short and epic."}])
+        service = ChatStubService([self.long_summary(1200), {"cinematic_summary_markdown": "Short and epic."}])
         payload = service._summarize_session_sync(lines_with_gaps([0]))
         self.assertEqual(payload["session_notes_markdown"], GOOD_SUMMARY["session_notes_markdown"])
         self.assertEqual(payload["cinematic_summary_markdown"], "Short and epic.")
@@ -154,25 +160,25 @@ class RecapLengthTests(unittest.TestCase):
         self.assertIn("onward onward", messages[1]["content"])
 
     def test_still_long_recap_is_kept_after_one_retry(self) -> None:
-        service = ChatStubService([self.long_summary(400), self.long_summary(350)])
+        service = ChatStubService([self.long_summary(1200), self.long_summary(1100)])
         payload = service._summarize_session_sync(lines_with_gaps([0]))
-        self.assertEqual(len(payload["cinematic_summary_markdown"].split()), 350)
+        self.assertEqual(len(payload["cinematic_summary_markdown"].split()), 1100)
         self.assertEqual(len(service.requests), 2)
 
     def test_failed_or_empty_retry_keeps_the_original(self) -> None:
         for retry in ([requests.ConnectionError("reset")] * 2, [{"cinematic_summary_markdown": ""}]):
-            service = ChatStubService([self.long_summary(400), *retry])
+            service = ChatStubService([self.long_summary(1200), *retry])
             payload = service._summarize_session_sync(lines_with_gaps([0]))
-            self.assertEqual(len(payload["cinematic_summary_markdown"].split()), 400)
+            self.assertEqual(len(payload["cinematic_summary_markdown"].split()), 1200)
 
     def test_multipart_checks_only_the_final_recap(self) -> None:
-        service = ChatStubService([self.long_summary(400)] * 3 + [GOOD_SUMMARY])
+        service = ChatStubService([self.long_summary(1200)] * 3 + [GOOD_SUMMARY])
         service._summary_budget_chars = lambda _instructions: 4100
         payload = service._summarize_session_sync(lines_with_gaps([0] + [2] * 29))
         self.assertEqual(payload, GOOD_SUMMARY)
         self.assertEqual(len(service.requests), 4)
         final_system = service.requests[-1][0][0]["content"]
-        self.assertIn("one 150–250 word read-aloud recap of the whole session", final_system)
+        self.assertIn("one 700–900 word read-aloud recap of the whole session", final_system)
 
 
 def fake_response(payload: dict) -> MagicMock:
