@@ -31,11 +31,28 @@ log = logging.getLogger(__name__)
 # time) is marked failed instead of being retried again on the next start.
 MAX_PROCESSING_ATTEMPTS = 3
 RETENTION_CHECK_SECONDS = 6 * 3600
+# Speech-to-text finding fewer words than this per minute of track audio (in a recording at least
+# this long) means the audio is broken; real sessions give far more, even counting quiet players.
+MIN_WORDS_PER_AUDIO_MINUTE = 1.0
+MIN_CHECKED_AUDIO_SECONDS = 10 * 60
+# Tell the channel once this many still-encrypted packets were dropped (one speaker-second).
+DAVE_WARNING_PACKETS = 50
+# DAVE (Discord's end-to-end voice encryption) ends each encrypted frame with a supplemental
+# block: 8-byte tag, ULEB128 nonce, unencrypted ranges, its own size byte, then 0xFAFA.
+_DAVE_MAGIC = b"\xfa\xfa"
+_DAVE_MIN_SUPPLEMENT = 12
 
 CompletionHandler = Callable[[int, int, SessionArtifacts | None, str | None], Awaitable[None]]
 NoticeHandler = Callable[[int, str], Awaitable[None]]
 
-__all__ = ["ActiveSession", "SessionManager", "format_offset"]
+__all__ = ["ActiveSession", "SessionManager", "format_offset", "is_dave_encrypted"]
+
+
+def is_dave_encrypted(payload: bytes) -> bool:
+    """Whether an Opus payload is still DAVE-encrypted (voice_recv passes it through when it can't decrypt)."""
+    if len(payload) < _DAVE_MIN_SUPPLEMENT or payload[-2:] != _DAVE_MAGIC:
+        return False
+    return _DAVE_MIN_SUPPLEMENT <= payload[-3] <= len(payload)
 
 
 @dataclass(slots=True)
@@ -79,6 +96,7 @@ class SessionAudioSink(voice_recv.AudioSink):
         self.manager = manager
         self.session = session
         self.speakers: dict[int, Speaker | None] = {}
+        self.encrypted_packets = 0
 
     def wants_opus(self) -> bool:
         return True
@@ -89,11 +107,31 @@ class SessionAudioSink(voice_recv.AudioSink):
         # Lost packets arrive as empty fake packets; their time becomes silence on the track.
         if user is None or packet is None or not payload:
             return
+        payload = bytes(payload)
+        if is_dave_encrypted(payload):
+            # Undecodable on disk: drop it, and warn while the table can still do something about it.
+            self._encrypted_packet()
+            return
         speaker = self._speaker(user)
         recorder = self.session.recorder
         if speaker is None or recorder is None:
             return
-        recorder.submit(speaker, packet.ssrc, packet.timestamp, bytes(payload))
+        recorder.submit(speaker, packet.ssrc, packet.timestamp, payload)
+
+    def _encrypted_packet(self) -> None:
+        self.encrypted_packets += 1
+        if self.encrypted_packets != DAVE_WARNING_PACKETS:
+            return
+        log.error(
+            "Session %s: voice packets are arriving still DAVE-encrypted and are not being recorded; "
+            "check the discord.py / davey versions",
+            self.session.session_id,
+        )
+        self.manager.post_threadsafe(
+            self.session.text_channel_id,
+            "**Recording is broken:** voice audio is arriving still encrypted, so it can't be saved. "
+            "This is a bot problem (its voice libraries), not something players can fix. Tell the bot's operator.",
+        )
 
     def _speaker(self, user: discord.User | discord.Member) -> Speaker | None:
         if user.id in self.speakers:
@@ -546,6 +584,8 @@ class SessionManager:
             "This can take a while; `!session-status` shows progress."
         )
         transcribed = 0
+        transcribed_seconds = 0.0
+        words = 0
         skipped: list[str] = []
         scratch_parent = self.spool_dir if self.spool_dir is not None else None
         if scratch_parent is not None:
@@ -578,8 +618,20 @@ class SessionManager:
                         await asyncio.to_thread(flac_path.unlink)
                 await asyncio.to_thread(self._store_track_transcript, session, track, result)
                 transcribed += 1
+                transcribed_seconds += durations[index - 1]
+                words += len(result.text.split())
         if transcribed == 0:
             raise RuntimeError("No speaker track could be decoded for transcription.")
+        # Summarizing a near-empty transcript would write nonsense into the summary and the wiki.
+        if (
+            transcribed_seconds >= MIN_CHECKED_AUDIO_SECONDS
+            and words < transcribed_seconds / 60 * MIN_WORDS_PER_AUDIO_MINUTE
+        ):
+            raise RuntimeError(
+                f"Speech-to-text found only {words} word(s) in {format_offset(timedelta(seconds=int(transcribed_seconds)))} "
+                "of audio, so the recording is probably broken. The summary and wiki were not updated. "
+                "If the transcript is right after all, `!reprocess-llm` summarizes it anyway."
+            )
         if skipped:
             await notify(f"Could not decode the audio of: {', '.join(skipped)}. The transcript is missing them.")
 

@@ -18,7 +18,13 @@ from test_llm_summary import fake_settings
 
 DISCORD_IMPORT_ERROR: str | None = None
 try:
-    from scrollkeeper.session_manager import MAX_PROCESSING_ATTEMPTS, SessionAudioSink, SessionManager
+    from scrollkeeper.session_manager import (
+        DAVE_WARNING_PACKETS,
+        MAX_PROCESSING_ATTEMPTS,
+        SessionAudioSink,
+        SessionManager,
+        is_dave_encrypted,
+    )
     from test_session_wiki import SummaryLLM
 except ModuleNotFoundError as exc:
     SessionManager = None
@@ -49,6 +55,10 @@ def fake_decode(source: Path, destination: Path) -> None:
     if source.read_bytes().startswith(b"broken"):
         raise RuntimeError("ffmpeg could not decode")
     destination.write_text(source.stem)
+
+
+# An Opus frame as DAVE encrypts it: ciphertext, 8-byte tag, 1-byte nonce, supplement size, 0xFAFA.
+DAVE_FRAME = b"\x8a" * 40 + b"\x11" * 8 + b"\x05" + bytes([12]) + b"\xfa\xfa"
 
 
 def write_track(path: Path, seconds: float = 1.0) -> None:
@@ -150,6 +160,25 @@ class SessionCaptureTests(unittest.IsolatedAsyncioTestCase):
         sink.write(guest, self.voice())
         self.assertEqual(submitted[-1][0].character_name, "Brother Aldous")
 
+    def test_dave_frames_are_recognised(self) -> None:
+        self.assertTrue(is_dave_encrypted(DAVE_FRAME))
+        self.assertFalse(is_dave_encrypted(VOICE))
+        self.assertFalse(is_dave_encrypted(b"\xfc" * 20 + bytes([3]) + b"\xfa\xfa"))  # supplement too small
+        self.assertFalse(is_dave_encrypted(b"\xfc" * 20 + bytes([200]) + b"\xfa\xfa"))  # bigger than the packet
+
+    def test_sink_drops_still_encrypted_packets_and_warns_once(self) -> None:
+        sink, submitted = self.make_sink()
+        posted: list[str] = []
+        self.manager.post_threadsafe = lambda _channel, message: posted.append(message)
+        player = types.SimpleNamespace(id=10, display_name="mira#1", bot=False)
+        with self.assertLogs("scrollkeeper.session_manager", "ERROR"):
+            for index in range(DAVE_WARNING_PACKETS * 3):
+                sink.write(player, self.voice(index * FRAME_SAMPLES, payload=DAVE_FRAME))
+        sink.write(player, self.voice(payload=VOICE))
+        self.assertEqual([args[3] for args in submitted], [VOICE])
+        self.assertEqual(len(posted), 1)
+        self.assertIn("Recording is broken", posted[0])
+
     # --- processing ---------------------------------------------------------------------
 
     async def test_end_to_end_tracks_are_archived_transcribed_and_merged_by_time(self) -> None:
@@ -188,6 +217,27 @@ class SessionCaptureTests(unittest.IsolatedAsyncioTestCase):
         await self.drain_queue()
         self.assertEqual(self.storage.get_session(session_id)["status"], "failed")
         self.assertIn("unavailable", self.completions[-1][3])
+
+    async def test_long_recording_with_almost_no_words_fails_before_the_summary(self) -> None:
+        session_id = self.storage.create_session(1, 2, 3, "Test")
+        started = datetime.fromisoformat(self.storage.get_session(session_id)["started_at"])
+        for user_id, name in ((10, "Mira"), (20, "Varric")):
+            path = self.spool / str(session_id) / f"{user_id}.ogg"
+            write_track(path, seconds=330)  # 11 minutes of track audio in total
+            self.storage.create_track(session_id, user_id, name.lower(), name, path, started)
+        self.llm.words_by_user = {10: [("Yeah.", 1.0, 1.2)]}
+        self.storage.queue_session(session_id, PROCESS_TRANSCRIBE)
+        self.manager._ensure_worker(1)
+        await self.drain_queue()
+        self.assertEqual(self.storage.get_session(session_id)["status"], "failed")
+        self.assertIn("only 1 word(s) in 00:11:00", self.completions[0][3])
+        self.assertFalse(hasattr(self.llm, "summary_input"))
+        self.assertEqual(self.llm.extract_calls, [])
+
+        # The operator can still summarize it on purpose.
+        await self.manager.reprocess_llm_only(1, session_id)
+        await self.drain_queue()
+        self.assertEqual(self.storage.get_session(session_id)["status"], "completed")
 
     async def test_no_tracks_explains_the_opt_in(self) -> None:
         session_id = self.storage.create_session(1, 2, 3, None)

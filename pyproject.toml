@@ -9,7 +9,10 @@ description = "Discord campaign archivist with transcription, summaries, and ret
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-  "discord.py[voice]>=2.7.0",
+  # The voice stack is pinned: a rebuild that picked up davey 0.2.0 recorded still-encrypted
+  # audio, because discord.py 2.7.1 doesn't make the transition calls it needs (#38).
+  "discord.py[voice]==2.7.1",
+  "davey>=0.1.6,<0.2",
   "discord-ext-voice-recv @ git+https://github.com/rdphillips7/discord-ext-voice-recv.git@ddd28601fe556f585b869e215f29c8236b95f88f",
   "python-dotenv>=1.0.1",
   "requests>=2.32.0",
